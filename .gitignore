@@ -1,0 +1,6 @@
+build
+.claude
+.vscode
+.clang*
+compile_commands.json
+.cspell.json

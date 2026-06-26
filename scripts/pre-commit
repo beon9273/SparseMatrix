@@ -1,0 +1,31 @@
+#!/bin/bash
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+BUILD_DIR="$REPO_ROOT/build"
+
+FILES=$(find "$REPO_ROOT" -path "$REPO_ROOT/build" -prune -o \( -name "*.cpp" -o -name "*.h" \) -print)
+
+echo "==> clang-format"
+echo "$FILES" | xargs clang-format -i
+git add $(echo "$FILES" | xargs -I{} git ls-files --error-unmatch {} 2>/dev/null || true)
+
+if [ ! -f "$BUILD_DIR/compile_commands.json" ]; then
+  echo "WARNING: $BUILD_DIR/compile_commands.json not found, skipping clang-tidy"
+  exit 0
+fi
+
+echo "==> clang-tidy"
+FAILED=0
+for f in $FILES; do
+  # Only tidy .cpp files — headers are covered transitively
+  [[ "$f" == *.cpp ]] || continue
+  if ! clang-tidy -p "$BUILD_DIR" "$f" --quiet; then
+    FAILED=1
+  fi
+done
+
+if [ $FAILED -ne 0 ]; then
+  echo "clang-tidy found errors. Fix them or use git commit --no-verify to skip."
+  exit 1
+fi
