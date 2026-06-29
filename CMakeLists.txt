@@ -19,13 +19,13 @@ add_test(NAME sparsemat_tests COMMAND test_sparsemat)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_custom_target(dist
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/dist
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/dist
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/amalgamate.py
           ${CMAKE_SOURCE_DIR}/include/sparsemat/api/sparsemat.h
-          ${CMAKE_BINARY_DIR}/dist/sparsemat_dist.h
+          ${CMAKE_SOURCE_DIR}/dist/sparsemat.h
           ${CMAKE_SOURCE_DIR}/include
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  COMMENT "Building single-header dist/sparsemat.h"
+  COMMENT "Building dist/sparsemat.h"
   VERBATIM
 )
 

@@ -56,10 +56,10 @@ This is a header-only library. There are two ways to use it:
 **Single-header amalgamation:** Build the `dist` target to generate a self-contained header, then copy it into your project:
 ```bash
 cmake --build build --target dist
-# produces build/dist/sparsemat_dist.h
+# produces dist/sparsemat.h
 ```
 ```cpp
-#include "sparsemat_dist.h"
+#include "sparsemat.h"
 ```
 
 
