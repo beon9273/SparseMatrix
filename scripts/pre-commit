@@ -37,19 +37,18 @@ else
   echo "Skipping build check: no build directory found at $BUILD_DIR"
 fi
 
-# --- clang-format ---
+# --- clang-format (all tracked C++ files) ---
 echo "Running clang-format..."
 format_failed=0
-for f in "${all_files[@]}"; do
-  [[ "$f" == "$REPO_ROOT/dist/"* ]] && continue
-  if ! clang-format-18 --dry-run --Werror "$f" 2>/dev/null; then
+while IFS= read -r f; do
+  if ! clang-format-18 --dry-run --Werror "$REPO_ROOT/$f" 2>/dev/null; then
     echo "  clang-format: $f"
     format_failed=1
   fi
-done
+done < <(git ls-files '*.h' '*.hpp' '*.cpp' '*.cc' '*.cxx' | grep -v '^dist/')
 
 if [[ $format_failed -ne 0 ]]; then
-  echo "Fix formatting with: clang-format-18 -i <file>"
+  echo "Fix with: git ls-files '*.h' '*.cpp' | grep -v '^dist/' | xargs clang-format-18 -i"
   exit 1
 fi
 
