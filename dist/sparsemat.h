@@ -517,7 +517,7 @@ class Triangular {
       return is_numerically_lower<I + 1, I + 2>(a, TOLERANCE);
     } else if constexpr (J > I) {
       constexpr int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-      if constexpr(index >= 0) {
+      if constexpr (index >= 0) {
         if (std::abs(a.values[index]) > TOLERANCE) {
           return false;
         }
@@ -748,8 +748,8 @@ class LowerTriangular {
     for (bool b : compute_nonzero_rows()) {
       if (b) {
         ++count;
-}
-}
+      }
+    }
     return count;
   }
 
@@ -760,7 +760,7 @@ class LowerTriangular {
     for (std::size_t i = 0; i < SparseMat::rows; ++i) {
       if (nz[i]) {
         result[k++] = i;
-}
+      }
     }
     return result;
   }
@@ -774,7 +774,7 @@ class LowerTriangular {
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
   constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t /*col*/) {
-    return std::ranges::any_of(nonZeros, [row](std::size_t idx){ return idx == row; });
+    return std::ranges::any_of(nonZeros, [row](std::size_t idx) { return idx == row; });
   }
 
   static constexpr std::size_t numNonzeros =
@@ -839,8 +839,8 @@ class UpperTriangular {
     for (bool b : compute_nonzero_rows()) {
       if (b) {
         ++count;
-}
-}
+      }
+    }
     return count;
   }
 
@@ -865,7 +865,7 @@ class UpperTriangular {
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
   constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t /*col*/) {
-    return std::ranges::any_of(nonZeros, [row](std::size_t idx){ return idx == row; });
+    return std::ranges::any_of(nonZeros, [row](std::size_t idx) { return idx == row; });
   }
 
   static constexpr std::size_t numNonzeros =
@@ -973,7 +973,7 @@ class CholeskySparsity {
       std::size_t col = idx % SparseMat::cols;
       if (row >= col) {
         fill[row][col] = true;
-}
+      }
     }
     // Propagate: outer-product update at step k creates fill at (i,j)
     // when both column-k entries are non-zero (i >= j > k).
@@ -981,11 +981,11 @@ class CholeskySparsity {
       for (std::size_t i = k + 1; i < N; ++i) {
         if (!fill[i][k]) {
           continue;
-}
+        }
         for (std::size_t j = k + 1; j <= i; ++j) {
           if (fill[j][k]) {
             fill[i][j] = true;
-}
+          }
         }
       }
     }
@@ -1005,10 +1005,10 @@ class CholeskySparsity {
   static constexpr bool l_nonzero(std::size_t row, std::size_t col) {
     if (col > row) {
       return false;  // upper triangle
-}
+    }
     if (row == col) {
       return true;  // diagonal always stored
-}
+    }
     return fill[row][col];
   }
 };
@@ -1214,7 +1214,7 @@ template<SparseMatrixType SparseMat>
 struct Cholesky {
   decltype(cholesky_factorize(std::declval<SparseMat>())) lower;
 
-  Cholesky(const SparseMat& a) : lower(cholesky_factorize(a)) { }
+  Cholesky(const SparseMat& a) : lower(cholesky_factorize(a)) {}
 
   template<SparseMatrixType RHS>
   auto solve(const RHS& b) {
@@ -1249,7 +1249,9 @@ class Dense {
   static constexpr std::size_t total_elements = rows * cols;
 
   /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
-  constexpr static auto is_result_index_nonzero(std::size_t /*unused*/, std::size_t /*unused*/) { return true; }
+  constexpr static auto is_result_index_nonzero(std::size_t /*unused*/, std::size_t /*unused*/) {
+    return true;
+  }
 
   /// Delegates to OperationUtilities to count result non-zeros.
   constexpr static auto num_nonzeros() {
@@ -1459,10 +1461,10 @@ class Invert2x2 {
   constexpr static auto is_result_index_nonzero(std::size_t row, std::size_t col) {
     if (row == 0 && col == 0) {
       return SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(1, 1);
-    } 
+    }
     if (row == 0 && col == 1) {
       return SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(0, 1);
-    } 
+    }
     if (row == 1 && col == 0) {
       return SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(1, 0);
     }
@@ -1673,11 +1675,11 @@ class LUSparsity {
       for (std::size_t i = k + 1; i < N; ++i) {
         if (!fill[i][k]) {
           continue;
-}
+        }
         for (std::size_t j = k; j < N; ++j) {
           if (fill[k][j]) {
             fill[i][j] = true;
-}
+          }
         }
       }
     }
@@ -1692,10 +1694,10 @@ class LUSparsity {
   static constexpr bool l_nonzero(std::size_t row, std::size_t col) {
     if (row == col) {
       return true;
-}
+    }
     if (col > row) {
       return false;
-}
+    }
     return fill[row][col];
   }
 
@@ -1703,7 +1705,7 @@ class LUSparsity {
   static constexpr bool u_nonzero(std::size_t row, std::size_t col) {
     if (col < row) {
       return false;
-}
+    }
     return fill[row][col];
   }
 };
@@ -2345,7 +2347,8 @@ class Symmetric {
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(col, row);
         if (index_ji < 0 && std::abs(value) > TOLERANCE) {
           return false;  // Non-zero position does not have a corresponding symmetric position
-        } if (index_ji >= 0 && std::abs(value - a.values[index_ji]) > TOLERANCE) {
+        }
+        if (index_ji >= 0 && std::abs(value - a.values[index_ji]) > TOLERANCE) {
           return false;  // Non-zero values are not symmetric within tolerance
         }
       }

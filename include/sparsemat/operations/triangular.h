@@ -1,6 +1,6 @@
 #pragma once
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 #include "sparsemat/concepts/concepts.h"
 
@@ -86,7 +86,7 @@ class Triangular {
       return is_numerically_lower<I + 1, I + 2>(a, TOLERANCE);
     } else if constexpr (J > I) {
       constexpr int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-      if constexpr(index >= 0) {
+      if constexpr (index >= 0) {
         if (std::abs(a.values[index]) > TOLERANCE) {
           return false;
         }
@@ -317,8 +317,8 @@ class LowerTriangular {
     for (bool b : compute_nonzero_rows()) {
       if (b) {
         ++count;
-}
-}
+      }
+    }
     return count;
   }
 
@@ -329,7 +329,7 @@ class LowerTriangular {
     for (std::size_t i = 0; i < SparseMat::rows; ++i) {
       if (nz[i]) {
         result[k++] = i;
-}
+      }
     }
     return result;
   }
@@ -343,7 +343,7 @@ class LowerTriangular {
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
   constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t /*col*/) {
-    return std::ranges::any_of(nonZeros, [row](std::size_t idx){ return idx == row; });
+    return std::ranges::any_of(nonZeros, [row](std::size_t idx) { return idx == row; });
   }
 
   static constexpr std::size_t numNonzeros =
@@ -408,8 +408,8 @@ class UpperTriangular {
     for (bool b : compute_nonzero_rows()) {
       if (b) {
         ++count;
-}
-}
+      }
+    }
     return count;
   }
 
@@ -434,7 +434,7 @@ class UpperTriangular {
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
   constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t /*col*/) {
-    return std::ranges::any_of(nonZeros, [row](std::size_t idx){ return idx == row; });
+    return std::ranges::any_of(nonZeros, [row](std::size_t idx) { return idx == row; });
   }
 
   static constexpr std::size_t numNonzeros =

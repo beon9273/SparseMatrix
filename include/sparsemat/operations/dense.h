@@ -25,7 +25,9 @@ class Dense {
   static constexpr std::size_t total_elements = rows * cols;
 
   /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
-  constexpr static auto is_result_index_nonzero(std::size_t /*unused*/, std::size_t /*unused*/) { return true; }
+  constexpr static auto is_result_index_nonzero(std::size_t /*unused*/, std::size_t /*unused*/) {
+    return true;
+  }
 
   /// Delegates to OperationUtilities to count result non-zeros.
   constexpr static auto num_nonzeros() {

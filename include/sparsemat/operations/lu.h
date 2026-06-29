@@ -36,11 +36,11 @@ class LUSparsity {
       for (std::size_t i = k + 1; i < N; ++i) {
         if (!fill[i][k]) {
           continue;
-}
+        }
         for (std::size_t j = k; j < N; ++j) {
           if (fill[k][j]) {
             fill[i][j] = true;
-}
+          }
         }
       }
     }
@@ -55,10 +55,10 @@ class LUSparsity {
   static constexpr bool l_nonzero(std::size_t row, std::size_t col) {
     if (row == col) {
       return true;
-}
+    }
     if (col > row) {
       return false;
-}
+    }
     return fill[row][col];
   }
 
@@ -66,7 +66,7 @@ class LUSparsity {
   static constexpr bool u_nonzero(std::size_t row, std::size_t col) {
     if (col < row) {
       return false;
-}
+    }
     return fill[row][col];
   }
 };

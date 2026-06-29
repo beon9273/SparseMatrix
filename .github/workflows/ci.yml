@@ -41,8 +41,7 @@ jobs:
 
       - name: clang-format
         run: |
-          find include examples -name '*.h' -o -name '*.cpp' | \
-            grep -v '^dist/' | \
+          find include examples tests \( -name '*.h' -o -name '*.cpp' \) | \
             xargs clang-format-18 --dry-run --Werror
 
       - name: clang-tidy

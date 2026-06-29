@@ -35,7 +35,7 @@ class CholeskySparsity {
       std::size_t col = idx % SparseMat::cols;
       if (row >= col) {
         fill[row][col] = true;
-}
+      }
     }
     // Propagate: outer-product update at step k creates fill at (i,j)
     // when both column-k entries are non-zero (i >= j > k).
@@ -43,11 +43,11 @@ class CholeskySparsity {
       for (std::size_t i = k + 1; i < N; ++i) {
         if (!fill[i][k]) {
           continue;
-}
+        }
         for (std::size_t j = k + 1; j <= i; ++j) {
           if (fill[j][k]) {
             fill[i][j] = true;
-}
+          }
         }
       }
     }
@@ -67,10 +67,10 @@ class CholeskySparsity {
   static constexpr bool l_nonzero(std::size_t row, std::size_t col) {
     if (col > row) {
       return false;  // upper triangle
-}
+    }
     if (row == col) {
       return true;  // diagonal always stored
-}
+    }
     return fill[row][col];
   }
 };
@@ -276,7 +276,7 @@ template<SparseMatrixType SparseMat>
 struct Cholesky {
   decltype(cholesky_factorize(std::declval<SparseMat>())) lower;
 
-  Cholesky(const SparseMat& a) : lower(cholesky_factorize(a)) { }
+  Cholesky(const SparseMat& a) : lower(cholesky_factorize(a)) {}
 
   template<SparseMatrixType RHS>
   auto solve(const RHS& b) {

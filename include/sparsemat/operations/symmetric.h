@@ -77,7 +77,8 @@ class Symmetric {
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(col, row);
         if (index_ji < 0 && std::abs(value) > TOLERANCE) {
           return false;  // Non-zero position does not have a corresponding symmetric position
-        } if (index_ji >= 0 && std::abs(value - a.values[index_ji]) > TOLERANCE) {
+        }
+        if (index_ji >= 0 && std::abs(value - a.values[index_ji]) > TOLERANCE) {
           return false;  // Non-zero values are not symmetric within tolerance
         }
       }

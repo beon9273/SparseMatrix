@@ -45,10 +45,10 @@ class Invert2x2 {
   constexpr static auto is_result_index_nonzero(std::size_t row, std::size_t col) {
     if (row == 0 && col == 0) {
       return SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(1, 1);
-    } 
+    }
     if (row == 0 && col == 1) {
       return SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(0, 1);
-    } 
+    }
     if (row == 1 && col == 0) {
       return SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(1, 0);
     }
