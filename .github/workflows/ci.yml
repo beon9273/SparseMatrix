@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build clang-18 clang-tidy-18 clang-format-18 python3
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++-18
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Build dist header
+        run: cmake --build build --target dist
+
+      - name: Check dist header is up to date
+        run: |
+          python3 scripts/amalgamate.py \
+            include/sparsemat/api/sparsemat.h \
+            dist/sparsemat.h.new \
+            include
+          diff dist/sparsemat.h dist/sparsemat.h.new || \
+            (echo "dist/sparsemat.h is out of date — run cmake --build build --target dist" && exit 1)
+
+      - name: clang-format
+        run: |
+          find include examples -name '*.h' -o -name '*.cpp' | \
+            grep -v '^dist/' | \
+            xargs clang-format-18 --dry-run --Werror
+
+      - name: clang-tidy
+        run: |
+          clang-tidy-18 -p build \
+            --header-filter="$PWD/include/.*" \
+            examples/demo.cpp
