@@ -3,22 +3,24 @@
 #include <array>
 #include <iostream>
 
-#include "operations/add.h"
-#include "operations/cholesky.h"
-#include "operations/dense.h"
-#include "operations/diagonal.h"
-#include "operations/hadamard.h"
-#include "operations/invert.h"
-#include "operations/kronecker.h"
-#include "operations/lu.h"
-#include "operations/multiply.h"
-#include "operations/scale.h"
-#include "operations/shift.h"
-#include "operations/symmetric.h"
-#include "operations/trace.h"
-#include "operations/transpose.h"
-#include "operations/triangular.h"
-#include "operations/utils.h"
+#include "sparsemat/operations/add.h"
+#include "sparsemat/operations/cholesky.h"
+#include "sparsemat/operations/dense.h"
+#include "sparsemat/operations/diagonal.h"
+#include "sparsemat/operations/hadamard.h"
+#include "sparsemat/operations/invert.h"
+#include "sparsemat/operations/kronecker.h"
+#include "sparsemat/operations/lu.h"
+#include "sparsemat/operations/multiply.h"
+#include "sparsemat/operations/scale.h"
+#include "sparsemat/operations/shift.h"
+#include "sparsemat/operations/symmetric.h"
+#include "sparsemat/operations/trace.h"
+#include "sparsemat/operations/transpose.h"
+#include "sparsemat/operations/triangular.h"
+#include "sparsemat/operations/utils.h"
+
+namespace SparseLinearAlgebra {
 
 /**
  * @brief Compile-time sparse matrix whose non-zero positions are encoded as
@@ -138,8 +140,8 @@ class SparseMat {
    */
   template<std::size_t I, std::size_t J>
   [[nodiscard]] DataType get() const {
-    if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-      constexpr int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+    if constexpr (MatrixUtilities<SparseMat>::isNonZero(I, J)) {
+      constexpr int index = MatrixUtilities<SparseMat>::getSparseIndex(I, J);
       return values[index];
     }
     return static_cast<DataType>(0);
@@ -156,8 +158,8 @@ class SparseMat {
    * @return  Element value, or zero if the position is structurally zero.
    */
   [[nodiscard]] DataType get(int i, int j) const {
-    if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(i, j)) {
-      int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(i, j);
+    if (MatrixUtilities<SparseMat>::isNonZero(i, j)) {
+      int index = MatrixUtilities<SparseMat>::getSparseIndex(i, j);
       return values[index];
     }
     return static_cast<DataType>(0);
@@ -247,11 +249,11 @@ class SparseMat {
    */
   template<std::size_t I, std::size_t J>
   void set(DataType value) {
-    if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-      constexpr int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+    if constexpr (MatrixUtilities<SparseMat>::isNonZero(I, J)) {
+      constexpr int index = MatrixUtilities<SparseMat>::getSparseIndex(I, J);
       values[index] = value;
     } else {
-      static_assert(SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J),
+      static_assert(MatrixUtilities<SparseMat>::isNonZero(I, J),
                     "Attempting to set a value at a zero index.");
     }
   }
@@ -269,8 +271,8 @@ class SparseMat {
    *              @c false otherwise.
    */
   bool set(int i, int j, DataType value) {
-    if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(i, j)) {
-      int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(i, j);
+    if (MatrixUtilities<SparseMat>::isNonZero(i, j)) {
+      int index = MatrixUtilities<SparseMat>::getSparseIndex(i, j);
       values[index] = value;
       return true;
     }
@@ -350,7 +352,7 @@ class SparseMat {
     }
   }
 
-  [[nodiscard]] auto cholesky() const { return SparseLinearAlgebra::Cholesky(*this); }
+  [[nodiscard]] auto cholesky() const { return Cholesky(*this); }
 
   /**
    * @brief Element-wise addition: @c *this + @p other.
@@ -450,7 +452,9 @@ class SparseMat {
    * @param factor Scalar multiplier.
    * @return       Scaled matrix.
    */
-  [[nodiscard]] auto scale(DataType factor) const { return SparseLinearAlgebra::scale(*this, factor); }
+  [[nodiscard]] auto scale(DataType factor) const {
+    return SparseLinearAlgebra::scale(*this, factor);
+  }
 
   /**
    * @brief Multiplies every non-zero element by @p factor in place.
@@ -469,7 +473,9 @@ class SparseMat {
    * @param factor Scalar to add to each stored value.
    * @return       Shifted matrix.
    */
-  [[nodiscard]] auto shift(DataType factor) const { return SparseLinearAlgebra::shift(*this, factor); }
+  [[nodiscard]] auto shift(DataType factor) const {
+    return SparseLinearAlgebra::shift(*this, factor);
+  }
 
   /**
    * @brief Adds @p factor to every non-zero element in place.
@@ -513,7 +519,7 @@ class SparseMat {
     requires(rows == cols)
   {
     auto l = SparseLinearAlgebra::cholesky_factorize(*this);
-    return SparseLinearAlgebra::CholeskyFactor<decltype(l)>(std::move(l));
+    return CholeskyFactor<decltype(l)>(std::move(l));
   }
 
   /**
@@ -592,3 +598,5 @@ class SparseMat {
     }
   }
 };
+
+}  // namespace SparseLinearAlgebra

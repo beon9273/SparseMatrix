@@ -2,9 +2,9 @@
 #include <cmath>
 #include <algorithm>
 
-#include "concepts/concepts.h"
+#include "sparsemat/concepts/concepts.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Compile-time and runtime triangular structure checks for a sparse matrix.
@@ -446,34 +446,34 @@ class UpperTriangular {
   }
 };
 
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
 /// Returns @c true if the sparsity pattern has no above-diagonal non-zeros.
 template<SparseMatrixType SparseMat>
 constexpr auto is_structurally_lower_triangular(const SparseMat& /*a*/) {
-  return Triangular<SparseMat>::structurally_lower;
+  return detail::Triangular<SparseMat>::structurally_lower;
 }
 
 /// Returns @c true if every above-diagonal stored value is within tolerance of zero.
 template<SparseMatrixType SparseMat>
 auto is_numerically_lower_triangular(const SparseMat& a,
                                      typename SparseMat::DataType tolerance = 1e-6) {
-  return Triangular<SparseMat>::is_numerically_lower(a, tolerance);
+  return detail::Triangular<SparseMat>::is_numerically_lower(a, tolerance);
 }
 
 /// Returns @c true if the sparsity pattern has no below-diagonal non-zeros.
 template<SparseMatrixType SparseMat>
 constexpr auto is_structurally_upper_triangular(const SparseMat& /*a*/) {
-  return Triangular<SparseMat>::structurally_upper;
+  return detail::Triangular<SparseMat>::structurally_upper;
 }
 
 /// Returns @c true if every below-diagonal stored value is within tolerance of zero.
 template<SparseMatrixType SparseMat>
 auto is_numerically_upper_triangular(const SparseMat& a,
                                      typename SparseMat::DataType tolerance = 1e-6) {
-  return Triangular<SparseMat>::is_numerically_upper(a, tolerance);
+  return detail::Triangular<SparseMat>::is_numerically_upper(a, tolerance);
 }
 
 /**
@@ -489,8 +489,8 @@ auto is_numerically_upper_triangular(const SparseMat& a,
  */
 template<SparseMatrixType SparseMat, SparseMatrixType RHS>
 auto forward_solve(const SparseMat& A, const RHS& b) {
-  auto result = LowerTriangular<SparseMat, RHS>::make_result();
-  Triangular<SparseMat>().forward_solve(result, A, b);
+  auto result = detail::LowerTriangular<SparseMat, RHS>::make_result();
+  detail::Triangular<SparseMat>().forward_solve(result, A, b);
   return result;
 }
 
@@ -507,8 +507,8 @@ auto forward_solve(const SparseMat& A, const RHS& b) {
  */
 template<SparseMatrixType SparseMat, SparseMatrixType RHS>
 auto backward_solve(const SparseMat& A, const RHS& b) {
-  auto result = UpperTriangular<SparseMat, RHS>::make_result();
-  Triangular<SparseMat>().backward_solve(result, A, b);
+  auto result = detail::UpperTriangular<SparseMat, RHS>::make_result();
+  detail::Triangular<SparseMat>().backward_solve(result, A, b);
   return result;
 }
 

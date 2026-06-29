@@ -1,9 +1,9 @@
 #pragma once
 #include <cmath>
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for expanding a sparse matrix into a dense array.
@@ -60,13 +60,13 @@ class Dense {
     return result;
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
 template<SparseMatrixType SparseMat>
 auto dense(const SparseMat& a) {
-  return Dense<SparseMat>::dense(a);
+  return detail::Dense<SparseMat>::dense(a);
 }
 
 }  // namespace SparseLinearAlgebra

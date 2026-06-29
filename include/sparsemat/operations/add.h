@@ -1,9 +1,9 @@
 #pragma once
 
-#include "concepts/concepts.h"
-#include "operations/utils.h"
+#include "sparsemat/concepts/concepts.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for sparse matrix addition and subtraction.
@@ -82,7 +82,7 @@ class Add {
     return result;
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -100,7 +100,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 auto add(const A& a, const B& b) {
-  return Add<A, B>::add(a, b, 1);
+  return detail::Add<A, B>::add(a, b, 1);
 }
 
 /**
@@ -117,7 +117,7 @@ auto add(const A& a, const B& b) {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 auto subtract(const A& a, const B& b) {
-  return Add<A, B>::add(a, b, -1);
+  return detail::Add<A, B>::add(a, b, -1);
 }
 
 /**
@@ -137,7 +137,7 @@ auto subtract(const A& a, const B& b) {
  */
 template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
 auto scaled_add(const A& a, const B& b, const DataType multiplier) {
-  return Add<A, B>::add(a, b, multiplier);
+  return detail::Add<A, B>::add(a, b, multiplier);
 }
 
 }  // namespace SparseLinearAlgebra

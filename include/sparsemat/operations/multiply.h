@@ -1,8 +1,8 @@
 #pragma once
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for sparse matrix multiplication A × B.
@@ -91,7 +91,7 @@ class Multiply {
     return result;
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -110,7 +110,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 auto multiply(const A& a, const B& b) {
-  return Multiply<A, B>::multiply(a, b);
+  return detail::Multiply<A, B>::multiply(a, b);
 }
 
 /**

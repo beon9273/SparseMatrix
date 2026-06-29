@@ -3,6 +3,7 @@
 #include <string>
 
 #include "sparsemat_dist.h"
+using namespace SparseLinearAlgebra;
 
 // --- Minimal test harness ---
 

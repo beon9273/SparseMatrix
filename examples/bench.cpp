@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "sparsemat_dist.h"
-
+using SparseLinearAlgebra::SparseMat;
 // ---------------------------------------------------------------------------
 // Timing harness
 // ---------------------------------------------------------------------------

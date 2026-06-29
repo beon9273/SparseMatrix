@@ -1,13 +1,23 @@
 # sparsemat
 
-> **Experimental** — built to explore what happens when you push sparsity into the type system. Not intended for production use. If you just need sparse matrices, use Eigen.
+> **Experimental** — built to explore what happens when you push sparsity into the type system. Not intended for production use. 
 
-A header-only C++20 sparse matrix library where sparsity patterns are encoded as template parameters. The idea: if the non-zero structure of your matrices is fixed and known at compile time, the compiler can eliminate all zero operations entirely.
+A header-only C++20 sparse matrix library where sparsity patterns are encoded as template parameters. 
 
-Sparsity patterns of operation results (e.g. `C = A × B`) are computed at compile time. All storage is `std::array`. Operations are fully unrolled and zero multiplications are stripped from the binary.
+Idea: if the non-zero structure of your matrices is fixed and known at compile time, the compiler can eliminate a whole bunch of operations.
 
-The tradeoff: every distinct sparsity pattern is a distinct type, which makes the API awkward and compile times long for large configurations. Whether the performance gain is worth that cost depends heavily on how sparse your matrices are and how many operations you're doing.
+Solution: user provides sparsity pattern as template parameters. Sparsity patterns of operations (e.g. `C = A × B`) are computed at compile time. Recursive templates are used to unroll operation loops at runtime. Zero operations (i.e, multiplications/additions where one of the terms is zero) are skipped 
+using compile-time constructs( e.g. constexpr if).  
 
+
+The tradeoff: 
+
+Limitations: 
+  - entering sparsity patterns at runtime is awkward and bugprone. Consider using scripts/generate.py
+    to generate class names for a given sparse matrix. 
+  - every distinct sparsity pattern is a distinct type, which makes compile times long for large configurations and binary size could expload pretty easily. 
+  - designed for SMALL matrices: recursive templates are used to unroll matrix operations. Template recursion limits will be encountered for larger matrices. Probably only useful for up to 10x10
+  - a certain level of sparsity is required.  Whether the performance gain is worth that cost depends heavily on how sparse your matrices are and how many operations you're doing.
 
 ```cpp
 // SparseMat<DataType, Rows, Cols, NonZeroIndices...>
@@ -21,27 +31,37 @@ SparseMat<double, 3, 3, 0, 1, 2> B(4, 5, 6);  // first row only
 auto C = A.mult(B);
 ```
 
-## Dev setup
-
-Install the pre-commit hook to auto-format and lint on every commit:
-
-```bash
-ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
-```
-
-The hook runs `clang-format` on all `.cpp`/`.h` files and re-stages them, then runs `clang-tidy` on all `.cpp` files. It requires `build/compile_commands.json` to exist (run `cmake -B build` first). Use `git commit --no-verify` to bypass.
-
 ## Requirements
 
 - C++20
 - CMake 3.16+
 
-## Building
+
+## Building 
 
 ```bash
 cmake -B build
 cmake --build build
 ```
+
+## Linking.
+
+This is a header-only library. There are two ways to use it:
+
+**Multi-header:** Add `include/` to your compiler search path and include the top-level header:
+```cpp
+#include "sparsemat/api/sparsemat.h"
+```
+
+**Single-header amalgamation:** Build the `dist` target to generate a self-contained header, then copy it into your project:
+```bash
+cmake --build build --target dist
+# produces build/dist/sparsemat_dist.h
+```
+```cpp
+#include "sparsemat_dist.h"
+```
+
 
 ## Running tests
 
@@ -96,13 +116,13 @@ All operations return a new matrix with the result sparsity inferred at compile 
 | `a.scale_inplace(factor)` | Scalar multiply in place |
 | `a.shift(factor)` | Scalar add factor, returns new matrix |
 | `a.shift_inplace(factor)` | Scalar add factor in place |
-
 | `a.normalize()` | Divide by Frobenius norm, returns new matrix |
 | `a.normalize_inplace()` | Divide by Frobenius norm in place |
 | `a.frobenius()` | Frobenius norm (scalar) |
 | `a.dot(b)` | Dot product for row or column vectors |
 | `a.dense()` | Convert to a dense array |
 | `a.print()` | Print non-zero values with their flat indices |
++ more 
 
 Free functions are also available under `SparseLinearAlgebra::` (`multiply`, `add`, `subtract`, `hadamard`, `transpose`, `scale`, `scale_inplace`, `normalize`, `normalize_inplace`, `frobenius`, `trace`, `dense`, `power<N>`).
 

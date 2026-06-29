@@ -3,9 +3,9 @@
 #include <cstddef>
 #include <span>
 
-#include "concepts/concepts.h"
+#include "sparsemat/concepts/concepts.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Set every stored diagonal element of a sparse matrix to a single value.
@@ -55,7 +55,7 @@ void set_diagonal_impl(A& a, std::span<typename A::DataType> values) {
   }
 }
 
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -66,7 +66,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 void set_diagonal(SparseMat& a, typename SparseMat::DataType value) {
-  set_diagonal_impl(a, value);
+  detail::set_diagonal_impl(a, value);
 }
 
 /**
@@ -80,7 +80,7 @@ void set_diagonal(SparseMat& a, typename SparseMat::DataType value) {
  */
 template<SparseMatrixType SparseMat>
 void set_diagonal(SparseMat& a, std::span<typename SparseMat::DataType> values) {
-  set_diagonal_impl(a, values);
+  detail::set_diagonal_impl(a, values);
 }
 
 }  // namespace SparseLinearAlgebra

@@ -3,11 +3,11 @@
 #include <cmath>
 #include <cstddef>
 
-#include "concepts/concepts.h"
-#include "operations/diagonal.h"
-#include "operations/triangular.h"
+#include "sparsemat/concepts/concepts.h"
+#include "sparsemat/operations/diagonal.h"
+#include "sparsemat/operations/triangular.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Compile-time symbolic Cholesky fill computation for a square sparse matrix.
@@ -196,7 +196,7 @@ class CholeskyFactorization {
   }
 };
 
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -245,8 +245,8 @@ class CholeskyFactor {
  */
 template<SparseMatrixType SparseMat>
 auto cholesky_factorize(const SparseMat& A) {
-  auto l = LCholeskyMatrix<SparseMat>::make_result();
-  CholeskyFactorization<SparseMat>::factorize(A, l);
+  auto l = detail::LCholeskyMatrix<SparseMat>::make_result();
+  detail::CholeskyFactorization<SparseMat>::factorize(A, l);
   return l;
 }
 

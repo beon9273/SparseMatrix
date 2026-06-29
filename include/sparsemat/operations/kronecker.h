@@ -1,8 +1,8 @@
 #pragma once
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for the Kronecker (tensor) product.
@@ -75,7 +75,7 @@ class Kronecker {
   }
 };
 
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -94,7 +94,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 auto kronecker(const A& a, const B& b) {
-  return Kronecker<A, B>::kronecker(a, b);
+  return detail::Kronecker<A, B>::kronecker(a, b);
 }
 
 }  // namespace SparseLinearAlgebra

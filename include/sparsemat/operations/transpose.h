@@ -1,8 +1,8 @@
 #pragma once
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for sparse matrix transposition.
@@ -67,7 +67,7 @@ class Transpose {
     return result;
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -84,7 +84,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto transpose(const SparseMat& a) {
-  return Transpose<SparseMat>::transpose(a);
+  return detail::Transpose<SparseMat>::transpose(a);
 }
 
 }  // namespace SparseLinearAlgebra

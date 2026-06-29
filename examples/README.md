@@ -17,12 +17,12 @@ cmake -B build -DSPARSEMAT_BUILD_EXAMPLES=OFF
 
 ## demo
 
-**Binary:** `build/examples/sparsemat`
+**Binary:** `build/examples/demo`
 
 Basic usage of the core matrix operations: multiply, add, subtract, and transpose on two 3×3 sparse matrices with compile-time sparsity patterns.
 
 ```sh
-./build/examples/sparsemat
+./build/examples/demo
 ```
 
 ---

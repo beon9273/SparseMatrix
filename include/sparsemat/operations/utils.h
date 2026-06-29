@@ -1,13 +1,6 @@
 #pragma once
 
-#include "concepts/concepts.h"
-
-// Bring concept names into scope so operation headers can use them
-// unqualified inside anonymous namespaces.
-using SparseLinearAlgebra::MatrixDataType;
-using SparseLinearAlgebra::OperationType;
-using SparseLinearAlgebra::SparseMatrixBase;
-using SparseLinearAlgebra::SparseMatrixType;
+#include "sparsemat/concepts/concepts.h"
 
 namespace SparseLinearAlgebra {
 

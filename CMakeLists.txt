@@ -21,7 +21,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_custom_target(dist
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/dist
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/amalgamate.py
-          ${CMAKE_SOURCE_DIR}/include/api/sparsemat.h
+          ${CMAKE_SOURCE_DIR}/include/sparsemat/api/sparsemat.h
           ${CMAKE_BINARY_DIR}/dist/sparsemat_dist.h
           ${CMAKE_SOURCE_DIR}/include
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -37,24 +37,24 @@ endif()
 # --- Install / package ---
 
 # Interface library — header-only, no compilation needed by consumers
-add_library(sparsemat_lib INTERFACE)
-add_library(sparsemat::sparsemat ALIAS sparsemat_lib)
+add_library(sparsemat INTERFACE)
+add_library(sparsemat::sparsemat ALIAS sparsemat)
 
-target_include_directories(sparsemat_lib INTERFACE
+target_include_directories(sparsemat INTERFACE
   $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 
-target_compile_features(sparsemat_lib INTERFACE cxx_std_20)
+target_compile_features(sparsemat INTERFACE cxx_std_20)
 
 include(GNUInstallDirs)
 
-install(TARGETS sparsemat_lib
+install(TARGETS sparsemat
   EXPORT sparsemat_targets
 )
 
-install(DIRECTORY include/
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+install(DIRECTORY include/sparsemat/
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/sparsemat
   FILES_MATCHING PATTERN "*.h"
 )
 
@@ -97,8 +97,8 @@ if(DOXYGEN_FOUND)
   set(DOXYGEN_QUIET YES)
 
   doxygen_add_docs(docs
-    ${CMAKE_SOURCE_DIR}/include/api/sparsemat.h
-    ${CMAKE_SOURCE_DIR}/include/operations
+    ${CMAKE_SOURCE_DIR}/include/sparsemat/api/sparsemat.h
+    ${CMAKE_SOURCE_DIR}/include/sparsemat/operations
     COMMENT "Generating API documentation"
   )
 endif()

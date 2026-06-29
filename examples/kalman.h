@@ -6,6 +6,8 @@
 
 #include "sparsemat_dist.h"
 
+using namespace SparseLinearAlgebra;
+
 namespace Kalman {
 
 // ---------------------------------------------------------------------------

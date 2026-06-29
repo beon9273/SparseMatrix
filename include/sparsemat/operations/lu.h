@@ -2,10 +2,10 @@
 
 #include <cstddef>
 
-#include "concepts/concepts.h"
-#include "operations/diagonal.h"
-#include "operations/triangular.h"
-namespace {
+#include "sparsemat/concepts/concepts.h"
+#include "sparsemat/operations/diagonal.h"
+#include "sparsemat/operations/triangular.h"
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Compile-time symbolic LU fill computation for a square sparse matrix.
@@ -222,7 +222,7 @@ class LUFactorization {
   }
 };
 
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -238,9 +238,9 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto lu_factorize(const SparseMat& A) {
-  auto l = LMatrix<SparseMat>::make_result();
-  auto u = UMatrix<SparseMat>::make_result();
-  LUFactorization<SparseMat>::factorize(A, l, u);
+  auto l = detail::LMatrix<SparseMat>::make_result();
+  auto u = detail::UMatrix<SparseMat>::make_result();
+  detail::LUFactorization<SparseMat>::factorize(A, l, u);
   return std::make_pair(l, u);
 }
 

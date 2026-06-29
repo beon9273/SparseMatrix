@@ -1,8 +1,8 @@
 #pragma once
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for computing the trace of a sparse matrix.
@@ -38,7 +38,7 @@ class Trace {
   };
 };
 
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -55,7 +55,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto trace(const SparseMat& a) {
-  return Trace<SparseMat>::template trace<0>(a);
+  return detail::Trace<SparseMat>::template trace<0>(a);
 }
 
 }  // namespace SparseLinearAlgebra

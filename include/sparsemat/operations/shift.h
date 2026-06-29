@@ -1,9 +1,9 @@
 #pragma once
 #include <cmath>
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for scalar multiplication of a sparse matrix.
@@ -44,7 +44,7 @@ class Shift {
     }
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -61,7 +61,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto shift(const SparseMat& a, typename SparseMat::DataType factor) {
-  return Shift<SparseMat>::shift(a, factor);
+  return detail::Shift<SparseMat>::shift(a, factor);
 }
 
 /**
@@ -75,7 +75,7 @@ auto shift(const SparseMat& a, typename SparseMat::DataType factor) {
  */
 template<typename SparseMat>
 void shift_inplace(SparseMat& a, typename SparseMat::DataType factor) {
-  Shift<SparseMat>::shift_inplace(a, factor);
+  detail::Shift<SparseMat>::shift_inplace(a, factor);
 }
 
 }  // namespace SparseLinearAlgebra

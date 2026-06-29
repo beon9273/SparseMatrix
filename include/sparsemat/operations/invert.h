@@ -2,9 +2,9 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for analytically inverting a 2×2 sparse matrix.
@@ -105,7 +105,7 @@ class Invert2x2 {
     return result;
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -122,7 +122,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto invert2x2(const SparseMat& a) {
-  return Invert2x2<SparseMat>::invert(a);
+  return detail::Invert2x2<SparseMat>::invert(a);
 }
 
 }  // namespace SparseLinearAlgebra

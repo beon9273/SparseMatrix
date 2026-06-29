@@ -1,8 +1,8 @@
 #pragma once
 #include <cmath>
 
-#include "concepts/concepts.h"
-namespace {
+#include "sparsemat/concepts/concepts.h"
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for determining symmetry of a sparse matrix.
@@ -85,7 +85,7 @@ class Symmetric {
     }
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -100,7 +100,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto is_structurally_symmetric(const SparseMat& a) {
-  return Symmetric<SparseMat>::is_structurally_symmetric(a);
+  return detail::Symmetric<SparseMat>::is_structurally_symmetric(a);
 }
 
 /**
@@ -116,12 +116,12 @@ auto is_structurally_symmetric(const SparseMat& a) {
 */
 template<SparseMatrixType SparseMat>
 auto is_sparse_symmetric(const SparseMat& a, typename SparseMat::DataType TOLERANCE = 1e-6) {
-  return Symmetric<SparseMat>::is_sparse_symmetric(a, TOLERANCE);
+  return detail::Symmetric<SparseMat>::is_sparse_symmetric(a, TOLERANCE);
 }
 
 template<SparseMatrixType SparseMat>
 auto is_full_symmetric(const SparseMat& a, typename SparseMat::DataType TOLERANCE = 1e-6) {
-  return Symmetric<SparseMat>::is_full_symmetric(a, TOLERANCE);
+  return detail::Symmetric<SparseMat>::is_full_symmetric(a, TOLERANCE);
 }  // namespace SparseLinearAlgebra
 
 }  // namespace SparseLinearAlgebra

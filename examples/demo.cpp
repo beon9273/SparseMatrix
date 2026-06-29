@@ -1,5 +1,7 @@
 
-#include "api/sparsemat.h"
+#include "sparsemat/api/sparsemat.h"
+
+using namespace SparseLinearAlgebra;
 
 int main() {
   SparseMat<double, 3, 3, 0, 4, 8> mat(1, 2, 3);

@@ -1,8 +1,8 @@
 #pragma once
 #include <cmath>
 
-#include "concepts/concepts.h"
-namespace {
+#include "sparsemat/concepts/concepts.h"
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for scalar multiplication of a sparse matrix.
@@ -43,7 +43,7 @@ class Scale {
     }
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -60,7 +60,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
-  return Scale<SparseMat>::scale(a, factor);
+  return detail::Scale<SparseMat>::scale(a, factor);
 }
 
 /**
@@ -74,7 +74,7 @@ auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
  */
 template<SparseMatrixType SparseMat>
 void scale_inplace(SparseMat& a, typename SparseMat::DataType factor) {
-  Scale<SparseMat>::scale_inplace(a, factor);
+  detail::Scale<SparseMat>::scale_inplace(a, factor);
 }
 
 /**
@@ -109,7 +109,7 @@ auto frobenius(const SparseMat& a) {
  */
 template<SparseMatrixType SparseMat>
 auto normalize(const SparseMat& a) {
-  return Scale<SparseMat>::scale(a, 1.0 / frobenius(a));
+  return detail::Scale<SparseMat>::scale(a, 1.0 / frobenius(a));
 }
 
 /**
@@ -123,7 +123,7 @@ auto normalize(const SparseMat& a) {
  */
 template<SparseMatrixType SparseMat>
 auto normalize_inplace(SparseMat& a) {
-  Scale<SparseMat>::scale_inplace(a, 1.0 / frobenius(a));
+  detail::Scale<SparseMat>::scale_inplace(a, 1.0 / frobenius(a));
 }
 
 }  // namespace SparseLinearAlgebra

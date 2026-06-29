@@ -1,8 +1,8 @@
 #pragma once
 
-#include "operations/utils.h"
+#include "sparsemat/operations/utils.h"
 
-namespace {
+namespace SparseLinearAlgebra::detail {
 
 /**
  * @brief Implementation policy for the Hadamard (element-wise) product.
@@ -76,7 +76,7 @@ class Hadamard {
     return result;
   }
 };
-}  // namespace
+}  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
@@ -95,7 +95,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 auto hadamard(const A& a, const B& b) {
-  return Hadamard<A, B>::hadamard(a, b, 1);
+  return detail::Hadamard<A, B>::hadamard(a, b, 1);
 }
 
 /**
@@ -115,7 +115,7 @@ auto hadamard(const A& a, const B& b) {
  */
 template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
 auto hadamard(const A& a, const B& b, const DataType multiplier) {
-  return Hadamard<A, B>::hadamard(a, b, multiplier);
+  return detail::Hadamard<A, B>::hadamard(a, b, multiplier);
 }
 
 }  // namespace SparseLinearAlgebra
