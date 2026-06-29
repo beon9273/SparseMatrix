@@ -34,11 +34,13 @@ class LUSparsity {
     }
     for (std::size_t k = 0; k < N; ++k) {
       for (std::size_t i = k + 1; i < N; ++i) {
-        if (!fill[i][k])
+        if (!fill[i][k]) {
           continue;
+}
         for (std::size_t j = k; j < N; ++j) {
-          if (fill[k][j])
+          if (fill[k][j]) {
             fill[i][j] = true;
+}
         }
       }
     }
@@ -51,17 +53,20 @@ class LUSparsity {
   /// Returns @c true if L[row][col] is structurally non-zero.
   /// L has a unit diagonal, so diagonal positions always return @c true.
   static constexpr bool l_nonzero(std::size_t row, std::size_t col) {
-    if (row == col)
+    if (row == col) {
       return true;
-    if (col > row)
+}
+    if (col > row) {
       return false;
+}
     return fill[row][col];
   }
 
   /// Returns @c true if U[row][col] is structurally non-zero.
   static constexpr bool u_nonzero(std::size_t row, std::size_t col) {
-    if (col < row)
+    if (col < row) {
       return false;
+}
     return fill[row][col];
   }
 };

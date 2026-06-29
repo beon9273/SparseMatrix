@@ -1,5 +1,5 @@
 
-#include "sparsemat_dist.h"
+#include "api/sparsemat.h"
 
 int main() {
   SparseMat<double, 3, 3, 0, 4, 8> mat(1, 2, 3);

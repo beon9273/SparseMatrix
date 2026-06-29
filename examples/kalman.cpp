@@ -6,12 +6,11 @@
  * Measurement: z = stacked [px, py]^T from each GPS sensor
  *
  * NumGPS is a compile-time parameter: all measurement matrices (H, R, z)
- * are sized and indexed at compile time via template metaprogramming.
+ * are sized and indexed at compile time via template meta-programming.
  */
 
 #include "kalman.h"
 
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -57,11 +56,13 @@ int main() {
   // Initial covariance: high position uncertainty, moderate velocity.
   auto P0 = SparseMat<double, 4, 4, 0, 5, 10, 15>(100.0, 100.0, 10.0, 10.0).dense();
 
-  Kalman::KalmanFilter<NumGPS> kf(x0, P0, dt, g);
+  Kalman::KalmanFilter<NumGPS> kf({.x0 = x0, .P0 = P0, .dt = dt, .g = g});
 
   // Ground-truth integrator.
-  double true_px = 0.0, true_py = 0.0;
-  double true_vx = 50.0, true_vy = 100.0;
+  double true_px = 0.0;
+  double true_py = 0.0;
+  double true_vx = 50.0;
+  double true_vy = 100.0;
 
   std::cout << "step |  true_px   true_py  |  gps_px    gps_py   |  est_px    est_py\n";
   std::cout << "-----+---------------------+---------------------+-------------------\n";

@@ -21,7 +21,7 @@ consteval auto h_indices() {
   std::array<std::size_t, 2 * NumGPS> arr{};
   for (std::size_t i = 0; i < NumGPS; ++i) {
     arr[2 * i] = 8 * i;
-    arr[2 * i + 1] = 8 * i + 5;
+    arr[(2 * i) + 1] = (8 * i) + 5;
   }
   return arr;
 }
@@ -72,11 +72,18 @@ struct KalmanFilter {
   // Gravity correction applied to vy slot (index 3).
   SparseMat<double, 4, 1, 3> gravity;
 
-  KalmanFilter(State x0, Cov P0, double dt0, double g0)
-      : x(x0),
-        P(P0),
-        dt(dt0),
-        g(g0),
+  struct KalmanInput {
+    State x0;
+    Cov P0;
+    double dt{};
+    double g{};
+  };
+
+  KalmanFilter(KalmanInput input)
+      : x(input.x0),
+        P(input.P0),
+        dt(input.dt),
+        g(input.g),
         F(1.0, dt, 1.0, dt, 1.0, 1.0),
         Q(0.1, 0.1, 1.0, 1.0),
         gravity(-g * dt) {}
@@ -109,14 +116,14 @@ struct KalmanFilter {
     auto HP = H.mult(P);    // M × 4
 
     // Innovation.
-    auto innov = measurements.subtract(H.mult(x));
+    auto innovation = measurements.subtract(H.mult(x));
 
-    // Innovation covariance S = H*P*H^T + R  (M × M).
-    auto Chol = HP.mult(HT).add(R).cholesky();
+    // innovation covariance S = H*P*H^T + R  (M × M).
+    auto cholesky = HP.mult(HT).add(R).cholesky();
 
     // State and covariance update.
-    x = x.add(PHT.mult(Chol.solve(innov))).dense();
-    P = P.subtract(PHT.mult(Chol.solve(HP))).dense();
+    x = x.add(PHT.mult(cholesky.solve(innovation))).dense();
+    P = P.subtract(PHT.mult(cholesky.solve(HP))).dense();
   }
 };
 

@@ -320,7 +320,7 @@ class SparseMat {
    * @return        Product matrix.
    */
   template<typename Matrix>
-  auto mult(const Matrix& m) const {
+  [[nodiscard]] auto mult(const Matrix& m) const {
     return SparseLinearAlgebra::multiply(*this, m);
   }
 
@@ -350,7 +350,7 @@ class SparseMat {
     }
   }
 
-  auto cholesky() const { return SparseLinearAlgebra::Cholesky(*this); }
+  [[nodiscard]] auto cholesky() const { return SparseLinearAlgebra::Cholesky(*this); }
 
   /**
    * @brief Element-wise addition: @c *this + @p other.
@@ -376,7 +376,7 @@ class SparseMat {
    * @return        Difference matrix.
    */
   template<typename Matrix>
-  auto subtract(const Matrix& other) const {
+  [[nodiscard]] auto subtract(const Matrix& other) const {
     return SparseLinearAlgebra::subtract(*this, other);
   }
 
@@ -440,7 +440,7 @@ class SparseMat {
    *
    * @return Transposed matrix.
    */
-  auto transpose() const { return SparseLinearAlgebra::transpose(*this); }
+  [[nodiscard]] auto transpose() const { return SparseLinearAlgebra::transpose(*this); }
 
   /**
    * @brief Returns a scaled copy: every non-zero element multiplied by @p factor.
@@ -450,7 +450,7 @@ class SparseMat {
    * @param factor Scalar multiplier.
    * @return       Scaled matrix.
    */
-  auto scale(DataType factor) const { return SparseLinearAlgebra::scale(*this, factor); }
+  [[nodiscard]] auto scale(DataType factor) const { return SparseLinearAlgebra::scale(*this, factor); }
 
   /**
    * @brief Multiplies every non-zero element by @p factor in place.
@@ -469,7 +469,7 @@ class SparseMat {
    * @param factor Scalar to add to each stored value.
    * @return       Shifted matrix.
    */
-  auto shift(DataType factor) const { return SparseLinearAlgebra::shift(*this, factor); }
+  [[nodiscard]] auto shift(DataType factor) const { return SparseLinearAlgebra::shift(*this, factor); }
 
   /**
    * @brief Adds @p factor to every non-zero element in place.
@@ -484,7 +484,7 @@ class SparseMat {
    * @brief Returns a unit-norm copy of this matrix (divided by its Frobenius norm).
    * @return Normalized matrix.
    */
-  auto normalize() const { return SparseLinearAlgebra::normalize(*this); }
+  [[nodiscard]] auto normalize() const { return SparseLinearAlgebra::normalize(*this); }
 
   /**
    * @brief Divides every non-zero element by the Frobenius norm in place.
@@ -494,7 +494,7 @@ class SparseMat {
     return *this;
   }
 
-  auto invert2x2() const
+  [[nodiscard]] auto invert2x2() const
     requires(rows == 2 && cols == 2)
   {
     return SparseLinearAlgebra::invert2x2(*this);
@@ -509,7 +509,7 @@ class SparseMat {
    *
    * @return A @c CholeskyFactor<L> handle for subsequent solves.
    */
-  auto cholesky() const
+  [[nodiscard]] auto cholesky() const
     requires(rows == cols)
   {
     auto l = SparseLinearAlgebra::cholesky_factorize(*this);
@@ -520,7 +520,7 @@ class SparseMat {
    * @brief Computes the Frobenius norm: √(Σ aᵢⱼ²) over all non-zero elements.
    * @return Frobenius norm as the matrix's @c DataType.
    */
-  auto frobenius() const { return SparseLinearAlgebra::frobenius(*this); }
+  [[nodiscard]] auto frobenius() const { return SparseLinearAlgebra::frobenius(*this); }
 
   /**
    * @brief Expands the sparse matrix into a fully dense row-major array.
@@ -529,7 +529,7 @@ class SparseMat {
    *
    * @return @c std::array<DataType, Rows*Cols> in row-major order.
    */
-  auto dense() const { return SparseLinearAlgebra::dense(*this); }
+  [[nodiscard]] auto dense() const { return SparseLinearAlgebra::dense(*this); }
 
   // --- Operator overloads ---
 

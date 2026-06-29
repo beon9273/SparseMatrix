@@ -62,7 +62,7 @@ void print_results() {
             << std::setw(W4) << "Eigen dense" << "\n";
   std::cout << sep << "\n";
 
-  std::string last_config;
+  std::string last_config{};
   for (const auto& r : results) {
     if (r.config != last_config) {
       if (!last_config.empty()) {

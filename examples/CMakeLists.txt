@@ -1,6 +1,5 @@
 add_executable(sparsemat demo.cpp)
-add_dependencies(sparsemat dist)
-target_include_directories(sparsemat PRIVATE ${CMAKE_BINARY_DIR}/dist)
+target_include_directories(sparsemat PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(sparsemat PRIVATE -Wall -Wextra -Werror)
 
 add_executable(kalman kalman.cpp)

@@ -6,9 +6,11 @@ import sys
 from pathlib import Path
 
 INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"')
+SYSTEM_INCLUDE_RE = re.compile(r'^\s*#include\s+<[^>]+>')
 PRAGMA_ONCE_RE = re.compile(r'^\s*#pragma\s+once\s*$')
 
 seen: set[Path] = set()
+seen_system: set[str] = set()
 
 
 def amalgamate(path: Path, root: Path) -> list[str]:
@@ -23,6 +25,11 @@ def amalgamate(path: Path, root: Path) -> list[str]:
     for line in path.read_text().splitlines(keepends=True):
         if PRAGMA_ONCE_RE.match(line):
             continue
+        if SYSTEM_INCLUDE_RE.match(line):
+            stripped = line.strip()
+            if stripped in seen_system:
+                continue
+            seen_system.add(stripped)
         m = INCLUDE_RE.match(line)
         if m:
             # Try relative to the including file, then relative to root.

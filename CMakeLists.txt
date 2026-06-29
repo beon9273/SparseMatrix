@@ -21,9 +21,9 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_custom_target(dist
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/dist
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/amalgamate.py
-          ${CMAKE_SOURCE_DIR}/api/sparsemat.h
+          ${CMAKE_SOURCE_DIR}/include/api/sparsemat.h
           ${CMAKE_BINARY_DIR}/dist/sparsemat_dist.h
-          ${CMAKE_SOURCE_DIR}
+          ${CMAKE_SOURCE_DIR}/include
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   COMMENT "Building single-header dist/sparsemat.h"
   VERBATIM
@@ -41,7 +41,7 @@ add_library(sparsemat_lib INTERFACE)
 add_library(sparsemat::sparsemat ALIAS sparsemat_lib)
 
 target_include_directories(sparsemat_lib INTERFACE
-  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/api>
+  $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 
@@ -53,17 +53,8 @@ install(TARGETS sparsemat_lib
   EXPORT sparsemat_targets
 )
 
-install(FILES api/sparsemat.h
+install(DIRECTORY include/
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
-
-install(DIRECTORY operations/
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/operations
-  FILES_MATCHING PATTERN "*.h"
-)
-
-install(DIRECTORY concepts/
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/concepts
   FILES_MATCHING PATTERN "*.h"
 )
 
@@ -106,8 +97,8 @@ if(DOXYGEN_FOUND)
   set(DOXYGEN_QUIET YES)
 
   doxygen_add_docs(docs
-    ${CMAKE_SOURCE_DIR}/api/sparsemat.h
-    ${CMAKE_SOURCE_DIR}/operations
+    ${CMAKE_SOURCE_DIR}/include/api/sparsemat.h
+    ${CMAKE_SOURCE_DIR}/include/operations
     COMMENT "Generating API documentation"
   )
 endif()
