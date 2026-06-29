@@ -43,6 +43,9 @@ jobs:
           diff dist/sparsemat.h dist/sparsemat.h.new || \
             (echo "dist/sparsemat.h is out of date — run cmake --build build --target dist" && exit 1)
 
+      - name: clang-format-version
+        run: clang-format-18 --version
+
       - name: clang-format
         run: |
           find include examples tests \( -name '*.h' -o -name '*.cpp' \) | \
