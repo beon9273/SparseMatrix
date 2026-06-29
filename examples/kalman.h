@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstddef>
 
-#include "sparsemat_dist.h"
+#include "sparsemat.h"
 
 using namespace SparseLinearAlgebra;
 

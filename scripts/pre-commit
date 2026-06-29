@@ -1,31 +1,91 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 BUILD_DIR="$REPO_ROOT/build"
 
-FILES=$(find "$REPO_ROOT" -path "$REPO_ROOT/build" -prune -o \( -name "*.cpp" -o -name "*.h" \) -print)
+# --- Regenerate dist/sparsemat.h ---
+echo "Regenerating dist/sparsemat.h..."
+python3 "$REPO_ROOT/scripts/amalgamate.py" \
+  "$REPO_ROOT/include/sparsemat/api/sparsemat.h" \
+  "$REPO_ROOT/dist/sparsemat.h" \
+  "$REPO_ROOT/include"
+git add "$REPO_ROOT/dist/sparsemat.h"
 
-echo "==> clang-format"
-echo "$FILES" | xargs clang-format -i
-git add $(echo "$FILES" | xargs -I{} git ls-files --error-unmatch {} 2>/dev/null || true)
+staged_headers=()
+staged_sources=()
 
-if [ ! -f "$BUILD_DIR/compile_commands.json" ]; then
-  echo "WARNING: $BUILD_DIR/compile_commands.json not found, skipping clang-tidy"
+while IFS= read -r file; do
+  [[ "$file" =~ \.(h|hpp)$ ]] && staged_headers+=("$REPO_ROOT/$file")
+  [[ "$file" =~ \.(cpp|cc|cxx)$ ]] && staged_sources+=("$REPO_ROOT/$file")
+done < <(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(h|hpp|cpp|cc|cxx)$' || true)
+
+all_files=("${staged_headers[@]}" "${staged_sources[@]}")
+
+if [[ ${#all_files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-echo "==> clang-tidy"
-FAILED=0
-for f in $FILES; do
-  # Only tidy .cpp files — headers are covered transitively
-  [[ "$f" == *.cpp ]] || continue
-  if ! clang-tidy -p "$BUILD_DIR" "$f" --quiet; then
-    FAILED=1
+# --- Build check ---
+if [[ -f "$BUILD_DIR/build.ninja" || -f "$BUILD_DIR/Makefile" ]]; then
+  echo "Building to verify..."
+  if ! cmake --build "$BUILD_DIR" 2>&1; then
+    echo "Build failed — commit rejected."
+    exit 1
+  fi
+else
+  echo "Skipping build check: no build directory found at $BUILD_DIR"
+fi
+
+# --- clang-format ---
+echo "Running clang-format..."
+format_failed=0
+for f in "${all_files[@]}"; do
+  [[ "$f" == "$REPO_ROOT/dist/"* ]] && continue
+  if ! clang-format-18 --dry-run --Werror "$f" 2>/dev/null; then
+    echo "  clang-format: $f"
+    format_failed=1
   fi
 done
 
-if [ $FAILED -ne 0 ]; then
-  echo "clang-tidy found errors. Fix them or use git commit --no-verify to skip."
+if [[ $format_failed -ne 0 ]]; then
+  echo "Fix formatting with: clang-format-18 -i <file>"
   exit 1
 fi
+
+# --- clang-tidy ---
+if [[ ! -f "$BUILD_DIR/compile_commands.json" ]]; then
+  echo "Skipping clang-tidy: no compile_commands.json in $BUILD_DIR"
+  exit 0
+fi
+
+if [[ ${#staged_sources[@]} -gt 0 ]]; then
+  echo "Running clang-tidy on source files..."
+  clang-tidy-18 -p "$BUILD_DIR" --header-filter="$REPO_ROOT/include/.*" \
+    "${staged_sources[@]}" 2>&1 | grep -E "warning:|error:" && exit 1 || true
+fi
+
+# For headers with no direct TU, find a source that includes them
+if [[ ${#staged_headers[@]} -gt 0 ]]; then
+  echo "Running clang-tidy on headers (via including TUs)..."
+  tidy_failed=0
+  for header in "${staged_headers[@]}"; do
+    rel="${header#$REPO_ROOT/}"
+    tus=$(grep -rl "#include" "$REPO_ROOT/examples" "$REPO_ROOT/tests" 2>/dev/null \
+          | xargs grep -l "$rel" 2>/dev/null || true)
+    if [[ -z "$tus" ]]; then
+      tus=$(find "$REPO_ROOT/examples" "$REPO_ROOT/tests" -name "*.cpp" 2>/dev/null | head -1)
+    fi
+    if [[ -n "$tus" ]]; then
+      result=$(clang-tidy-18 -p "$BUILD_DIR" --header-filter="$(basename "$header")" \
+        $tus 2>&1 | grep "$header" || true)
+      if [[ -n "$result" ]]; then
+        echo "$result"
+        tidy_failed=1
+      fi
+    fi
+  done
+  [[ $tidy_failed -ne 0 ]] && exit 1
+fi
+
+exit 0
