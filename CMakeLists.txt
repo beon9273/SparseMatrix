@@ -9,7 +9,7 @@ enable_testing()
 
 add_executable(test_sparsemat tests/test_sparsemat.cpp)
 add_dependencies(test_sparsemat dist)
-target_include_directories(test_sparsemat PRIVATE ${CMAKE_BINARY_DIR}/dist)
+target_include_directories(test_sparsemat PRIVATE ${CMAKE_SOURCE_DIR}/dist)
 target_compile_options(test_sparsemat PRIVATE -Wall -Wextra -Werror)
 
 add_test(NAME sparsemat_tests COMMAND test_sparsemat)

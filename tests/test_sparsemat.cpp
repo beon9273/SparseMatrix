@@ -2,7 +2,7 @@
 #include <iostream>
 #include <string>
 
-#include "sparsemat_dist.h"
+#include "sparsemat.h"
 using namespace SparseLinearAlgebra;
 
 // --- Minimal test harness ---
