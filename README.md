@@ -185,74 +185,74 @@ will run the benchmarks, update the table, and update the conclusions. Make sure
 ------------------------------------------------------------------------------------------------------
 Configuration                 Operation                sparsemat  Eigen sparse   Eigen dense
 ------------------------------------------------------------------------------------------------------
-3x3 diagonal (33%)            multiply                      2.81 ns        365.70 ns          1.89 ns
-3x3 diagonal (33%)            add                           1.92 ns         71.30 ns          1.90 ns
-3x3 diagonal (33%)            transpose                     4.29 ns         72.00 ns          1.94 ns
-3x3 diagonal (33%)            scale                         1.82 ns         93.03 ns          4.25 ns
-3x3 diagonal (33%)            frobenius                     2.51 ns          4.98 ns          1.82 ns
+3x3 diagonal (33%)            multiply                      1.82 ns        264.10 ns          1.80 ns
+3x3 diagonal (33%)            add                           1.85 ns         55.75 ns          1.80 ns
+3x3 diagonal (33%)            transpose                     1.99 ns         59.65 ns          1.84 ns
+3x3 diagonal (33%)            scale                         1.82 ns         51.62 ns          2.31 ns
+3x3 diagonal (33%)            frobenius                     1.81 ns          3.95 ns          1.74 ns
 
-3x3 first-row (33%)           multiply                      1.87 ns        314.13 ns          1.86 ns
-3x3 first-row (33%)           add                           1.89 ns         61.68 ns          1.92 ns
-3x3 first-row (33%)           scale                         1.84 ns         80.84 ns          1.90 ns
-3x3 first-row (33%)           frobenius                     4.02 ns         13.72 ns          2.22 ns
+3x3 first-row (33%)           multiply                      1.82 ns        270.93 ns          1.78 ns
+3x3 first-row (33%)           add                           1.81 ns         57.18 ns          1.79 ns
+3x3 first-row (33%)           scale                         1.82 ns         52.45 ns          1.76 ns
+3x3 first-row (33%)           frobenius                     1.82 ns          3.90 ns          1.76 ns
 
-3x3 full (100%)               multiply                      1.85 ns        498.01 ns          3.19 ns
-3x3 full (100%)               add                           4.28 ns        137.66 ns          1.86 ns
-3x3 full (100%)               scale                         1.85 ns        117.97 ns          4.18 ns
-3x3 full (100%)               frobenius                     1.91 ns          5.14 ns          1.85 ns
+3x3 full (100%)               multiply                      1.84 ns        346.50 ns          1.87 ns
+3x3 full (100%)               add                           1.78 ns         96.72 ns          1.79 ns
+3x3 full (100%)               scale                         1.81 ns         93.47 ns          1.75 ns
+3x3 full (100%)               frobenius                     1.80 ns          4.53 ns          1.76 ns
 
-5x5 diagonal (20%)            multiply                      5.64 ns        330.05 ns          1.83 ns
-5x5 diagonal (20%)            add                           2.56 ns        109.12 ns          5.91 ns
-5x5 diagonal (20%)            transpose                     1.85 ns         76.10 ns          1.86 ns
-5x5 diagonal (20%)            scale                         1.87 ns         78.37 ns          2.52 ns
-5x5 diagonal (20%)            frobenius                     1.92 ns          6.47 ns          1.95 ns
+5x5 diagonal (20%)            multiply                      3.05 ns        310.29 ns          2.46 ns
+5x5 diagonal (20%)            add                           1.74 ns         66.36 ns          3.60 ns
+5x5 diagonal (20%)            transpose                     1.81 ns         66.89 ns          1.76 ns
+5x5 diagonal (20%)            scale                         1.93 ns         57.94 ns          1.74 ns
+5x5 diagonal (20%)            frobenius                     1.83 ns          9.08 ns          1.83 ns
 
-5x5 tridiagonal (52%)         multiply                      1.85 ns        575.21 ns          1.81 ns
-5x5 tridiagonal (52%)         add                           1.82 ns        142.93 ns          3.52 ns
-5x5 tridiagonal (52%)         scale                         4.30 ns        184.22 ns          1.86 ns
-5x5 tridiagonal (52%)         frobenius                     4.09 ns         15.74 ns          4.20 ns
+5x5 tridiagonal (52%)         multiply                      1.80 ns        463.56 ns          2.54 ns
+5x5 tridiagonal (52%)         add                           2.27 ns        114.39 ns          1.85 ns
+5x5 tridiagonal (52%)         scale                         1.81 ns         94.47 ns          1.83 ns
+5x5 tridiagonal (52%)         frobenius                     1.82 ns         10.53 ns          1.82 ns
 
-5x5 random sparse (24%)       multiply                      6.66 ns        425.76 ns          3.60 ns
-5x5 random sparse (24%)       add                           2.69 ns        103.50 ns          5.78 ns
-5x5 random sparse (24%)       scale                         2.77 ns         88.29 ns          2.64 ns
-5x5 random sparse (24%)       frobenius                     2.78 ns         14.20 ns          4.26 ns
+5x5 random sparse (24%)       multiply                      1.81 ns        325.41 ns          2.50 ns
+5x5 random sparse (24%)       add                           1.83 ns         69.42 ns          1.74 ns
+5x5 random sparse (24%)       scale                         1.82 ns         74.32 ns          1.76 ns
+5x5 random sparse (24%)       frobenius                     1.82 ns          9.07 ns          1.78 ns
 
-5x5 dense-ish (76%)           multiply                      4.25 ns        694.33 ns          2.80 ns
-5x5 dense-ish (76%)           add                           2.22 ns        175.76 ns          3.40 ns
-5x5 dense-ish (76%)           scale                         2.80 ns        163.88 ns          1.87 ns
-5x5 dense-ish (76%)           frobenius                     2.64 ns         15.35 ns          2.85 ns
+5x5 dense-ish (76%)           multiply                      1.81 ns        547.79 ns          2.52 ns
+5x5 dense-ish (76%)           add                           1.83 ns        127.85 ns          1.82 ns
+5x5 dense-ish (76%)           scale                         1.92 ns        112.48 ns          1.80 ns
+5x5 dense-ish (76%)           frobenius                     1.84 ns          9.43 ns          1.92 ns
 
-8x8 diagonal (12%)            multiply                      2.01 ns        376.86 ns         85.85 ns
-8x8 diagonal (12%)            add                           1.86 ns         79.85 ns          1.83 ns
-8x8 diagonal (12%)            transpose                     1.86 ns         81.64 ns          1.84 ns
-8x8 diagonal (12%)            scale                         1.87 ns         82.52 ns          1.82 ns
-8x8 diagonal (12%)            frobenius                     1.85 ns         10.23 ns          1.83 ns
+8x8 diagonal (12%)            multiply                      1.81 ns        346.81 ns         56.94 ns
+8x8 diagonal (12%)            add                           1.83 ns         77.77 ns          1.80 ns
+8x8 diagonal (12%)            transpose                     1.79 ns         72.83 ns          1.76 ns
+8x8 diagonal (12%)            scale                         1.82 ns         74.33 ns          1.73 ns
+8x8 diagonal (12%)            frobenius                     1.91 ns          9.88 ns          1.75 ns
 
-8x8 tridiagonal (34%)         multiply                      3.21 ns        740.20 ns         61.13 ns
-8x8 tridiagonal (34%)         add                           1.82 ns        182.53 ns          2.78 ns
-8x8 tridiagonal (34%)         scale                         3.48 ns        169.02 ns          1.83 ns
-8x8 tridiagonal (34%)         frobenius                     2.55 ns         15.46 ns          3.08 ns
+8x8 tridiagonal (34%)         multiply                      1.82 ns        627.27 ns         51.04 ns
+8x8 tridiagonal (34%)         add                           1.84 ns        134.71 ns          1.81 ns
+8x8 tridiagonal (34%)         scale                         1.86 ns        113.86 ns          1.75 ns
+8x8 tridiagonal (34%)         frobenius                     1.83 ns         11.25 ns          1.82 ns
 
-8x8 random sparse (25%)       multiply                      4.15 ns        687.48 ns         91.36 ns
-8x8 random sparse (25%)       add                           1.85 ns        159.38 ns          4.16 ns
-8x8 random sparse (25%)       scale                         1.85 ns         78.72 ns          1.83 ns
-8x8 random sparse (25%)       frobenius                     1.88 ns         11.71 ns          1.78 ns
+8x8 random sparse (25%)       multiply                      1.80 ns        517.06 ns         53.80 ns
+8x8 random sparse (25%)       add                           1.81 ns        104.40 ns          1.77 ns
+8x8 random sparse (25%)       scale                         1.83 ns         81.13 ns          4.07 ns
+8x8 random sparse (25%)       frobenius                     1.82 ns         12.49 ns          1.77 ns
 
-5x5 SPD tridiagonal           cholesky (1 rhs)             27.63 ns        897.25 ns        168.73 ns
-5x5 SPD tridiagonal           lu (1 rhs)                   81.34 ns       1817.78 ns        130.99 ns
-5x5 SPD tridiagonal           cholesky (3 rhs)             57.63 ns       1222.28 ns        194.51 ns
-5x5 SPD tridiagonal           lu (3 rhs)                   76.95 ns       2055.37 ns        228.27 ns
+5x5 SPD tridiagonal           cholesky (1 rhs)             29.06 ns        878.88 ns        127.96 ns
+5x5 SPD tridiagonal           lu (1 rhs)                   70.37 ns       1520.21 ns        107.10 ns
+5x5 SPD tridiagonal           cholesky (3 rhs)             46.03 ns        918.02 ns        162.46 ns
+5x5 SPD tridiagonal           lu (3 rhs)                   78.45 ns       1720.51 ns        173.24 ns
 ------------------------------------------------------------------------------------------------------
 ```
 <!-- BENCHMARK_TABLE:END -->
 
-**vs Eigen sparse** — sparsemat wins across the board, roughly 2–450× depending on the operation. The gap is largest for multiply (`Eigen::SparseMatrix` pays CSC bookkeeping overhead per non-zero) and smallest for frobenius, which is memory-bandwidth bound rather than compute bound so there's less for compile-time zero elimination to remove.
+**vs Eigen sparse** — sparsemat wins across the board, roughly 2–345× depending on the operation. The gap is largest for multiply (`Eigen::SparseMatrix` pays CSC bookkeeping overhead per non-zero) and smallest for frobenius, which is memory-bandwidth bound rather than compute bound so there's less for compile-time zero elimination to remove.
 
-**vs Eigen dense** — competitive on most operations. The largest win is multiply on 8×8: sparsemat is ~30–60× faster than Eigen dense because it skips all zero multiplications at compile time. Add, scale, and frobenius are roughly equal since those are memory-bandwidth bound rather than compute bound.
+**vs Eigen dense** — competitive on most operations. The largest win is multiply on 8×8: sparsemat is ~28–31× faster than Eigen dense because it skips all zero multiplications at compile time. Add, scale, and frobenius are roughly equal since those are memory-bandwidth bound rather than compute bound.
 
 **Sparsity vs fill level** — multiply is where compile-time zero elimination pays off most. Add and scale show little sensitivity to fill level since they are bounded by the number of non-zeros regardless.
 
-**Solving linear systems** (`5x5 SPD tridiagonal`) — `cholesky_solve`/`lu_solve` factorize and solve in one call, timed the same way as constructing+solving an Eigen solver each iteration. sparsemat's Cholesky solve is ~35–40× faster than `Eigen::SimplicialLLT` and ~4–6× faster than dense `.llt()`, since the fill-in pattern and every zero pivot skip are known at compile time — there's no runtime symbolic analysis step to pay for. Cholesky beats LU by roughly 2× here (as expected: LU does twice the factorization work on a matrix that's actually SPD), and the gap between 1 RHS and 3 RHS is much smaller than 3× because the RHS columns share the same factorization and just add more of the recursive-template solve step.
+**Solving linear systems** (`5x5 SPD tridiagonal`) — `cholesky_solve`/`lu_solve` factorize and solve in one call, timed the same way as constructing+solving an Eigen solver each iteration. sparsemat's Cholesky solve is ~20–30× faster than `Eigen::SimplicialLLT` and ~3.5–4.5× faster than dense `.llt()`, since the fill-in pattern and every zero pivot skip are known at compile time — there's no runtime symbolic analysis step to pay for. Cholesky beats LU by roughly 2× here (as expected: LU does twice the factorization work on a matrix that's actually SPD), and the gap between 1 RHS and 3 RHS is much smaller than 3× because the RHS columns share the same factorization and just add more of the recursive-template solve step.
 
 **Conclusion** It is probably a wash -- Defining sparsity at Runtime is a pain (and really error prone). It is probably not worth it.
 
@@ -265,7 +265,9 @@ Or to run them and refresh the table above in the same step, use `cmake --build 
 
 ## GPU (CUDA)
 
-Every `SparseMat` operation is marked `SPARSEMAT_HD` (`__host__ __device__` under `nvcc`, a no-op elsewhere), so the same header can be included and called from CUDA device code — no separate GPU build of the library is needed.
+This library is designed for small matrices, where parallelizing individual matrix operations across GPU threads is generally not beneficial. Nevertheless, every SparseMat operation is annotated with SPARSEMAT_HD (__host__ __device__ when compiled with nvcc, and a no-op otherwise), allowing the same header to be included and invoked from both host and CUDA device code without requiring a separate GPU build of the library.
+
+This enables sparse matrix operations to be performed directly within GPU kernels, with each GPU thread executing its own independent matrix computations. The Kalman filter example demonstrates a practical application of this programming model.
 
 Solvers and factorizations (`solve`, `cholesky`, `lu_solve`, `forward_solve`, `backward_solve`, `cholesky_solve`) never throw; they return a `Result<T>` instead, since exceptions aren't usable in device code. Always check `.ok()` before trusting `.value()`.
 
@@ -278,7 +280,7 @@ cmake -B build-cuda -DSPARSEMAT_ENABLE_CUDA=ON
 cmake --build build-cuda
 ```
 
-This requires `nvcc` on your `PATH`; if no CUDA compiler is found, CMake emits a warning and skips the CUDA targets rather than failing the configure step. When enabled, it builds:
+ When enabled, it builds:
 - `test_sparsemat_gpu` — compiles `tests/test_sparsemat.cpp` through `nvcc` and runs the exact same tests from a device-side kernel, proving the `SPARSEMAT_HD` operations both compile for and run correctly on the device. On a machine with no physical GPU (e.g. CI), it detects this at runtime and reports itself as skipped rather than failed.
 - `examples/kalman_gpu.cu` — a GPU build of the Kalman filter example.
 - `benchmark_gpu` (also requires Eigen3) — see GPU benchmarks below.
@@ -301,8 +303,25 @@ This builds `benchmark_gpu`, runs it, and splices its output into the table belo
 
 <!-- BENCHMARK_TABLE_GPU:START -->
 ```
-(not yet run on a CUDA-capable GPU — build with -DSPARSEMAT_ENABLE_CUDA=ON and
-run `cmake --build build --target update-gpu-benchmarks` on a machine with a GPU)
+----------------------------------------------------------------------------------------------------
+Configuration           Batch N            sparsemat GPU     Eigen dense GPU       sparsemat CPU
+----------------------------------------------------------------------------------------------------
+3x3 diagonal multiply   100000                   0.67 ns             0.18 ns            47.13 ns
+
+5x5 tridiagonal multiply100000                   0.18 ns             0.88 ns           416.40 ns
+
+8x8 random sparse multiply100000                   0.23 ns             1.86 ns           986.70 ns
+
+5x5 SPD cholesky solve  100000                   3.24 ns                 n/a           544.69 ns
+
+3x3 diagonal multiply   1000000                  0.27 ns             0.61 ns            49.30 ns
+
+5x5 tridiagonal multiply1000000                  0.46 ns             1.11 ns           421.23 ns
+
+8x8 random sparse multiply1000000                  0.51 ns             1.95 ns           994.04 ns
+
+5x5 SPD cholesky solve  1000000                  2.13 ns                 n/a           510.26 ns
+----------------------------------------------------------------------------------------------------
 ```
 <!-- BENCHMARK_TABLE_GPU:END -->
 
