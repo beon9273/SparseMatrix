@@ -4,8 +4,8 @@
 using namespace SparseLinearAlgebra;
 
 int main() {
-  SparseMat<double, 3, 3, 0, 4, 8> mat(1, 2, 3);
-  SparseMat<double, 3, 3, 0, 1, 2> mat2(4, 5, 6);
+  SparseMat<double, int, 3, 3, 0, 4, 8> mat(1, 2, 3);
+  SparseMat<double, int, 3, 3, 0, 1, 2> mat2(4, 5, 6);
   auto m3 = mat.mult(mat2);
   auto m4 = mat.add(mat2);
   auto m5 = mat.subtract(mat2);

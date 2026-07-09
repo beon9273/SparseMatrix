@@ -38,7 +38,7 @@ def main():
     indices_str = ", ".join(str(i) for i in nonzero_indices)
     values_str  = ", ".join(str(v) for v in values)
 
-    print(f"SparseMat<double, {rows}, {cols}, {indices_str}> m({values_str});")
+    print(f"SparseMat<double,int, {rows}, {cols}, {indices_str}> m({values_str});")
 
 
 if __name__ == "__main__":

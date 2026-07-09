@@ -18,30 +18,31 @@ template<SparseMatrixType SparseMat>
 class Dense {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
-  static constexpr std::size_t num_non_zeros = rows * cols;
-  static constexpr std::size_t num_zeros = 0;
-  static constexpr std::size_t total_elements = rows * cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = rows * cols;
+  static constexpr auto num_zeros = 0;
+  static constexpr auto total_elements = rows * cols;
 
   /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
-  constexpr static auto is_result_index_nonzero(std::size_t /*unused*/, std::size_t /*unused*/) {
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int /*unused*/, Int /*unused*/) {
     return true;
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
-  constexpr static auto num_nonzeros() {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
     return SparseLinearAlgebra::OperationUtilities<Dense>::num_nonzeros();
   }
 
   /// Delegates to OperationUtilities to compute result sparsity indices.
-  constexpr static auto calculate_sparsity() {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
     return SparseLinearAlgebra::OperationUtilities<Dense>::calculate_sparsity();
   }
 
-  template<typename Result, std::size_t index = 0>
-  static auto dense(const SparseMat& a, Result& r) {
-    if constexpr (index < rows * cols) {
+  template<typename Result, Int index = 0>
+  SPARSEMAT_HD static auto dense(const SparseMat& a, Result& r) {
+    if constexpr (index < total_elements) {
       constexpr auto flat =
           SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(index / cols,
                                                                           index % cols);
@@ -54,10 +55,11 @@ class Dense {
     }
   }
 
-  static auto dense(const SparseMat& a) {
+  SPARSEMAT_HD static auto dense(const SparseMat& a) {
     constexpr auto sparsity = calculate_sparsity();
     auto result =
-        SparseMat::template make<rows, cols, sparsity>(std::make_index_sequence<num_nonzeros()>{});
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<num_nonzeros()>{});
     dense(a, result);
     return result;
   }
@@ -67,7 +69,7 @@ class Dense {
 namespace SparseLinearAlgebra {
 
 template<SparseMatrixType SparseMat>
-auto dense(const SparseMat& a) {
+SPARSEMAT_HD auto dense(const SparseMat& a) {
   return detail::Dense<SparseMat>::dense(a);
 }
 

@@ -1,8 +1,9 @@
 #pragma once
-#include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "sparsemat/concepts/concepts.h"
+#include "sparsemat/operations/result.h"
 
 namespace SparseLinearAlgebra::detail {
 
@@ -24,9 +25,11 @@ namespace SparseLinearAlgebra::detail {
  */
 template<typename SparseMat>
 class Triangular {
+  using Int = typename SparseMat::Int;
+
   // Walks the index pack at compile time; returns false as soon as any
   // above-diagonal position (J > I) is structurally non-zero.
-  template<std::size_t I = 0, std::size_t J = 1>
+  template<Int I = 0, Int J = 1>
   constexpr static bool is_structurally_lower() {
     if constexpr (I >= rows) {
       return true;
@@ -42,7 +45,7 @@ class Triangular {
 
   // Walks the index pack at compile time; returns false as soon as any
   // below-diagonal position (I > J) is structurally non-zero.
-  template<std::size_t I = 1, std::size_t J = 0>
+  template<Int I = 1, Int J = 0>
   constexpr static bool is_structurally_upper() {
     if constexpr (I >= rows) {
       return true;
@@ -58,10 +61,10 @@ class Triangular {
 
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
-  static constexpr std::size_t num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr std::size_t total_elements = rows * cols;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto total_elements = rows * cols;
 
   /// @c true if no above-diagonal index is structurally non-zero.
   static constexpr bool structurally_lower = is_structurally_lower();
@@ -78,14 +81,14 @@ class Triangular {
    * @param a         Matrix to test.
    * @param TOLERANCE Maximum absolute value allowed above the diagonal.
    */
-  template<std::size_t I = 0, std::size_t J = 1>
-  static bool is_numerically_lower(const SparseMat& a, DataType TOLERANCE = 1e-6) {
+  template<Int I = 0, Int J = 1>
+  SPARSEMAT_HD static bool is_numerically_lower(const SparseMat& a, DataType TOLERANCE = 1e-6) {
     if constexpr (I >= rows) {
       return true;
     } else if constexpr (J >= cols) {
       return is_numerically_lower<I + 1, I + 2>(a, TOLERANCE);
     } else if constexpr (J > I) {
-      constexpr int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
       if constexpr (index >= 0) {
         if (std::abs(a.values[index]) > TOLERANCE) {
           return false;
@@ -107,16 +110,16 @@ class Triangular {
    * @param a         Matrix to test.
    * @param TOLERANCE Maximum absolute value allowed below the diagonal.
    */
-  template<std::size_t I = 1, std::size_t J = 0>
-  static bool is_numerically_upper(const SparseMat& a, DataType TOLERANCE = 1e-6) {
+  template<Int I = 1, Int J = 0>
+  SPARSEMAT_HD static bool is_numerically_upper(const SparseMat& a, DataType TOLERANCE = 1e-6) {
     if constexpr (I >= rows) {
       return true;
     } else if constexpr (J >= cols) {
       return is_numerically_upper<I + 1, 0>(a, TOLERANCE);
     } else if constexpr (I > J) {
-      if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-        int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-        if (index >= 0 && std::abs(a.values[index]) > TOLERANCE) {
+      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+      if constexpr (index >= 0) {
+        if (std::abs(a.values[index]) > TOLERANCE) {
           return false;
         }
       }
@@ -128,8 +131,12 @@ class Triangular {
 
   // Computes sum(A[I][J] * result[J][C]) for J < I — the already-solved lower
   // entries for column C of the block RHS, used by forward_solve.
-  template<SparseMatrixType A, SparseMatrixType B, std::size_t I, std::size_t C, std::size_t J = 0>
-  static DataType do_lower_product(const A& a, const B& b) {
+  template<SparseMatrixType A,
+           SparseMatrixType B,
+           typename A::Int I,
+           typename B::Int C,
+           typename A::Int J = 0>
+  SPARSEMAT_HD static DataType do_lower_product(const A& a, const B& b) {
     if constexpr (J >= I) {
       return DataType(0);
     } else {
@@ -146,8 +153,12 @@ class Triangular {
 
   // Computes sum(A[I][J] * result[J][C]) for J > I — the already-solved upper
   // entries for column C of the block RHS, used by backward_solve.
-  template<SparseMatrixType A, SparseMatrixType B, std::size_t I, std::size_t C, std::size_t J = 0>
-  static DataType do_upper_product(const A& a, const B& b) {
+  template<SparseMatrixType A,
+           SparseMatrixType B,
+           typename A::Int I,
+           typename B::Int C,
+           typename A::Int J = 0>
+  SPARSEMAT_HD static DataType do_upper_product(const A& a, const B& b) {
     if constexpr (J >= cols) {
       return DataType(0);
     } else if constexpr (J <= I) {
@@ -177,8 +188,8 @@ class Triangular {
    * @param b       Right-hand side vector.
    */
   // Inner loop: fills all RHS columns for a fixed row I in forward substitution.
-  template<SparseMatrixType Result, SparseMatrixType RHS, std::size_t I, std::size_t C = 0>
-  void forward_solve_col(Result& result, const SparseMat& A, const RHS& b) {
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, Int C = 0>
+  SPARSEMAT_HD void forward_solve_col(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
     if constexpr (C < RHS::cols) {
       constexpr auto diag_index =
           SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, I);
@@ -188,6 +199,12 @@ class Triangular {
         if constexpr (diag_index < 0) {
           result.values[result_index] = DataType(0);
         } else {
+          if (A.values[diag_index] == DataType(0)) {
+            ok = false;
+            result.values[result_index] = DataType(0);
+            forward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
+            return;
+          }
           constexpr auto rhs_index =
               SparseLinearAlgebra::MatrixUtilities<RHS>::getSparseIndex(I, C);
           DataType sum = do_lower_product<SparseMat, Result, I, C>(A, result);
@@ -198,24 +215,24 @@ class Triangular {
           }
         }
       }
-      forward_solve_col<Result, RHS, I, C + 1>(result, A, b);
+      forward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
     }
   }
 
-  template<SparseMatrixType Result, SparseMatrixType RHS, std::size_t I = 0>
-  auto forward_solve(Result& result, const SparseMat& A, const RHS& b) {
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I = 0>
+  SPARSEMAT_HD auto forward_solve(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
     static_assert(structurally_lower, "Matrix is not structurally lower triangular.");
     if constexpr (I < rows) {
-      forward_solve_col<Result, RHS, I>(result, A, b);
-      return forward_solve<Result, RHS, I + 1>(result, A, b);
+      forward_solve_col<Result, RHS, I>(result, A, b, ok);
+      return forward_solve<Result, RHS, I + 1>(result, A, b, ok);
     } else {
       return result;
     }
   }
 
   // Inner loop: fills all RHS columns for a fixed row I in back substitution.
-  template<SparseMatrixType Result, SparseMatrixType RHS, int I, std::size_t C = 0>
-  void backward_solve_col(Result& result, const SparseMat& A, const RHS& b) {
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, Int C = 0>
+  SPARSEMAT_HD void backward_solve_col(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
     if constexpr (C < RHS::cols) {
       constexpr auto diag_index =
           SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, I);
@@ -225,6 +242,12 @@ class Triangular {
         if constexpr (diag_index < 0) {
           result.values[result_index] = DataType(0);
         } else {
+          if (A.values[diag_index] == DataType(0)) {
+            ok = false;
+            result.values[result_index] = DataType(0);
+            backward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
+            return;
+          }
           constexpr auto rhs_index =
               SparseLinearAlgebra::MatrixUtilities<RHS>::getSparseIndex(I, C);
           DataType sum = do_upper_product<SparseMat, Result, I, C>(A, result);
@@ -235,7 +258,7 @@ class Triangular {
           }
         }
       }
-      backward_solve_col<Result, RHS, I, C + 1>(result, A, b);
+      backward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
     }
   }
 
@@ -253,11 +276,11 @@ class Triangular {
    * @param b       Right-hand side.
    */
   template<SparseMatrixType Result, SparseMatrixType RHS, int I = rows - 1>
-  auto backward_solve(Result& result, const SparseMat& A, const RHS& b) {
+  SPARSEMAT_HD auto backward_solve(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
     static_assert(structurally_upper, "Matrix is not structurally upper triangular.");
     if constexpr (I >= 0) {
-      backward_solve_col<Result, RHS, I>(result, A, b);
-      return backward_solve<Result, RHS, I - 1>(result, A, b);
+      backward_solve_col<Result, RHS, I>(result, A, b, ok);
+      return backward_solve<Result, RHS, I - 1>(result, A, b, ok);
     } else {
       return result;
     }
@@ -277,14 +300,18 @@ class Triangular {
  */
 template<typename SparseMat, typename RHS>
 class LowerTriangular {
+ public:
+  using Int = typename SparseMat::Int;
+
+ private:
   // Forward sparsity propagation: x[i] is non-zero if b[i] is non-zero, or if
   // any already-determined non-zero x[j] (j < i) connects through L[i][j].
   // Row i is potentially non-zero if any column of RHS has a non-zero at row i,
   // or if any earlier non-zero row j connects to i through L[i][j].
   static constexpr std::array<bool, SparseMat::rows> compute_nonzero_rows() {
     std::array<bool, SparseMat::rows> nz{};
-    for (std::size_t i = 0; i < SparseMat::rows; ++i) {
-      for (auto idx : RHS::indices) {
+    for (Int i = 0; i < SparseMat::rows; ++i) {
+      for (auto idx : RHS::indices()) {
         if (idx / RHS::cols == i) {
           nz[i] = true;
           break;
@@ -293,12 +320,12 @@ class LowerTriangular {
       if (nz[i]) {
         continue;
       }
-      for (std::size_t j = 0; j < i; ++j) {
+      for (Int j = 0; j < i; ++j) {
         if (!nz[j]) {
           continue;
         }
-        std::size_t flat = i * SparseMat::cols + j;
-        for (auto idx : SparseMat::indices) {
+        Int flat = i * SparseMat::cols + j;
+        for (auto idx : SparseMat::indices()) {
           if (idx == flat) {
             nz[i] = true;
             break;
@@ -312,8 +339,8 @@ class LowerTriangular {
     return nz;
   }
 
-  static constexpr std::size_t count_nonzero_rows_lower() {
-    std::size_t count = 0;
+  static constexpr Int count_nonzero_rows_lower() {
+    Int count = 0;
     for (bool b : compute_nonzero_rows()) {
       if (b) {
         ++count;
@@ -324,9 +351,9 @@ class LowerTriangular {
 
   static constexpr auto get_nonzero_rows_lower() {
     auto nz = compute_nonzero_rows();
-    std::array<std::size_t, count_nonzero_rows_lower()> result{};
-    std::size_t k = 0;
-    for (std::size_t i = 0; i < SparseMat::rows; ++i) {
+    std::array<Int, count_nonzero_rows_lower()> result{};
+    Int k = 0;
+    for (Int i = 0; i < SparseMat::rows; ++i) {
       if (nz[i]) {
         result[k++] = i;
       }
@@ -336,23 +363,28 @@ class LowerTriangular {
 
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = RHS::cols;  // block: result has same column count as RHS
-  static constexpr std::array<std::size_t, count_nonzero_rows_lower()> nonZeros =
-      get_nonzero_rows_lower();
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = RHS::cols;  // block: result has same column count as RHS
+  static constexpr std::array<Int, count_nonzero_rows_lower()> nonZeros = get_nonzero_rows_lower();
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
-  constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t /*col*/) {
-    return std::ranges::any_of(nonZeros, [row](std::size_t idx) { return idx == row; });
+  SPARSEMAT_HD constexpr static bool is_result_index_nonzero(Int row, Int /*col*/) {
+    for (Int idx : nonZeros) {
+      if (idx == row) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  static constexpr std::size_t numNonzeros =
+  static constexpr auto numNonzeros =
       SparseLinearAlgebra::OperationUtilities<LowerTriangular>::num_nonzeros();
   static constexpr auto sparsity =
       SparseLinearAlgebra::OperationUtilities<LowerTriangular>::calculate_sparsity();
 
-  static auto make_result() {
-    return SparseMat::template make<rows, cols, sparsity>(std::make_index_sequence<numNonzeros>{});
+  SPARSEMAT_HD static auto make_result() {
+    return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+        std::make_index_sequence<numNonzeros>{});
   }
 };
 
@@ -369,13 +401,17 @@ class LowerTriangular {
  */
 template<typename SparseMat, typename RHS>
 class UpperTriangular {
+ public:
+  using Int = typename SparseMat::Int;
+
+ private:
   // Row i is potentially non-zero if any column of RHS has a non-zero at row i,
   // or if any later non-zero row j connects to i through U[i][j].
   static constexpr std::array<bool, SparseMat::rows> compute_nonzero_rows() {
     std::array<bool, SparseMat::rows> nz{};
-    for (std::size_t ii = 0; ii < SparseMat::rows; ++ii) {
-      std::size_t i = SparseMat::rows - 1 - ii;
-      for (auto idx : RHS::indices) {
+    for (Int ii = 0; ii < SparseMat::rows; ++ii) {
+      Int i = SparseMat::rows - 1 - ii;
+      for (auto idx : RHS::indices()) {
         if (idx / RHS::cols == i) {
           nz[i] = true;
           break;
@@ -384,12 +420,12 @@ class UpperTriangular {
       if (nz[i]) {
         continue;
       }
-      for (std::size_t j = i + 1; j < SparseMat::cols; ++j) {
+      for (Int j = i + 1; j < SparseMat::cols; ++j) {
         if (!nz[j]) {
           continue;
         }
-        std::size_t flat = i * SparseMat::cols + j;
-        for (auto idx : SparseMat::indices) {
+        Int flat = i * SparseMat::cols + j;
+        for (auto idx : SparseMat::indices()) {
           if (idx == flat) {
             nz[i] = true;
             break;
@@ -403,8 +439,8 @@ class UpperTriangular {
     return nz;
   }
 
-  static constexpr std::size_t count_nonzero_rows_upper() {
-    std::size_t count = 0;
+  static constexpr Int count_nonzero_rows_upper() {
+    Int count = 0;
     for (bool b : compute_nonzero_rows()) {
       if (b) {
         ++count;
@@ -415,9 +451,9 @@ class UpperTriangular {
 
   static constexpr auto get_nonzero_rows_upper() {
     auto nz = compute_nonzero_rows();
-    std::array<std::size_t, count_nonzero_rows_upper()> result{};
-    std::size_t k = 0;
-    for (std::size_t i = 0; i < SparseMat::rows; ++i) {
+    std::array<Int, count_nonzero_rows_upper()> result{};
+    Int k = 0;
+    for (Int i = 0; i < SparseMat::rows; ++i) {
       if (nz[i]) {
         result[k++] = i;
       }
@@ -427,22 +463,27 @@ class UpperTriangular {
 
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = RHS::cols;  // block: result has same column count as RHS
-  static constexpr std::array<std::size_t, count_nonzero_rows_upper()> nonZeros =
-      get_nonzero_rows_upper();
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = RHS::cols;  // block: result has same column count as RHS
+  static constexpr std::array<Int, count_nonzero_rows_upper()> nonZeros = get_nonzero_rows_upper();
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
-  constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t /*col*/) {
-    return std::ranges::any_of(nonZeros, [row](std::size_t idx) { return idx == row; });
+  SPARSEMAT_HD constexpr static bool is_result_index_nonzero(Int row, Int /*col*/) {
+    for (Int idx : nonZeros) {
+      if (idx == row) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  static constexpr std::size_t numNonzeros =
+  static constexpr auto numNonzeros =
       SparseLinearAlgebra::OperationUtilities<UpperTriangular>::num_nonzeros();
   static constexpr auto sparsity =
       SparseLinearAlgebra::OperationUtilities<UpperTriangular>::calculate_sparsity();
-  static auto make_result() {
-    return SparseMat::template make<rows, cols, sparsity>(std::make_index_sequence<numNonzeros>{});
+  SPARSEMAT_HD static auto make_result() {
+    return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+        std::make_index_sequence<numNonzeros>{});
   }
 };
 
@@ -452,27 +493,27 @@ namespace SparseLinearAlgebra {
 
 /// Returns @c true if the sparsity pattern has no above-diagonal non-zeros.
 template<SparseMatrixType SparseMat>
-constexpr auto is_structurally_lower_triangular(const SparseMat& /*a*/) {
+SPARSEMAT_HD constexpr auto is_structurally_lower_triangular(const SparseMat& /*a*/) {
   return detail::Triangular<SparseMat>::structurally_lower;
 }
 
 /// Returns @c true if every above-diagonal stored value is within tolerance of zero.
 template<SparseMatrixType SparseMat>
-auto is_numerically_lower_triangular(const SparseMat& a,
-                                     typename SparseMat::DataType tolerance = 1e-6) {
+SPARSEMAT_HD auto is_numerically_lower_triangular(const SparseMat& a,
+                                                  typename SparseMat::DataType tolerance = 1e-6) {
   return detail::Triangular<SparseMat>::is_numerically_lower(a, tolerance);
 }
 
 /// Returns @c true if the sparsity pattern has no below-diagonal non-zeros.
 template<SparseMatrixType SparseMat>
-constexpr auto is_structurally_upper_triangular(const SparseMat& /*a*/) {
+SPARSEMAT_HD constexpr auto is_structurally_upper_triangular(const SparseMat& /*a*/) {
   return detail::Triangular<SparseMat>::structurally_upper;
 }
 
 /// Returns @c true if every below-diagonal stored value is within tolerance of zero.
 template<SparseMatrixType SparseMat>
-auto is_numerically_upper_triangular(const SparseMat& a,
-                                     typename SparseMat::DataType tolerance = 1e-6) {
+SPARSEMAT_HD auto is_numerically_upper_triangular(const SparseMat& a,
+                                                  typename SparseMat::DataType tolerance = 1e-6) {
   return detail::Triangular<SparseMat>::is_numerically_upper(a, tolerance);
 }
 
@@ -485,13 +526,19 @@ auto is_numerically_upper_triangular(const SparseMat& a,
  *
  * @param A Lower triangular matrix.
  * @param b Right-hand side column vector.
- * @return  Solution vector x such that Ax = b.
+ * @return  @c Result wrapping the solution vector x such that Ax = b;
+ *          @c ok() is @c false if a zero pivot was hit on the diagonal.
  */
 template<SparseMatrixType SparseMat, SparseMatrixType RHS>
-auto forward_solve(const SparseMat& A, const RHS& b) {
+SPARSEMAT_HD auto forward_solve(const SparseMat& A, const RHS& b) {
+  static_assert(SparseMat::rows == SparseMat::cols,
+                "forward_solve requires a square coefficient matrix.");
+  static_assert(SparseMat::rows == RHS::rows, "forward_solve requires RHS::rows == A.rows.");
   auto result = detail::LowerTriangular<SparseMat, RHS>::make_result();
-  detail::Triangular<SparseMat>().forward_solve(result, A, b);
-  return result;
+  bool ok = true;
+  detail::Triangular<SparseMat>().forward_solve(result, A, b, ok);
+  return Result<decltype(result)>(std::move(result),
+                                  ok ? SolveStatus::Success : SolveStatus::SingularMatrix);
 }
 
 /**
@@ -503,13 +550,19 @@ auto forward_solve(const SparseMat& A, const RHS& b) {
  *
  * @param A Upper triangular matrix.
  * @param b Right-hand side column vector.
- * @return  Solution vector x such that Ax = b.
+ * @return  @c Result wrapping the solution vector x such that Ax = b;
+ *          @c ok() is @c false if a zero pivot was hit on the diagonal.
  */
 template<SparseMatrixType SparseMat, SparseMatrixType RHS>
-auto backward_solve(const SparseMat& A, const RHS& b) {
+SPARSEMAT_HD auto backward_solve(const SparseMat& A, const RHS& b) {
+  static_assert(SparseMat::rows == SparseMat::cols,
+                "backward_solve requires a square coefficient matrix.");
+  static_assert(SparseMat::rows == RHS::rows, "backward_solve requires RHS::rows == A.rows.");
   auto result = detail::UpperTriangular<SparseMat, RHS>::make_result();
-  detail::Triangular<SparseMat>().backward_solve(result, A, b);
-  return result;
+  bool ok = true;
+  detail::Triangular<SparseMat>().backward_solve(result, A, b, ok);
+  return Result<decltype(result)>(std::move(result),
+                                  ok ? SolveStatus::Success : SolveStatus::SingularMatrix);
 }
 
 }  // namespace SparseLinearAlgebra

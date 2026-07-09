@@ -14,18 +14,19 @@ template<typename SparseMat>
 class Symmetric {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
-  static constexpr std::size_t num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr std::size_t num_zeros = SparseMat::zeroCount;
-  static constexpr std::size_t total_elements = rows * cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+  static constexpr auto total_elements = rows * cols;
 
-  constexpr static bool is_structurally_symmetric() {
+  SPARSEMAT_HD constexpr static bool is_structurally_symmetric() {
     if constexpr (rows != cols) {
       return false;
     } else {
-      for (std::size_t i = 0; i < rows; ++i) {
-        for (std::size_t j = 0; j < cols; ++j) {
+      for (Int i = 0; i < rows; ++i) {
+        for (Int j = 0; j < cols; ++j) {
           if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(i, j) !=
               SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(j, i)) {
             return false;
@@ -36,8 +37,9 @@ class Symmetric {
     }
   }
 
-  template<std::size_t I, std::size_t J>
-  constexpr static bool is_sparse_symmetric(const SparseMat& a, DataType TOLERANCE = 1e-6) {
+  template<Int I = 0, Int J = 0>
+  SPARSEMAT_HD constexpr static bool is_sparse_symmetric(const SparseMat& a,
+                                                         DataType TOLERANCE = 1e-6) {
     if constexpr (!is_structurally_symmetric()) {
       return false;
     } else {
@@ -47,9 +49,9 @@ class Symmetric {
         return is_sparse_symmetric<I + 1, 0>(a, TOLERANCE);
       } else {
         if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-          constexpr int index_ij =
+          constexpr auto index_ij =
               SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-          constexpr int index_ji =
+          constexpr auto index_ji =
               SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
           static_assert(index_ij >= 0 && index_ji >= 0,
                         "Non-zero positions must have valid indices.");
@@ -63,23 +65,26 @@ class Symmetric {
     }
   }
 
-  template<std::size_t I>
-  bool is_full_symmetric(const SparseMat& a, DataType TOLERANCE = 1e-6) {
-    if constexpr (I > SparseMat::nonZeroCount) {
+  template<Int I = 0>
+  SPARSEMAT_HD constexpr static bool is_full_symmetric(const SparseMat& a,
+                                                       DataType TOLERANCE = 1e-6) {
+    if constexpr (I >= SparseMat::nonZeroCount) {
       return true;
     } else {
-      constexpr auto index = SparseMat::indices[I];
-      constexpr auto value = a.values[I];
-      constexpr std::size_t row = index / SparseMat::cols;
-      constexpr std::size_t col = index % SparseMat::cols;
+      constexpr auto index = SparseMat::indices()[I];
+      constexpr auto row = index / SparseMat::cols;
+      constexpr auto col = index % SparseMat::cols;
+
+      const auto& value = a.values[I];
       if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(col, row)) {
-        constexpr int index_ji =
+        constexpr auto index_ji =
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(col, row);
-        if (index_ji < 0 && std::abs(value) > TOLERANCE) {
-          return false;  // Non-zero position does not have a corresponding symmetric position
-        }
-        if (index_ji >= 0 && std::abs(value - a.values[index_ji]) > TOLERANCE) {
+        if (std::abs(value - a.values[index_ji]) > TOLERANCE) {
           return false;  // Non-zero values are not symmetric within tolerance
+        }
+      } else {
+        if (std::abs(value) > TOLERANCE) {
+          return false;  // Non-zero position does not have a corresponding symmetric position
         }
       }
       return is_full_symmetric<I + 1>(a, TOLERANCE);
@@ -100,8 +105,8 @@ namespace SparseLinearAlgebra {
  * @return           True if the sparsity pattern is symmetric, false otherwise.
  */
 template<SparseMatrixType SparseMat>
-auto is_structurally_symmetric(const SparseMat& a) {
-  return detail::Symmetric<SparseMat>::is_structurally_symmetric(a);
+SPARSEMAT_HD auto is_structurally_symmetric([[maybe_unused]] const SparseMat& a) {
+  return detail::Symmetric<SparseMat>::is_structurally_symmetric();
 }
 
 /**
@@ -116,12 +121,14 @@ auto is_structurally_symmetric(const SparseMat& a) {
  * @return           True if the matrix is symmetric, false otherwise.
 */
 template<SparseMatrixType SparseMat>
-auto is_sparse_symmetric(const SparseMat& a, typename SparseMat::DataType TOLERANCE = 1e-6) {
+SPARSEMAT_HD auto is_sparse_symmetric(const SparseMat& a,
+                                      typename SparseMat::DataType TOLERANCE = 1e-6) {
   return detail::Symmetric<SparseMat>::is_sparse_symmetric(a, TOLERANCE);
 }
 
 template<SparseMatrixType SparseMat>
-auto is_full_symmetric(const SparseMat& a, typename SparseMat::DataType TOLERANCE = 1e-6) {
+SPARSEMAT_HD auto is_full_symmetric(const SparseMat& a,
+                                    typename SparseMat::DataType TOLERANCE = 1e-6) {
   return detail::Symmetric<SparseMat>::is_full_symmetric(a, TOLERANCE);
 }  // namespace SparseLinearAlgebra
 

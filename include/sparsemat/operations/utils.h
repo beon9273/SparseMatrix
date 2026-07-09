@@ -11,26 +11,46 @@ namespace SparseLinearAlgebra {
  * All methods are @c constexpr so they can be evaluated at compile time when
  * the indices are known.
  *
- * @tparam SparseMatrix A @c SparseMat instantiation whose static @c indices
- *                      array and dimension constants are accessible.
+ * @tparam SparseMatrix A @c SparseMat instantiation whose @c indices()
+ *                      accessor and dimension constants are accessible.
  */
-template<SparseMatrixType SparseMatrix>
+template<typename SparseMatrix>
 class MatrixUtilities {
  public:
+  using Int = typename SparseMatrix::Int;
+
+  /**
+   * @brief Forwards to @c SparseMatrix::make to rebuild a matrix type from a
+   *        compile-time sparsity array.
+   *
+   * @tparam NRows Target row count.
+   * @tparam NCols Target column count.
+   * @tparam Arr   Compile-time array whose elements become the @c NonZeros pack.
+   * @tparam Is    Index sequence over @p Arr.
+   * @return       Default-constructed rebuilt sparse matrix.
+   */
+  template<Int NRows, Int NCols, auto Arr, std::size_t... Is>
+  SPARSEMAT_HD static auto make(std::index_sequence<Is...> /*seq*/) {
+    return typename SparseMatrix::template Rebind<NRows, NCols, Arr[static_cast<Int>(Is)]...>{};
+  }
+
   /**
    * @brief Checks whether position (row, col) is a non-zero element.
    *
-   * Linearly scans the @c SparseMatrix::indices array for the flat index
-   * @c row*cols + col.
+   * Scans @c SparseMatrix::indices() for the flat index @c row*cols + col.
+   * @c indices() returns its own array by value rather than exposing a
+   * `static constexpr` data member, so this loop always indexes a local
+   * copy — safe to call from @c SPARSEMAT_HD code on both host and device,
+   * since there's no host-only static storage being referenced.
    *
    * @param row Row index.
    * @param col Column index.
    * @return    @c true if the position has a stored (non-zero) entry.
    */
-  constexpr static bool isNonZero(std::size_t row, std::size_t col) {
-    std::size_t index = (row * SparseMatrix::cols) + col;
-    for (std::size_t i = 0; i < SparseMatrix::nonZeroCount; ++i) {
-      if (SparseMatrix::indices[i] == index) {
+  SPARSEMAT_HD constexpr static bool isNonZero(Int row, Int col) {
+    auto index = (row * SparseMatrix::cols) + col;
+    for (Int i = 0; i < SparseMatrix::nonZeroCount; ++i) {
+      if (SparseMatrix::indices()[i] == index) {
         return true;
       }
     }
@@ -40,7 +60,7 @@ class MatrixUtilities {
   /**
    * @brief Returns the offset into @c values[] for position (row, col).
    *
-   * Scans @c SparseMatrix::indices for the flat index @c row*cols + col
+   * Scans @c SparseMatrix::indices() for the flat index @c row*cols + col
    * and returns its position in the packed storage array.
    *
    * @param row Row index.
@@ -48,15 +68,31 @@ class MatrixUtilities {
    * @return    Zero-based index into @c values, or @c -1 if the position is
    *            structurally zero.
    */
-  constexpr static int getSparseIndex(std::size_t row, std::size_t col) {
-    std::size_t index = (row * SparseMatrix::cols) + col;
-    for (std::size_t i = 0; i < SparseMatrix::nonZeroCount; ++i) {
-      if (SparseMatrix::indices[i] == index) {
-        return static_cast<int>(i);
+  SPARSEMAT_HD constexpr static auto getSparseIndex(Int row, Int col) {
+    // Causes compile error at compile time, assert as normal at runtime.
+    assert(row >= 0 && row < SparseMatrix::rows && col >= 0 && col < SparseMatrix::cols);
+
+    if constexpr (SparseMatrix::nonZeroCount != 0) {
+      auto index = (row * SparseMatrix::cols) + col;
+      for (Int i = 0; i < SparseMatrix::nonZeroCount; ++i) {
+        if (SparseMatrix::indices()[i] == index) {
+          return i;
+        }
       }
     }
-    return -1;
+    return Int(-1);
   }
+
+  SPARSEMAT_HD constexpr static auto diagonal_nonzeros() {
+    Int count = 0;
+    for (Int i = 0; i < SparseMatrix::rows && i < SparseMatrix::cols; ++i) {
+      if (isNonZero(i, i)) {
+        ++count;
+      }
+    }
+    return count;
+  }
+  SPARSEMAT_HD constexpr static auto num_nonzeros() { return SparseMatrix::nonZeroCount; }
 };
 
 /**
@@ -74,6 +110,8 @@ class MatrixUtilities {
 template<OperationType Operation>
 class OperationUtilities {
  public:
+  using Int = typename Operation::Int;
+
   /**
    * @brief Counts the number of non-zero positions in the operation result.
    *
@@ -82,10 +120,10 @@ class OperationUtilities {
    *
    * @return Number of non-zero elements in the result matrix.
    */
-  constexpr static auto num_nonzeros() {
-    int count = 0;
-    for (std::size_t i = 0; i < Operation::rows; i++) {
-      for (std::size_t j = 0; j < Operation::cols; j++) {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    Int count = 0;
+    for (Int i = 0; i < Operation::rows; i++) {
+      for (Int j = 0; j < Operation::cols; j++) {
         if (Operation::is_result_index_nonzero(i, j)) {
           ++count;
         }
@@ -100,13 +138,13 @@ class OperationUtilities {
    * Iterates in row-major order and records every (i, j) for which
    * @c Operation::is_result_index_nonzero returns @c true.
    *
-   * @return @c std::array<std::size_t, num_nonzeros()> of flat indices.
+   * @return @c std::array<typename Operation::Int, num_nonzeros()> of flat indices.
    */
-  constexpr static auto calculate_sparsity() {
-    std::array<std::size_t, num_nonzeros()> sparsity{};
-    std::size_t c = 0;
-    for (std::size_t i = 0; i < Operation::rows; i++) {
-      for (std::size_t j = 0; j < Operation::cols; j++) {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    std::array<Int, num_nonzeros()> sparsity{};
+    Int c = 0;
+    for (Int i = 0; i < Operation::rows; i++) {
+      for (Int j = 0; j < Operation::cols; j++) {
         if (Operation::is_result_index_nonzero(i, j)) {
           sparsity[c++] = (i * Operation::cols) + j;
         }

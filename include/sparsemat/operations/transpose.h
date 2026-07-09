@@ -16,38 +16,39 @@ template<SparseMatrixType SparseMat>
 class Transpose {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::cols;
-  static constexpr std::size_t cols = SparseMat::rows;
-  static constexpr std::size_t num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr std::size_t num_zeros = (rows * cols) - num_non_zeros;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::cols;
+  static constexpr auto cols = SparseMat::rows;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
 
   /// Returns true if (row, col) in the result corresponds to a non-zero at (col, row) in the input.
-  constexpr static auto is_result_index_nonzero(int row, int col) {
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(int row, int col) {
     return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(col, row));
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
-  constexpr static auto num_nonzeros() {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
     return SparseLinearAlgebra::OperationUtilities<Transpose>::num_nonzeros();
   }
 
   /// Delegates to OperationUtilities to compute result sparsity indices.
-  constexpr static auto calculate_sparsity() {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
     return SparseLinearAlgebra::OperationUtilities<Transpose>::calculate_sparsity();
   }
 
   /// Recursively copies a.values[J,I] into r.values[I,J] for every non-zero result position.
-  template<SparseMatrixType Result, std::size_t I, std::size_t J>
-  static void transpose(Result& r, const SparseMat& a) {
+  template<SparseMatrixType Result, Int I, Int J>
+  SPARSEMAT_HD static void transpose(Result& r, const SparseMat& a) {
     if constexpr (I >= Result::rows) {
       return;
     } else if constexpr (J >= Result::cols) {
       return transpose<Result, I + 1, 0>(r, a);
     } else {
-      constexpr int sparse_index =
+      constexpr auto sparse_index =
           SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
       if constexpr (sparse_index >= 0) {
-        constexpr int a_index =
+        constexpr auto a_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
         static_assert(
             a_index >= 0,
@@ -59,10 +60,11 @@ class Transpose {
   }
 
   /// Constructs the transposed SparseMat and fills it via the recursive helper.
-  static auto transpose(const SparseMat& a) {
+  SPARSEMAT_HD static auto transpose(const SparseMat& a) {
     constexpr auto sparsity = calculate_sparsity();
-    auto result = SparseMat::template make<SparseMat::cols, SparseMat::rows, sparsity>(
-        std::make_index_sequence<num_nonzeros()>{});
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
+        template make<SparseMat::cols, SparseMat::rows, sparsity>(
+            std::make_index_sequence<num_nonzeros()>{});
     transpose<decltype(result), 0, 0>(result, a);
     return result;
   }
@@ -80,10 +82,10 @@ namespace SparseLinearAlgebra {
  *
  * @tparam SparseMat Input matrix type.
  * @param  a         Matrix to transpose.
- * @return           Transposed matrix of type @c SparseMat<DType, Cols, Rows, ...>.
+ * @return           Transposed matrix of type @c SparseMat<DType, IType, Cols, Rows, ...>.
  */
 template<SparseMatrixType SparseMat>
-auto transpose(const SparseMat& a) {
+SPARSEMAT_HD auto transpose(const SparseMat& a) {
   return detail::Transpose<SparseMat>::transpose(a);
 }
 

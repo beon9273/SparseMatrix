@@ -22,12 +22,13 @@ class Multiply {
                 "Incompatible matrix dimensions for multiplication.");
 
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat1::cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat1::cols;
 
   /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
-  constexpr static auto is_result_index_nonzero(std::size_t row, std::size_t col) {
-    for (std::size_t i = 0; i < SparseMat::cols; i++) {
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    for (Int i = 0; i < SparseMat::cols; i++) {
       if (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, i) &&
           SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(i, col)) {
         return true;
@@ -37,26 +38,26 @@ class Multiply {
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
-  constexpr static auto num_nonzeros() {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
     return SparseLinearAlgebra::OperationUtilities<Multiply>::num_nonzeros();
   }
 
   /// Delegates to OperationUtilities to compute result sparsity indices.
-  constexpr static auto calculate_sparsity() {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
     return SparseLinearAlgebra::OperationUtilities<Multiply>::calculate_sparsity();
   }
 
   /// Compile-time accumulation of A[I,*] · B[*,J] over non-zero pairs at column k=i.
-  template<std::size_t I, std::size_t J, std::size_t i = 0>
-  static DataType do_inner_product(const SparseMat& a, const SparseMat1& b) {
+  template<Int I, Int J, Int i = 0>
+  SPARSEMAT_HD static DataType do_inner_product(const SparseMat& a, const SparseMat1& b) {
     if constexpr (i >= SparseMat::cols) {
       return 0;
     } else {
       if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(I, i) &&
                     SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(i, J)) {
-        constexpr int a_index =
+        constexpr auto a_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, i);
-        constexpr int b_index =
+        constexpr auto b_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(i, J);
         return (a.values[a_index] * b.values[b_index]) + do_inner_product<I, J, i + 1>(a, b);
       } else {
@@ -66,14 +67,14 @@ class Multiply {
   }
 
   /// Recursively fills result positions (I,J) in row-major order.
-  template<typename Result, std::size_t I, std::size_t J>
-  static void recursive_multiply(Result& r, const SparseMat& a, const SparseMat1& b) {
+  template<typename Result, Int I, Int J>
+  SPARSEMAT_HD static void recursive_multiply(Result& r, const SparseMat& a, const SparseMat1& b) {
     if constexpr (I >= SparseMat::rows) {
       return;
     } else if constexpr (J >= SparseMat1::cols) {
       return recursive_multiply<Result, I + 1, 0>(r, a, b);
     } else {
-      constexpr int sparse_index =
+      constexpr auto sparse_index =
           SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
       if constexpr (sparse_index >= 0) {
         r.values[sparse_index] = do_inner_product<I, J>(a, b);
@@ -83,10 +84,11 @@ class Multiply {
   }
 
   /// Constructs the result SparseMat and fills it via recursive_multiply.
-  static auto multiply(const SparseMat& a, const SparseMat1& b) {
+  SPARSEMAT_HD static auto multiply(const SparseMat& a, const SparseMat1& b) {
     constexpr auto sparsity = calculate_sparsity();
-    auto result = SparseMat::template make<SparseMat::rows, SparseMat1::cols, sparsity>(
-        std::make_index_sequence<num_nonzeros()>{});
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
+        template make<SparseMat::rows, SparseMat1::cols, sparsity>(
+            std::make_index_sequence<num_nonzeros()>{});
     recursive_multiply<decltype(result), 0, 0>(result, a, b);
     return result;
   }
@@ -109,7 +111,7 @@ namespace SparseLinearAlgebra {
  * @return   Product matrix whose type encodes the result sparsity pattern.
  */
 template<SparseMatrixType A, SparseMatrixType B>
-auto multiply(const A& a, const B& b) {
+SPARSEMAT_HD auto multiply(const A& a, const B& b) {
   return detail::Multiply<A, B>::multiply(a, b);
 }
 
@@ -127,7 +129,7 @@ auto multiply(const A& a, const B& b) {
  * @return   @p a raised to the @p N-th power.
  */
 template<SparseMatrixType A, int N>
-auto power(const A& a) {
+SPARSEMAT_HD auto power(const A& a) {
   static_assert(N > 0, "Matrix exponent must be greater than 0");
   if constexpr (N == 1) {
     return a;

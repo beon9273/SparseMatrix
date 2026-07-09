@@ -17,17 +17,17 @@ template<SparseMatrixType SparseMat>
 class Shift {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
-  static constexpr std::size_t num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr std::size_t num_zeros = SparseMat::zeroCount;
-  static constexpr std::size_t total_elements = rows * cols;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+  static constexpr auto total_elements = rows * cols;
 
   /// Returns the unchanged input sparsity as the result sparsity.
-  constexpr static auto calculate_sparsity() { return SparseMat::indices; }
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() { return SparseMat::indices(); }
 
   /// Returns a copy of @p a with every stored value multiplied by @p factor.
-  static auto shift(const SparseMat& a, DataType factor) {
+  SPARSEMAT_HD static auto shift(const SparseMat& a, DataType factor) {
     SparseMat result;
     result.values = a.values;
 
@@ -38,7 +38,7 @@ class Shift {
   }
 
   /// Adds @p factor to every stored value of @p a in place.
-  static void shift_inplace(SparseMat& a, DataType factor) {
+  SPARSEMAT_HD static void shift_inplace(SparseMat& a, DataType factor) {
     for (auto& it : a.values) {
       it += factor;
     }
@@ -60,7 +60,7 @@ namespace SparseLinearAlgebra {
  * @return           Shifted matrix with the same sparsity pattern as @p a.
  */
 template<SparseMatrixType SparseMat>
-auto shift(const SparseMat& a, typename SparseMat::DataType factor) {
+SPARSEMAT_HD auto shift(const SparseMat& a, typename SparseMat::DataType factor) {
   return detail::Shift<SparseMat>::shift(a, factor);
 }
 
@@ -74,7 +74,7 @@ auto shift(const SparseMat& a, typename SparseMat::DataType factor) {
  * @param  factor    Scalar to add.
  */
 template<typename SparseMat>
-void shift_inplace(SparseMat& a, typename SparseMat::DataType factor) {
+SPARSEMAT_HD void shift_inplace(SparseMat& a, typename SparseMat::DataType factor) {
   detail::Shift<SparseMat>::shift_inplace(a, factor);
 }
 

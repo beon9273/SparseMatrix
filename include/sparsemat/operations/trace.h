@@ -18,19 +18,19 @@ template<SparseMatrixType SparseMat>
 class Trace {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
-  static constexpr std::size_t num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr std::size_t num_zeros = SparseMat::zeroCount;
-  static constexpr std::size_t total_elements = rows * cols;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+  static constexpr auto total_elements = rows * cols;
 
   /// Compile-time recursive accumulation of diagonal elements starting at (N, N).
   template<int N>
-  static DataType trace(const SparseMat& a) {
+  SPARSEMAT_HD static DataType trace(const SparseMat& a) {
     if constexpr (N >= rows || N >= cols) {
       return 0;
     } else if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(N, N)) {
-      constexpr int index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(N, N);
+      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(N, N);
       return a.values[index] + trace<N + 1>(a);
     } else {
       return trace<N + 1>(a);
@@ -54,7 +54,7 @@ namespace SparseLinearAlgebra {
  * @return           Sum of stored diagonal elements as @c SparseMat::DataType.
  */
 template<SparseMatrixType SparseMat>
-auto trace(const SparseMat& a) {
+SPARSEMAT_HD auto trace(const SparseMat& a) {
   return detail::Trace<SparseMat>::template trace<0>(a);
 }
 
