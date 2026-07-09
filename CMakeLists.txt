@@ -107,9 +107,8 @@ add_custom_target(dist
           ${CMAKE_SOURCE_DIR}/include/sparsemat/api/sparsemat.h
           ${CMAKE_SOURCE_DIR}/dist/sparsemat.h
           ${CMAKE_SOURCE_DIR}/include
-  COMMAND chmod 444 ${CMAKE_SOURCE_DIR}/dist/sparsemat.h
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  COMMENT "Building dist/sparsemat.h (read-only, generated file)"
+  COMMENT "Building dist/sparsemat.h"
   VERBATIM
 )
 
