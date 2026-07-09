@@ -1,8 +1,15 @@
 # sparsemat
 
-> **Experimental** — built to explore what happens when you push sparsity into the type system. Not intended for production use. 
-
 A header-only C++20 sparse matrix library where sparsity patterns are encoded as template parameters. 
+
+> **Preface** — This library was built for fun, to test the limits of C++ compile-time constructs like template parameter packs, index sequences and `constexpr`. The underlying question was whether compile-time coding could meaningfully speed up basic linear algebra operations versus leaving it to generic compiler optimizations.
+>
+> It also doubled as an exercise in using AI assistance to turn a simple C++ project into a fully developed library. The design and sparsity algorithms (how the result sparsity of each operation is derived and unrolled at compile time) are my own; AI was used for the surrounding brunt work — setting up and writing documentation, creating test harnesses, benchmarks, enabling code-coverage, exploring edge cases, and similar scaffolding. 
+
+## Leveraging known sparsity information at compile time
+
+The project was born while developing a GPU-enabled Kalman filter for particle track reconstruction in high energy physics. In that application, one must perform billions of
+independent Kalman filters, all of which require many linear algebra operations using a small number of small (O(10x10)) sparse matrices.
 
 Idea: if the non-zero structure of your matrices is fixed and known at compile time, the compiler can eliminate a whole bunch of operations.
 
@@ -10,14 +17,12 @@ Solution: user provides sparsity pattern as template parameters. Sparsity patter
 using compile-time constructs( e.g. constexpr if).  
 
 
-The tradeoff: 
-
 Limitations: 
-  - entering sparsity patterns at runtime is awkward and bugprone. Consider using scripts/generate.py
-    to generate class names for a given sparse matrix. 
+  - entering sparsity patterns is awkward and bugprone. 
   - every distinct sparsity pattern is a distinct type, which makes compile times long for large configurations and binary size could expload pretty easily. 
-  - designed for SMALL matrices: recursive templates are used to unroll matrix operations. Template recursion limits will be encountered for larger matrices. Probably only useful for up to 10x10
+  - recursive templates are used to unroll matrix operations. Template recursion limits mean this will only work for small matrices.
   - a certain level of sparsity is required.  Whether the performance gain is worth that cost depends heavily on how sparse your matrices are and how many operations you're doing.
+
 
 ```cpp
 // SparseMat<DataType, IntType, Rows, Cols, NonZeroIndices...>
@@ -156,6 +161,8 @@ SparseMat<double, int, 3, 3>::identity()  // 3x3 identity matrix
 ```
 
 ## Benchmarks
+
+Note: Benchmarks were performed on a laptop running all sorts of other things at the same time. Take these results with a grain of salt. More serious benchmarking would be needed before even considering adopting this.  
 
 Comparison against Eigen's `SparseMatrix` and fixed-size `Matrix` (dense). Measured at 500,000 iterations with 50,000 warmup on `-O3 -march=native`. Times are nanoseconds per operation. Eigen is not using BLAS. 
 
