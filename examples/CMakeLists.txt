@@ -41,5 +41,39 @@ if(EIGEN3_FOUND)
   endif()
 endif()
 
+# --- GPU throughput benchmark ---
+# Compares sparsemat vs Eigen dense, both running one instance per CUDA
+# thread over a batch of small matrices, against the same sparsemat
+# workload run single-threaded on the CPU. Needs both a CUDA toolchain
+# (for the device kernels) and Eigen (for the dense-GPU comparison), so it
+# only exists when both of the above blocks succeeded.
+if(SPARSEMAT_ENABLE_CUDA AND EIGEN3_FOUND)
+  add_executable(benchmark_gpu bench_gpu.cu)
+  add_dependencies(benchmark_gpu dist)
+  target_include_directories(benchmark_gpu PRIVATE ${CMAKE_SOURCE_DIR}/dist ${EIGEN3_INCLUDE_DIRS})
+  target_compile_options(benchmark_gpu PRIVATE --expt-relaxed-constexpr)
+
+  # Runs `benchmark_gpu` and splices its output into the README's GPU
+  # benchmark table (between the BENCHMARK_TABLE_GPU markers), via the same
+  # script used for the CPU table. On a machine with no physical GPU,
+  # benchmark_gpu reports "no device" and prints no table; the script
+  # detects that and leaves the README untouched instead of failing, so this
+  # target is safe to run on any machine that can build it — it just won't
+  # produce results until run on one with an actual GPU.
+  if(Python3_FOUND)
+    add_custom_target(update-gpu-benchmarks
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/update_benchmark_table.py
+              --binary $<TARGET_FILE:benchmark_gpu>
+              --readme ${CMAKE_SOURCE_DIR}/README.md
+              --start-marker "<!-- BENCHMARK_TABLE_GPU:START -->"
+              --end-marker "<!-- BENCHMARK_TABLE_GPU:END -->"
+      DEPENDS benchmark_gpu
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      COMMENT "Regenerating the GPU benchmark table in README.md (no-op without a GPU)"
+      VERBATIM
+    )
+  endif()
+endif()
+
 # Build the package-consumer link example as part of the examples suite.
 add_subdirectory(link)
