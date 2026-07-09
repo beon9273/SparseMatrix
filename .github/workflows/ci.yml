@@ -43,4 +43,32 @@ jobs:
           diff dist/sparsemat.h dist/sparsemat.h.new || \
             (echo "dist/sparsemat.h is out of date — run cmake --build build --target dist" && exit 1)
 
-      
+  cuda-build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build python3 nvidia-cuda-toolkit
+
+      # Every SparseMat operation is marked SPARSEMAT_HD (__host__ __device__).
+      # sparsemat_tests_gpu compiles tests/test_sparsemat.cpp — the same test
+      # source the CPU job runs — through nvcc and launches a kernel that
+      # calls its run_all_tests(), so this proves those SPARSEMAT_HD
+      # operations both compile for the device and run correctly on it, not
+      # just something that happens to compile with g++/clang. No GPU is
+      # available on this runner, so CMAKE_CUDA_ARCHITECTURES falls back from
+      # "native" (nvcc still compiles for a default architecture) and the
+      # test detects the missing device at runtime and reports itself as
+      # skipped rather than failed.
+      - name: Configure
+        run: cmake -B build-cuda -G Ninja -DSPARSEMAT_ENABLE_CUDA=ON -DSPARSEMAT_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build-cuda
+
+      - name: Test
+        run: ctest --test-dir build-cuda --output-on-failure

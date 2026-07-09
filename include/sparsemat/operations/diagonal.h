@@ -18,10 +18,11 @@ namespace SparseLinearAlgebra::detail {
  * @param  a     Matrix whose diagonal is to be set.
  * @param  value Scalar value written to every stored diagonal entry.
  */
-template<SparseMatrixType A, std::size_t N = 0>
-void set_diagonal_impl(A& a, typename A::DataType value) {
-  if constexpr (N < A::rows) {
-    constexpr int idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
+template<SparseMatrixType A, typename A::Int N = 0>
+SPARSEMAT_HD void set_diagonal_impl(A& a, typename A::DataType value) {
+  constexpr auto min_dim = (A::rows < A::cols) ? A::rows : A::cols;
+  if constexpr (N < min_dim) {
+    constexpr auto idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
     if constexpr (idx >= 0) {
       a.values[idx] = value;
     }
@@ -42,10 +43,15 @@ void set_diagonal_impl(A& a, typename A::DataType value) {
  * @param  a      Matrix whose diagonal is to be set.
  * @param  values Span of values to write into stored diagonal entries, in order.
  */
-template<SparseMatrixType A, std::size_t N = 0, std::size_t index = 0>
-void set_diagonal_impl(A& a, std::span<typename A::DataType> values) {
-  if constexpr (N < A::rows) {
-    constexpr int idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
+template<SparseMatrixType A, typename A::Int N = 0, typename A::Int index = 0>
+SPARSEMAT_HD void set_diagonal_impl(
+    A& a,
+    std::array<typename A::DataType, SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()>
+        values) {
+  constexpr auto min_dim = (A::rows < A::cols) ? A::rows : A::cols;
+  if constexpr (N < min_dim &&
+                index < SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()) {
+    constexpr auto idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
     if constexpr (idx >= 0) {
       a.values[idx] = values[index];
       set_diagonal_impl<A, N + 1, index + 1>(a, values);
@@ -65,7 +71,7 @@ namespace SparseLinearAlgebra {
  * @param value Scalar written to every stored diagonal entry.
  */
 template<SparseMatrixType SparseMat>
-void set_diagonal(SparseMat& a, typename SparseMat::DataType value) {
+SPARSEMAT_HD void set_diagonal(SparseMat& a, typename SparseMat::DataType value) {
   detail::set_diagonal_impl(a, value);
 }
 
@@ -79,7 +85,10 @@ void set_diagonal(SparseMat& a, typename SparseMat::DataType value) {
  * @param values Values to write into stored diagonal entries, in row order.
  */
 template<SparseMatrixType SparseMat>
-void set_diagonal(SparseMat& a, std::span<typename SparseMat::DataType> values) {
+SPARSEMAT_HD void set_diagonal(
+    SparseMat& a,
+    std::array<typename SparseMat::DataType,
+               SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros()> values) {
   detail::set_diagonal_impl(a, values);
 }
 

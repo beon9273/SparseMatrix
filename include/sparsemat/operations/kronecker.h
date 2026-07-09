@@ -19,11 +19,12 @@ template<SparseMatrixType SparseMat, SparseMatrixType SparseMat1>
 class Kronecker {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows * SparseMat1::rows;
-  static constexpr std::size_t cols = SparseMat::cols * SparseMat1::cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows * SparseMat1::rows;
+  static constexpr auto cols = SparseMat::cols * SparseMat1::cols;
 
   /// Returns true when (row, col) in the result is non-zero.
-  constexpr static auto is_result_index_nonzero(std::size_t row, std::size_t col) {
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(row / SparseMat1::rows,
                                                                       col / SparseMat1::cols) &&
            SparseLinearAlgebra::MatrixUtilities<SparseMat1>::isNonZero(row % SparseMat1::rows,
@@ -31,30 +32,30 @@ class Kronecker {
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
-  constexpr static auto num_nonzeros() {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
     return SparseLinearAlgebra::OperationUtilities<Kronecker>::num_nonzeros();
   }
 
   /// Delegates to OperationUtilities to compute result sparsity indices.
-  constexpr static auto calculate_sparsity() {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
     return SparseLinearAlgebra::OperationUtilities<Kronecker>::calculate_sparsity();
   }
 
   /// Recursively fills result positions with a[I/B.rows, J/B.cols] * b[I%B.rows, J%B.cols].
-  template<typename Result, std::size_t I, std::size_t J>
-  static void recursive_kronecker(Result& r, const SparseMat& a, const SparseMat1& b) {
-    if constexpr (I >= rows) {
+  template<SparseMatrixType Result, Int I, Int J>
+  SPARSEMAT_HD static void recursive_kronecker(Result& r, const SparseMat& a, const SparseMat1& b) {
+    if constexpr (I >= SparseMat::rows * SparseMat1::rows) {
       return;
-    } else if constexpr (J >= cols) {
+    } else if constexpr (J >= SparseMat::cols * SparseMat1::cols) {
       return recursive_kronecker<Result, I + 1, 0>(r, a, b);
     } else {
-      constexpr int sparse_index =
+      constexpr auto sparse_index =
           SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
       if constexpr (sparse_index >= 0) {
-        constexpr int a_index =
+        constexpr auto a_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I / SparseMat1::rows,
                                                                             J / SparseMat1::cols);
-        constexpr int b_index =
+        constexpr auto b_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I % SparseMat1::rows,
                                                                              J % SparseMat1::cols);
         static_assert(a_index >= 0 && b_index >= 0,
@@ -66,10 +67,12 @@ class Kronecker {
   }
 
   /// Constructs the result SparseMat and fills it via recursive_kronecker.
-  static auto kronecker(const SparseMat& a, const SparseMat1& b) {
+  SPARSEMAT_HD static auto kronecker(const SparseMat& a, const SparseMat1& b) {
     constexpr auto sparsity = calculate_sparsity();
-    auto result =
-        SparseMat::template make<rows, cols, sparsity>(std::make_index_sequence<num_nonzeros()>{});
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<
+        SparseMat::rows * SparseMat1::rows,
+        SparseMat::cols * SparseMat1::cols,
+        sparsity>(std::make_index_sequence<num_nonzeros()>{});
     recursive_kronecker<decltype(result), 0, 0>(result, a, b);
     return result;
   }
@@ -93,7 +96,7 @@ namespace SparseLinearAlgebra {
  * @return   Kronecker product matrix.
  */
 template<SparseMatrixType A, SparseMatrixType B>
-auto kronecker(const A& a, const B& b) {
+SPARSEMAT_HD auto kronecker(const A& a, const B& b) {
   return detail::Kronecker<A, B>::kronecker(a, b);
 }
 

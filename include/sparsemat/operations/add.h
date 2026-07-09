@@ -23,42 +23,43 @@ class Add {
                 "Incompatible matrix dimensions for addition.");
 
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat1::cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat1::cols;
 
   /// Returns true if (row, col) is non-zero in either input matrix.
-  constexpr static auto is_result_index_nonzero(std::size_t row, std::size_t col) {
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
     return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, col) ||
             SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(row, col));
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
-  constexpr static auto num_nonzeros() {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
     return SparseLinearAlgebra::OperationUtilities<Add>::num_nonzeros();
   }
 
   /// Delegates to OperationUtilities to compute result sparsity indices.
-  constexpr static auto calculate_sparsity() {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
     return SparseLinearAlgebra::OperationUtilities<Add>::calculate_sparsity();
   }
 
   /// Recursively fills result positions (I,J) with a[I,J] + multiplier*b[I,J].
-  template<SparseMatrixType Result, std::size_t I, std::size_t J>
-  static void recursive_add(Result& r,
-                            const SparseMat& a,
-                            const SparseMat1& b,
-                            const DataType multiplier) {
+  template<SparseMatrixType Result, Int I, Int J>
+  SPARSEMAT_HD static void recursive_add(Result& r,
+                                         const SparseMat& a,
+                                         const SparseMat1& b,
+                                         const DataType multiplier) {
     if constexpr (I >= SparseMat::rows) {
       return;
     } else if constexpr (J >= SparseMat1::cols) {
       return recursive_add<Result, I + 1, 0>(r, a, b, multiplier);
     } else {
-      constexpr int sparse_index =
+      constexpr auto sparse_index =
           SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
       if constexpr (sparse_index >= 0) {
-        constexpr int a_index =
+        constexpr auto a_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-        constexpr int b_index =
+        constexpr auto b_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
 
         r.values[sparse_index] = 0;
@@ -74,10 +75,11 @@ class Add {
   }
 
   /// Constructs the result SparseMat and fills it via recursive_add.
-  static auto add(const SparseMat& a, const SparseMat1& b, const DataType multiplier) {
+  SPARSEMAT_HD static auto add(const SparseMat& a, const SparseMat1& b, const DataType multiplier) {
     constexpr auto sparsity = calculate_sparsity();
-    auto result = SparseMat::template make<SparseMat::rows, SparseMat1::cols, sparsity>(
-        std::make_index_sequence<num_nonzeros()>{});
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
+        template make<SparseMat::rows, SparseMat1::cols, sparsity>(
+            std::make_index_sequence<num_nonzeros()>{});
     recursive_add<decltype(result), 0, 0>(result, a, b, multiplier);
     return result;
   }
@@ -99,7 +101,7 @@ namespace SparseLinearAlgebra {
  * @return   Sum matrix whose sparsity covers every non-zero in either input.
  */
 template<SparseMatrixType A, SparseMatrixType B>
-auto add(const A& a, const B& b) {
+SPARSEMAT_HD auto add(const A& a, const B& b) {
   return detail::Add<A, B>::add(a, b, 1);
 }
 
@@ -116,7 +118,7 @@ auto add(const A& a, const B& b) {
  * @return   Difference matrix.
  */
 template<SparseMatrixType A, SparseMatrixType B>
-auto subtract(const A& a, const B& b) {
+SPARSEMAT_HD auto subtract(const A& a, const B& b) {
   return detail::Add<A, B>::add(a, b, -1);
 }
 
@@ -136,7 +138,7 @@ auto subtract(const A& a, const B& b) {
  * @return            Result matrix @c a + multiplier*b.
  */
 template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
-auto scaled_add(const A& a, const B& b, const DataType multiplier) {
+SPARSEMAT_HD auto scaled_add(const A& a, const B& b, const DataType multiplier) {
   return detail::Add<A, B>::add(a, b, multiplier);
 }
 

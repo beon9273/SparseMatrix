@@ -16,7 +16,7 @@
 #include <iostream>
 #include <random>
 
-constexpr std::size_t NumGPS = 10;             // <-- change to 2, 5, 10, etc.
+constexpr int NumGPS = 10;                     // <-- change to 2, 5, 10, etc.
 constexpr double g = 9.81;                     // gravity in m/s²
 constexpr double dt = 0.5;                     // time step in seconds
 constexpr int N = 10;                          // number of time steps to simulate
@@ -32,7 +32,7 @@ double normal(std::mt19937& rng, double sigma) {
   return sigma * std::sqrt(-2.0 * std::log(a)) * std::cos(2.0 * M_PI * b);
 }
 
-template<std::size_t I, std::size_t NUM_GPS>
+template<int I, int NUM_GPS>
 void set_measurements(typename Kalman::KalmanFilter<NUM_GPS>::Z_type& z,
                       std::mt19937& rng,
                       double true_px,
@@ -54,7 +54,7 @@ int main() {
   // Initial state: launch from origin, 50 m/s horizontal, 100 m/s vertical.
   Kalman::KalmanFilter<NumGPS>::State x0(0.0, 0.0, 50.0, 100.0);
   // Initial covariance: high position uncertainty, moderate velocity.
-  auto P0 = SparseMat<double, 4, 4, 0, 5, 10, 15>(100.0, 100.0, 10.0, 10.0).dense();
+  auto P0 = SparseMat<double, int, 4, 4, 0, 5, 10, 15>(100.0, 100.0, 10.0, 10.0).dense();
 
   Kalman::KalmanFilter<NumGPS> kf({.x0 = x0, .P0 = P0, .dt = dt, .g = g});
 
@@ -77,7 +77,10 @@ int main() {
 
     // Simulated GPS measurements — one noisy [px, py] per sensor.
     set_measurements<0, NumGPS>(measurements, rng, true_px, true_py, GPS_STD);
-    kf.step(measurements, GPS_VAR);
+    if (!kf.step(measurements, GPS_VAR)) {
+      std::cerr << "Kalman filter update failed at step " << step << "\n";
+      return 1;
+    }
 
     // Print the first sensor's GPS reading alongside the estimate.
     std::cout << "  " << step << "  | " << true_px << "  " << true_py << " | "

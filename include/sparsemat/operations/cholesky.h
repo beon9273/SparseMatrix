@@ -5,6 +5,7 @@
 
 #include "sparsemat/concepts/concepts.h"
 #include "sparsemat/operations/diagonal.h"
+#include "sparsemat/operations/result.h"
 #include "sparsemat/operations/triangular.h"
 
 namespace SparseLinearAlgebra::detail {
@@ -23,28 +24,29 @@ namespace SparseLinearAlgebra::detail {
  */
 template<typename SparseMat>
 class CholeskySparsity {
+  using Int = typename SparseMat::Int;
   static_assert(SparseMat::rows == SparseMat::cols,
                 "Cholesky factorization requires a square matrix.");
-  static constexpr std::size_t N = SparseMat::rows;
+  static constexpr auto N = SparseMat::rows;
 
   static constexpr auto compute_fill() {
-    std::array<std::array<bool, N>, N> fill{};
+    std::array<std::array<bool, N>, N> fill{};  // N is of type SparseMat::Int
     // Seed with the lower-triangular non-zeros of A.
-    for (auto idx : SparseMat::indices) {
-      std::size_t row = idx / SparseMat::cols;
-      std::size_t col = idx % SparseMat::cols;
+    for (auto idx : SparseMat::indices()) {
+      Int row = idx / SparseMat::cols;
+      Int col = idx % SparseMat::cols;
       if (row >= col) {
         fill[row][col] = true;
       }
     }
     // Propagate: outer-product update at step k creates fill at (i,j)
     // when both column-k entries are non-zero (i >= j > k).
-    for (std::size_t k = 0; k < N; ++k) {
-      for (std::size_t i = k + 1; i < N; ++i) {
+    for (Int k = 0; k < N; ++k) {
+      for (Int i = k + 1; i < N; ++i) {
         if (!fill[i][k]) {
           continue;
         }
-        for (std::size_t j = k + 1; j <= i; ++j) {
+        for (Int j = k + 1; j <= i; ++j) {
           if (fill[j][k]) {
             fill[i][j] = true;
           }
@@ -64,7 +66,7 @@ class CholeskySparsity {
    * Upper-triangle entries are always zero.  Sub-diagonal entries are governed
    * by the fill array computed above.
    */
-  static constexpr bool l_nonzero(std::size_t row, std::size_t col) {
+  SPARSEMAT_HD static constexpr bool l_nonzero(Int row, Int col) {
     if (col > row) {
       return false;  // upper triangle
     }
@@ -90,20 +92,22 @@ template<typename SparseMat>
 class LCholeskyMatrix {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
 
-  constexpr static bool is_result_index_nonzero(std::size_t row, std::size_t col) {
+  SPARSEMAT_HD constexpr static bool is_result_index_nonzero(Int row, Int col) {
     return CholeskySparsity<SparseMat>::l_nonzero(row, col);
   }
 
-  static constexpr std::size_t numNonzeros =
+  static constexpr auto numNonzeros =
       SparseLinearAlgebra::OperationUtilities<LCholeskyMatrix>::num_nonzeros();
   static constexpr auto sparsity =
       SparseLinearAlgebra::OperationUtilities<LCholeskyMatrix>::calculate_sparsity();
 
-  static auto make_result() {
-    return SparseMat::template make<rows, cols, sparsity>(std::make_index_sequence<numNonzeros>{});
+  SPARSEMAT_HD static auto make_result() {
+    return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+        std::make_index_sequence<numNonzeros>{});
   }
 };
 
@@ -128,19 +132,20 @@ template<typename SparseMat>
 class CholeskyFactorization {
   static_assert(SparseMat::rows == SparseMat::cols,
                 "Cholesky factorization requires a square matrix.");
-  static constexpr std::size_t N = SparseMat::rows;
+  static constexpr auto N = SparseMat::rows;
   using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
   using MU = SparseLinearAlgebra::MatrixUtilities<SparseMat>;
 
   /**
    * Computes sum_{m=0}^{J-1} L[I][m] * L[J][m].
    * Used for both diagonal (I==J) and sub-diagonal (I>J) entries.
    */
-  template<typename L, std::size_t I, std::size_t J, std::size_t M = 0>
-  static DataType inner_sum(const L& l) {
+  template<typename L, Int I, Int J, Int M = 0>
+  SPARSEMAT_HD static DataType inner_sum(const L& l) {
     if constexpr (M < J) {
-      constexpr int lim = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, M);
-      constexpr int ljm = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, M);
+      constexpr auto lim = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, M);
+      constexpr auto ljm = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, M);
       auto term = DataType(0);
       if constexpr (lim >= 0 && ljm >= 0) {
         term = l.values[lim] * l.values[ljm];
@@ -154,45 +159,60 @@ class CholeskyFactorization {
   /**
    * Fills column J of L: diagonal first (I==J), then sub-diagonal rows (I>J).
    */
-  template<typename L, std::size_t J, std::size_t I = J>
-  static void compute_column(const SparseMat& a, L& l) {
+  template<typename L, Int J, Int I = J>
+  SPARSEMAT_HD static void compute_column(const SparseMat& a, L& l, bool& ok) {
     if constexpr (I >= N) {
       return;
     } else if constexpr (I == J) {
       // Diagonal: L[J][J] = sqrt(A[J][J] - sum_{m<J} L[J][m]^2)
-      constexpr int l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+      constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
       static_assert(l_jj >= 0, "Cholesky: diagonal of L must be structurally non-zero.");
       DataType sum = inner_sum<L, J, J>(l);
-      constexpr int a_jj = MU::getSparseIndex(J, J);
+      constexpr auto a_jj = MU::getSparseIndex(J, J);
       DataType a_val = (a_jj >= 0) ? a.values[a_jj] : DataType(0);
-      l.values[l_jj] = std::sqrt(a_val - sum);
-      compute_column<L, J, J + 1>(a, l);
+      DataType diag = a_val - sum;
+      if (diag <= DataType(0)) {
+        // Non-positive diag: A is not (numerically) positive definite,
+        // so the diagonal pivot is zero or the factorization is undefined.
+        ok = false;
+        l.values[l_jj] = DataType(0);
+        compute_column<L, J, J + 1>(a, l, ok);
+        return;
+      }
+      l.values[l_jj] = std::sqrt(diag);
+      compute_column<L, J, J + 1>(a, l, ok);
     } else {
       // Sub-diagonal: L[I][J] = (A[I][J] - sum_{m<J} L[I][m]*L[J][m]) / L[J][J]
-      constexpr int l_ij = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, J);
+      constexpr auto l_ij = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, J);
       if constexpr (l_ij >= 0) {
         DataType sum = inner_sum<L, I, J>(l);
-        constexpr int a_ij = MU::getSparseIndex(I, J);
+        constexpr auto a_ij = MU::getSparseIndex(I, J);
         DataType a_val = (a_ij >= 0) ? a.values[a_ij] : DataType(0);
-        constexpr int l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+        constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+        if (l.values[l_jj] == DataType(0)) {
+          ok = false;
+          l.values[l_ij] = DataType(0);
+          compute_column<L, J, I + 1>(a, l, ok);
+          return;
+        }
         l.values[l_ij] = (a_val - sum) / l.values[l_jj];
       }
-      compute_column<L, J, I + 1>(a, l);
+      compute_column<L, J, I + 1>(a, l, ok);
     }
   }
 
-  template<typename L, std::size_t J = 0>
-  static void outer_loop(const SparseMat& a, L& l) {
+  template<typename L, Int J = 0>
+  SPARSEMAT_HD static void outer_loop(const SparseMat& a, L& l, bool& ok) {
     if constexpr (J < N) {
-      compute_column<L, J>(a, l);
-      outer_loop<L, J + 1>(a, l);
+      compute_column<L, J>(a, l, ok);
+      outer_loop<L, Int(J + 1)>(a, l, ok);
     }
   }
 
  public:
   template<typename L>
-  static void factorize(const SparseMat& a, L& l) {
-    outer_loop(a, l);
+  SPARSEMAT_HD static void factorize(const SparseMat& a, L& l, bool& ok) {
+    outer_loop(a, l, ok);
   }
 };
 
@@ -214,7 +234,7 @@ class CholeskyFactor {
   L_Type l_;
 
  public:
-  explicit CholeskyFactor(L_Type l) : l_(std::move(l)) {}
+  SPARSEMAT_HD explicit CholeskyFactor(L_Type l) : l_(std::move(l)) {}
 
   /**
    * @brief Solves (L * L^T) * X = RHS for X.
@@ -226,9 +246,14 @@ class CholeskyFactor {
    * @return    Solution X with the same column count as @p rhs.
    */
   template<SparseMatrixType RHS>
-  [[nodiscard]] auto solve(const RHS& rhs) const {
+  [[nodiscard]] SPARSEMAT_HD auto solve(const RHS& rhs) const {
     auto y = forward_solve(l_, rhs);
-    return backward_solve(l_.transpose(), y);
+    if (!y.ok()) {
+      return Result(std::move(y.value()), SolveStatus::SingularMatrix);
+    }
+    auto x = backward_solve(l_.transpose(), y.value());
+    return Result(std::move(x.value()),
+                  x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
   }
 };
 
@@ -241,13 +266,16 @@ class CholeskyFactor {
  *
  * @tparam SparseMat Square SPD input matrix type satisfying @c SparseMatrixType.
  * @param  A         Input matrix.
- * @return           Lower-triangular L such that A = L * L^T.
+ * @return           @c Result wrapping the lower-triangular L such that
+ *                    A = L * L^T; @c ok() is @c false if a diagonal pivot
+ *                    was zero or negative (A is not positive definite).
  */
 template<SparseMatrixType SparseMat>
-auto cholesky_factorize(const SparseMat& A) {
+SPARSEMAT_HD auto cholesky_factorize(const SparseMat& A) {
   auto l = detail::LCholeskyMatrix<SparseMat>::make_result();
-  detail::CholeskyFactorization<SparseMat>::factorize(A, l);
-  return l;
+  bool ok = true;
+  detail::CholeskyFactorization<SparseMat>::factorize(A, l, ok);
+  return Result(std::move(l), ok ? SolveStatus::Success : SolveStatus::SingularMatrix);
 }
 
 /**
@@ -263,25 +291,50 @@ auto cholesky_factorize(const SparseMat& A) {
  *
  * @param A Square SPD input matrix.
  * @param b Right-hand side column vector.
- * @return  Solution vector x such that Ax = b.
+ * @return  @c Result wrapping the solution vector x such that Ax = b;
+ *          @c ok() is @c false if the factorization or either triangular
+ *          solve hit a zero/non-positive pivot.
  */
 template<SparseMatrixType SparseMat, SparseMatrixType RHS>
-auto cholesky_solve(const SparseMat& A, const RHS& b) {
+SPARSEMAT_HD auto cholesky_solve(const SparseMat& A, const RHS& b) {
   auto l = cholesky_factorize(A);
-  auto y = forward_solve(l, b);
-  return backward_solve(l.transpose(), y);
+  if (!l.ok()) {
+    using LType = decltype(detail::LCholeskyMatrix<SparseMat>::make_result());
+    using YType = decltype(detail::LowerTriangular<LType, RHS>::make_result());
+    return Result(YType{}, SolveStatus::SingularMatrix);
+  }
+  auto y = forward_solve(l.value(), b);
+  if (!y.ok()) {
+    return Result(std::move(y.value()), SolveStatus::SingularMatrix);
+  }
+  auto x = backward_solve(l.value().transpose(), y.value());
+  return Result(std::move(x.value()), x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
 }
 
 template<SparseMatrixType SparseMat>
 struct Cholesky {
-  decltype(cholesky_factorize(std::declval<SparseMat>())) lower;
+  using LType = decltype(cholesky_factorize(std::declval<SparseMat>()).value());
+  Result<LType> factor;
 
-  Cholesky(const SparseMat& a) : lower(cholesky_factorize(a)) {}
+  SPARSEMAT_HD Cholesky(const SparseMat& a) : factor(cholesky_factorize(a)) {}
+
+  [[nodiscard]] SPARSEMAT_HD bool ok() const { return factor.ok(); }
 
   template<SparseMatrixType RHS>
-  auto solve(const RHS& b) {
+  SPARSEMAT_HD auto solve(const RHS& b) const {
+    if (!factor.ok()) {
+      using YType = decltype(detail::LowerTriangular<LType, RHS>::make_result());
+      return Result(YType{}, SolveStatus::SingularMatrix);
+    }
+
+    const auto& lower = factor.value();
     auto y = forward_solve(lower, b);
-    return backward_solve(lower.transpose(), y);
+    if (!y.ok()) {
+      return Result(std::move(y.value()), SolveStatus::SingularMatrix);
+    }
+    auto x = backward_solve(lower.transpose(), y.value());
+    return Result(std::move(x.value()),
+                  x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
   };
 };
 

@@ -22,42 +22,43 @@ class Hadamard {
                 "Incompatible matrix dimensions for Hadamard operation.");
 
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat1::cols;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat1::cols;
 
   /// Returns true only when (row, col) is non-zero in both input matrices.
-  constexpr static auto is_result_index_nonzero(std::size_t row, std::size_t col) {
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
     return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, col) &&
             SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(row, col));
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
-  constexpr static auto num_nonzeros() {
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
     return SparseLinearAlgebra::OperationUtilities<Hadamard>::num_nonzeros();
   }
 
   /// Delegates to OperationUtilities to compute result sparsity indices.
-  constexpr static auto calculate_sparsity() {
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
     return SparseLinearAlgebra::OperationUtilities<Hadamard>::calculate_sparsity();
   }
 
   /// Recursively fills result positions with a[I,J] * b[I,J] * multiplier.
-  template<SparseMatrixType Result, std::size_t I, std::size_t J>
-  static void recursive_hadamard(Result& r,
-                                 const SparseMat& a,
-                                 const SparseMat1& b,
-                                 const DataType multiplier) {
+  template<SparseMatrixType Result, Int I, Int J>
+  SPARSEMAT_HD static void recursive_hadamard(Result& r,
+                                              const SparseMat& a,
+                                              const SparseMat1& b,
+                                              const DataType multiplier) {
     if constexpr (I >= SparseMat::rows) {
       return;
     } else if constexpr (J >= SparseMat1::cols) {
       return recursive_hadamard<Result, I + 1, 0>(r, a, b, multiplier);
     } else {
-      constexpr int sparse_index =
+      constexpr auto sparse_index =
           SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
       if constexpr (sparse_index >= 0) {
-        constexpr int a_index =
+        constexpr auto a_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-        constexpr int b_index =
+        constexpr auto b_index =
             SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
         static_assert(a_index >= 0 && b_index >= 0,
                       "Invalid sparse indices for Hadamard operation.");
@@ -68,10 +69,13 @@ class Hadamard {
   }
 
   /// Constructs the result SparseMat and fills it via recursive_hadamard.
-  static auto hadamard(const SparseMat& a, const SparseMat1& b, const DataType multiplier) {
+  SPARSEMAT_HD static auto hadamard(const SparseMat& a,
+                                    const SparseMat1& b,
+                                    const DataType multiplier) {
     constexpr auto sparsity = calculate_sparsity();
-    auto result = SparseMat::template make<SparseMat::rows, SparseMat::cols, sparsity>(
-        std::make_index_sequence<num_nonzeros()>{});
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<num_nonzeros()>{});
     recursive_hadamard<decltype(result), 0, 0>(result, a, b, multiplier);
     return result;
   }
@@ -94,7 +98,7 @@ namespace SparseLinearAlgebra {
  * @return   Element-wise product matrix.
  */
 template<SparseMatrixType A, SparseMatrixType B>
-auto hadamard(const A& a, const B& b) {
+SPARSEMAT_HD auto hadamard(const A& a, const B& b) {
   return detail::Hadamard<A, B>::hadamard(a, b, 1);
 }
 
@@ -114,7 +118,7 @@ auto hadamard(const A& a, const B& b) {
  * @return            Scaled element-wise product matrix.
  */
 template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
-auto hadamard(const A& a, const B& b, const DataType multiplier) {
+SPARSEMAT_HD auto hadamard(const A& a, const B& b, const DataType multiplier) {
   return detail::Hadamard<A, B>::hadamard(a, b, multiplier);
 }
 

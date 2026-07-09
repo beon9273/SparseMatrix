@@ -16,17 +16,17 @@ template<typename SparseMat>
 class Scale {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr std::size_t rows = SparseMat::rows;
-  static constexpr std::size_t cols = SparseMat::cols;
-  static constexpr std::size_t num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr std::size_t num_zeros = SparseMat::zeroCount;
-  static constexpr std::size_t total_elements = rows * cols;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+  static constexpr auto total_elements = rows * cols;
 
   /// Returns the unchanged input sparsity as the result sparsity.
-  constexpr static auto calculate_sparsity() { return SparseMat::indices; }
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() { return SparseMat::indices(); }
 
   /// Returns a copy of @p a with every stored value multiplied by @p factor.
-  static auto scale(const SparseMat& a, DataType factor) {
+  SPARSEMAT_HD static auto scale(const SparseMat& a, DataType factor) {
     SparseMat result;
     result.values = a.values;
 
@@ -37,7 +37,7 @@ class Scale {
   }
 
   /// Multiplies every stored value of @p a by @p factor in place.
-  static void scale_inplace(SparseMat& a, DataType factor) {
+  SPARSEMAT_HD static void scale_inplace(SparseMat& a, DataType factor) {
     for (auto& it : a.values) {
       it *= factor;
     }
@@ -59,7 +59,7 @@ namespace SparseLinearAlgebra {
  * @return           Scaled matrix with the same sparsity pattern as @p a.
  */
 template<SparseMatrixType SparseMat>
-auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
+SPARSEMAT_HD auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
   return detail::Scale<SparseMat>::scale(a, factor);
 }
 
@@ -73,7 +73,7 @@ auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
  * @param  factor    Scalar multiplier.
  */
 template<SparseMatrixType SparseMat>
-void scale_inplace(SparseMat& a, typename SparseMat::DataType factor) {
+SPARSEMAT_HD void scale_inplace(SparseMat& a, typename SparseMat::DataType factor) {
   detail::Scale<SparseMat>::scale_inplace(a, factor);
 }
 
@@ -88,7 +88,7 @@ void scale_inplace(SparseMat& a, typename SparseMat::DataType factor) {
  * @return           Frobenius norm as the matrix's @c DataType.
  */
 template<SparseMatrixType SparseMat>
-auto frobenius(const SparseMat& a) {
+SPARSEMAT_HD auto frobenius(const SparseMat& a) {
   using DataType = typename SparseMat::DataType;
   DataType sq_sum = 0;
   for (auto& it : a.values) {
@@ -100,30 +100,42 @@ auto frobenius(const SparseMat& a) {
 /**
  * @brief Returns a unit-norm copy of @p a, scaled by @c 1/frobenius(a).
  *
- * The resulting matrix has a Frobenius norm of 1.  Behaviour is undefined if
- * @p a is the zero matrix (division by zero).
+ * The resulting matrix has a Frobenius norm of 1 for non-zero inputs.
+ * If @p a is the zero matrix, returns @p a unchanged.
  *
  * @tparam SparseMat Matrix type.
  * @param  a         Input matrix.
  * @return           Normalized matrix with the same sparsity pattern as @p a.
  */
 template<SparseMatrixType SparseMat>
-auto normalize(const SparseMat& a) {
-  return detail::Scale<SparseMat>::scale(a, 1.0 / frobenius(a));
+SPARSEMAT_HD auto normalize(const SparseMat& a) {
+  const auto frobenius_norm = frobenius(a);
+  if (frobenius_norm == decltype(frobenius_norm)(0)) {
+    return a;
+  }
+  return detail::Scale<SparseMat>::scale(a,
+                                         static_cast<typename SparseMat::DataType>(1.0 /
+                                                                                   frobenius_norm));
 }
 
 /**
  * @brief Normalizes @p a to unit Frobenius norm in place.
  *
- * Divides every stored element by @c frobenius(a).  Behavior is undefined if
- * @p a is the zero matrix.
+ * Divides every stored element by @c frobenius(a). If @p a is the zero
+ * matrix, this operation is a no-op.
  *
  * @tparam SparseMat Matrix type.
  * @param  a         Matrix to normalize in place.
  */
 template<SparseMatrixType SparseMat>
-auto normalize_inplace(SparseMat& a) {
-  detail::Scale<SparseMat>::scale_inplace(a, 1.0 / frobenius(a));
+SPARSEMAT_HD auto normalize_inplace(SparseMat& a) {
+  const auto frobenius_norm = frobenius(a);
+  if (frobenius_norm == decltype(frobenius_norm)(0)) {
+    return;
+  }
+  detail::Scale<SparseMat>::scale_inplace(a,
+                                          static_cast<typename SparseMat::DataType>(
+                                              1.0 / frobenius_norm));
 }
 
 }  // namespace SparseLinearAlgebra
