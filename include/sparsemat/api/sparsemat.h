@@ -4,6 +4,8 @@
 #include <cassert>
 #include <iostream>
 #include <type_traits>
+#include <tuple>
+
 
 #include "sparsemat/operations/add.h"
 #include "sparsemat/operations/cholesky.h"
