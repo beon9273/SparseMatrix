@@ -116,6 +116,57 @@ concept OperationType = requires {
   { T::is_result_index_nonzero(row, col) } -> std::convertible_to<bool>;
 };
 
+namespace detail {
+
+/// Checks that every row of @p T::sparsity() has the same length.
+template<typename T>
+constexpr bool is_rectangular_sparsity() {
+  auto pattern = T::sparsity();
+  auto cols = pattern[0].size();
+  for (std::size_t i = 0; i < pattern.size(); ++i) {
+    if (pattern[i].size() != cols) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Checks that every entry of @p T::sparsity() is either 0 or 1.
+template<typename T>
+constexpr bool is_zero_or_one_sparsity() {
+  auto pattern = T::sparsity();
+  for (std::size_t i = 0; i < pattern.size(); ++i) {
+    for (std::size_t j = 0; j < pattern[i].size(); ++j) {
+      if (pattern[i][j] != 0 && pattern[i][j] != 1) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace detail
+
+/**
+ * @brief Concept satisfied by types describing a compile-time sparsity pattern.
+ *
+ * A sparsity pattern type exposes a @c static @c constexpr @c sparsity()
+ * function returning a rectangular array-of-arrays of 0/1 entries: a 1 marks
+ * a stored (non-zero) position, a 0 marks an empty one. @c SparseMatBuilder
+ * uses this shape to derive a @c SparseMat's dimensions and flat non-zero
+ * index list at compile time.
+ */
+template<typename T>
+concept SparsityPatternType = requires {
+  { T::sparsity() };
+} && requires {
+  requires(T::sparsity().size() > 0);
+  requires(T::sparsity()[0].size() > 0);
+  { T::sparsity()[0][0] } -> std::convertible_to<int>;
+  requires detail::is_rectangular_sparsity<T>();
+  requires detail::is_zero_or_one_sparsity<T>();
+};
+
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/utils.h ----
 
@@ -2809,7 +2860,7 @@ class SparseMat {
   // --- Constructors ---
 
   /// Default-constructs all non-zero values to zero.
-  SPARSEMAT_HD SparseMat() = default;
+  SparseMat() = default; // No annotation as it causes warning. 
 
   /**
    * @brief Constructs from a pre-built values array.
@@ -3403,5 +3454,213 @@ template<typename DType, typename IntType, int Rows, int Cols>
 SPARSEMAT_HD auto dense() {
   return SparseMat<DType, IntType, Rows, Cols>().dense();
 }
+
+
+
+/**
+ * @brief Builds a @c SparseMat from a compile-time sparsity pattern plus a
+ *        dense initializer array.
+ *
+ * Given a type satisfying @c SparsityPatternType, derives the resulting
+ * @c SparseMat's dimensions and flat non-zero index list at compile time, so
+ * callers can populate a sparse matrix from an ordinary dense
+ * array-of-arrays without hand-computing @c NonZeros indices themselves.
+ *
+ * @tparam SparsityPattern Type exposing a @c static @c constexpr @c sparsity()
+ *                         function; see @c SparsityPatternType.
+ * @tparam DType           Scalar element type of the built matrix.
+ * @tparam IntType         Signed integer type used for indices/offsets.
+ */
+template<SparsityPatternType SparsityPattern, typename DType, typename IntType>
+struct SparseMatBuilder {
+
+    /// Number of rows in @c SparsityPattern::sparsity().
+    SPARSEMAT_HD static constexpr IntType get_row_count() { return SparsityPattern::sparsity().size(); }
+
+    /// Number of columns in @c SparsityPattern::sparsity() (rows are assumed uniform in length).
+    SPARSEMAT_HD static constexpr IntType get_column_count() {
+      return SparsityPattern::sparsity()[0].size();
+    }
+
+    /// Counts the non-zero (1) entries in @c SparsityPattern::sparsity().
+    SPARSEMAT_HD static constexpr IntType get_nonzero_count() {
+      auto s = SparsityPattern::sparsity();
+      IntType count = 0;
+      for (IntType i = 0; i < get_row_count(); ++i) {
+          for (IntType j = 0; j < get_column_count(); ++j) {
+              if (s[i][j]) {
+                  ++count;
+              }
+          }
+      }
+      return count;
+    }
+
+    /**
+     * @brief Flattens the non-zero positions of @c SparsityPattern::sparsity()
+     *        into row-major flat indices.
+     * @return Array of @c get_nonzero_count() flat indices, in row-major order.
+     */
+    SPARSEMAT_HD static constexpr auto flatten() {
+      std::array<IntType, get_nonzero_count()> inds{};
+      auto s = SparsityPattern::sparsity();
+      IntType idx = 0;
+      for (IntType i = 0; i < get_row_count(); ++i) {
+          for (IntType j = 0; j < get_column_count(); ++j) {
+              if (s[i][j]) {
+                  inds[idx++] = i * get_column_count() + j;
+              }
+          }
+      }
+      return inds;
+    }
+
+    /**
+     * @brief Rebuilds @c flatten()'s flat index array as the @c SparseMat
+     *        @c NonZeros template pack, so its type can be captured in @c Matrix.
+     */
+    template<std::size_t... Is>
+    static constexpr auto make_matrix_type(std::index_sequence<Is...> /*seq*/)
+        -> SparseMat<DType,
+                     IntType,
+                     static_cast<int>(get_row_count()),
+                     static_cast<int>(get_column_count()),
+                     static_cast<IntType>(flatten()[Is])...>;
+
+    /// The concrete @c SparseMat type produced by this builder.
+    using Matrix = decltype(make_matrix_type(std::make_index_sequence<get_nonzero_count()>{}));
+
+    /**
+     * @brief Builds a @c Matrix from a dense array, keeping only the values at
+     *        the pattern's non-zero positions.
+     *
+     * @param data Dense @c get_row_count() x @c get_column_count() array;
+     *             values at structurally zero positions are discarded.
+     * @return     @c Matrix populated with @p data's values at every non-zero position.
+     */
+    SPARSEMAT_HD auto build(std::array<std::array<DType, get_column_count()>, get_row_count()> data) {
+        constexpr auto sparsity = flatten();
+
+        std::array<DType, get_nonzero_count()> flat_data{};
+        IntType idx = 0;
+        for (IntType i = 0; i < get_row_count(); ++i) {
+            for (IntType j = 0; j < get_column_count(); ++j) {
+                if (idx < get_nonzero_count() && sparsity[idx] == i * get_column_count() + j) {
+                    flat_data[idx++] = data[i][j];
+                }
+            }
+        }
+        return Matrix(flat_data);
+    }
+
+};
+
+/**
+ * @brief Builds a @c SparseMat from a compile-time sparsity pattern given as
+ *        a coordinate (COO-style) list, plus a matching list of (row, col,
+ *        value) triples.
+ *
+ * Unlike @c SparseMatBuilder — whose @c SparsityPattern spells out a full
+ * dense 0/1 grid — @c SparseMatBuilderCSR's @c SparsityPattern lists only the
+ * non-zero coordinates directly, which scales better as matrices grow
+ * sparser. A conforming @c SparsityPattern type must expose:
+ *  - @c static @c constexpr @c int @c rows and @c cols giving the matrix
+ *    dimensions (unlike @c SparseMatBuilder, these are not inferred from
+ *    @c sparsity()).
+ *  - @c static @c constexpr @c sparsity() returning an array of
+ *    @c rows*cols row/col pairs (any type exposing @c .first / @c .second,
+ *    e.g. @c std::pair<int,int>) — one per non-zero position, in any order.
+ *
+ * @c build() likewise takes its values as a list of @c (row, col, value)
+ * triples rather than a dense array-of-arrays; the triples may be supplied
+ * in any order and are matched against the pattern by coordinate, not by
+ * position — at the cost of an O(n^2) match against @c flatten() (see
+ * @c build()).
+ *
+ * @tparam SparsityPattern Type exposing @c rows, @c cols, and @c sparsity()
+ *                         as described above.
+ * @tparam DType           Scalar element type of the built matrix. Defaults
+ *                         to @c double.
+ * @tparam IntType         Signed integer type used for indices/offsets.
+ *                         Defaults to @c int32_t.
+ */
+template<typename SparsityPattern, typename DType = double, typename IntType = int32_t>
+struct SparseMatBuilderCSR {
+
+    /// Number of rows, taken from @c SparsityPattern::rows.
+    SPARSEMAT_HD static constexpr IntType get_row_count() { return SparsityPattern::rows; }
+
+    /// Number of columns, taken from @c SparsityPattern::cols.
+    SPARSEMAT_HD static constexpr IntType get_column_count() {
+      return SparsityPattern::cols;
+    }
+
+    /// Number of non-zero entries, taken from @c SparsityPattern::sparsity()'s length.
+    SPARSEMAT_HD static constexpr IntType get_nonzero_count() {
+      return SparsityPattern::sparsity().size();
+    }
+
+    /**
+     * @brief Flattens @c SparsityPattern::sparsity()'s (row, col) coordinates
+     *        into row-major flat indices.
+     * @return Array of @c get_nonzero_count() flat indices, in the same order
+     *         as @c SparsityPattern::sparsity().
+     */
+    SPARSEMAT_HD static constexpr auto flatten() {
+      std::array<IntType, get_nonzero_count()> inds{};
+      auto s = SparsityPattern::sparsity(); // Array of pairs (row,col) for nonzero positions
+      IntType idx = 0;
+      for (IntType i = 0; i < get_nonzero_count(); ++i) {
+          inds[idx++] = s[i].first * get_column_count() + s[i].second;
+      }
+      return inds;
+    }
+
+    /**
+     * @brief Rebuilds @c flatten()'s flat index array as the @c SparseMat
+     *        @c NonZeros template pack, so its type can be captured in @c Matrix.
+     */
+    template<std::size_t... Is>
+    static constexpr auto make_matrix_type(std::index_sequence<Is...> /*seq*/)
+        -> SparseMat<DType,
+                     IntType,
+                     static_cast<int>(get_row_count()),
+                     static_cast<int>(get_column_count()),
+                     static_cast<IntType>(flatten()[Is])...>;
+
+    /// The concrete @c SparseMat type produced by this builder.
+    using Matrix = decltype(make_matrix_type(std::make_index_sequence<get_nonzero_count()>{}));
+
+    /**
+     * @brief Builds a @c Matrix from (row, col, value) triples.
+     *
+     * @param data @c get_nonzero_count() triples of @c (row, col, value),
+     *             one per non-zero position, in any order — each is matched
+     *             against @c flatten() by coordinate rather than by
+     *             position. Every triple's @c (row, col) must appear in
+     *             @c SparsityPattern::sparsity(); triples for coordinates
+     *             outside the pattern are silently dropped.
+     * @return     @c Matrix populated with @p data's values at every non-zero position.
+     */
+    SPARSEMAT_HD auto build(std::array<std::tuple<IntType, IntType, DType>, get_nonzero_count()> data) {
+        constexpr auto sparsity = flatten();
+        //This is not great. We are doing a nested loop to match the flat index, which is O(n^2).
+        std::array<DType, get_nonzero_count()> flat_data{};
+        for (IntType i = 0; i < get_nonzero_count(); ++i) {
+           auto row = std::get<0>(data[i]);
+           auto col = std::get<1>(data[i]);
+           auto index = row * get_column_count() + col;
+           for (IntType j = 0; j < get_nonzero_count(); ++j) {
+               if (sparsity[j] == index) {
+                   flat_data[j] = std::get<2>(data[i]);
+                   break;
+               }
+           }
+        }
+        return Matrix(flat_data);
+    }
+
+};
+
 
 }  // namespace SparseLinearAlgebra

@@ -106,4 +106,55 @@ concept OperationType = requires {
   { T::is_result_index_nonzero(row, col) } -> std::convertible_to<bool>;
 };
 
+namespace detail {
+
+/// Checks that every row of @p T::sparsity() has the same length.
+template<typename T>
+constexpr bool is_rectangular_sparsity() {
+  auto pattern = T::sparsity();
+  auto cols = pattern[0].size();
+  for (std::size_t i = 0; i < pattern.size(); ++i) {
+    if (pattern[i].size() != cols) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Checks that every entry of @p T::sparsity() is either 0 or 1.
+template<typename T>
+constexpr bool is_zero_or_one_sparsity() {
+  auto pattern = T::sparsity();
+  for (std::size_t i = 0; i < pattern.size(); ++i) {
+    for (std::size_t j = 0; j < pattern[i].size(); ++j) {
+      if (pattern[i][j] != 0 && pattern[i][j] != 1) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace detail
+
+/**
+ * @brief Concept satisfied by types describing a compile-time sparsity pattern.
+ *
+ * A sparsity pattern type exposes a @c static @c constexpr @c sparsity()
+ * function returning a rectangular array-of-arrays of 0/1 entries: a 1 marks
+ * a stored (non-zero) position, a 0 marks an empty one. @c SparseMatBuilder
+ * uses this shape to derive a @c SparseMat's dimensions and flat non-zero
+ * index list at compile time.
+ */
+template<typename T>
+concept SparsityPatternType = requires {
+  { T::sparsity() };
+} && requires {
+  requires(T::sparsity().size() > 0);
+  requires(T::sparsity()[0].size() > 0);
+  { T::sparsity()[0][0] } -> std::convertible_to<int>;
+  requires detail::is_rectangular_sparsity<T>();
+  requires detail::is_zero_or_one_sparsity<T>();
+};
+
 }  // namespace SparseLinearAlgebra

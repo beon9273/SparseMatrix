@@ -250,6 +250,140 @@ SPARSEMAT_HD void test_dense() {
   check_eq(d.get<0, 1>(), 0.0, "dense: zero element");
 }
 
+// --- SparseMatBuilder ---
+//
+// One test per sparsity-pattern shape: a diagonal pattern (mostly zero), a
+// fully dense pattern (no zeros), and a pattern whose last (bottom-right)
+// position is structurally zero — a regression case for a bug where build()
+// read one past the end of its flattened non-zero index array once the
+// final scanned position wasn't itself a non-zero.
+
+struct DiagonalPattern3x3 {
+  SPARSEMAT_HD static constexpr auto sparsity() {
+    return std::array<std::array<int, 3>, 3>{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+  }
+};
+
+SPARSEMAT_HD void test_builder_diagonal() {
+  SparseMatBuilder<DiagonalPattern3x3, double, IntType> builder;
+  auto mat = builder.build({{{1.0, 0.0, 0.0}, {0.0, 2.0, 0.0}, {0.0, 0.0, 3.0}}});
+  check_eq(decltype(mat)::rows, IntType(3), "builder diagonal: rows");
+  check_eq(decltype(mat)::cols, IntType(3), "builder diagonal: cols");
+  check_eq(decltype(mat)::nonZeroCount, IntType(3), "builder diagonal: nonZeroCount");
+  check_eq(mat.template get<0, 0>(), 1.0, "builder diagonal: (0,0)");
+  check_eq(mat.template get<1, 1>(), 2.0, "builder diagonal: (1,1)");
+  check_eq(mat.template get<2, 2>(), 3.0, "builder diagonal: (2,2)");
+  check_eq(mat.template get<0, 1>(), 0.0, "builder diagonal: zero element (0,1)");
+}
+
+struct DensePattern3x2 {
+  SPARSEMAT_HD static constexpr auto sparsity() {
+    return std::array<std::array<int, 2>, 3>{{{1, 1}, {1, 1}, {1, 1}}};
+  }
+};
+
+SPARSEMAT_HD void test_builder_dense() {
+  SparseMatBuilder<DensePattern3x2, double, IntType> builder;
+  auto mat = builder.build({{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}});
+  check_eq(decltype(mat)::rows, IntType(3), "builder dense: rows");
+  check_eq(decltype(mat)::cols, IntType(2), "builder dense: cols");
+  check_eq(decltype(mat)::nonZeroCount, IntType(6), "builder dense: nonZeroCount");
+  check_eq(mat.template get<0, 0>(), 1.0, "builder dense: (0,0)");
+  check_eq(mat.template get<1, 1>(), 4.0, "builder dense: (1,1)");
+  check_eq(mat.template get<2, 1>(), 6.0, "builder dense: (2,1)");
+}
+
+struct FirstColumnPattern2x2 {
+  SPARSEMAT_HD static constexpr auto sparsity() {
+    return std::array<std::array<int, 2>, 2>{{{1, 0}, {1, 0}}};
+  }
+};
+
+SPARSEMAT_HD void test_builder_trailing_zero() {
+  SparseMatBuilder<FirstColumnPattern2x2, double, IntType> builder;
+  auto mat = builder.build({{{5.0, 99.0}, {7.0, 99.0}}});
+  check_eq(decltype(mat)::nonZeroCount, IntType(2), "builder trailing zero: nonZeroCount");
+  check_eq(mat.template get<0, 0>(), 5.0, "builder trailing zero: (0,0)");
+  check_eq(mat.template get<1, 0>(), 7.0, "builder trailing zero: (1,0)");
+  check_eq(mat.template get<0, 1>(), 0.0, "builder trailing zero: discarded value at (0,1)");
+  check_eq(mat.template get<1, 1>(), 0.0, "builder trailing zero: discarded value at (1,1)");
+}
+
+// --- SparseMatBuilderCSR ---
+//
+// Unlike SparseMatBuilder's dense 0/1 grid, SparseMatBuilderCSR's pattern is
+// a coordinate (row, col) list, and build() takes matching (row, col, value)
+// triples. One test for the basic case (triples in sparsity() order), one
+// for triples supplied out of order — a regression case for a bug where
+// build() wrote each matched value back to the input triple's own position
+// instead of its matched position in the flattened sparsity order, silently
+// scrambling values whenever the input order didn't match sparsity() — and
+// one using the builder's default DType/IntType template arguments.
+
+struct DiagonalPatternCSR3x3 {
+  static constexpr int rows = 3;
+  static constexpr int cols = 3;
+  SPARSEMAT_HD static constexpr auto sparsity() {
+    return std::array<std::pair<int, int>, 3>{{{0, 0}, {1, 1}, {2, 2}}};
+  }
+};
+
+SPARSEMAT_HD void test_builder_csr_diagonal() {
+  SparseMatBuilderCSR<DiagonalPatternCSR3x3, double, IntType> builder;
+  auto mat = builder.build({{{0, 0, 1.0}, {1, 1, 2.0}, {2, 2, 3.0}}});
+  check_eq(decltype(mat)::rows, IntType(3), "builder csr diagonal: rows");
+  check_eq(decltype(mat)::cols, IntType(3), "builder csr diagonal: cols");
+  check_eq(decltype(mat)::nonZeroCount, IntType(3), "builder csr diagonal: nonZeroCount");
+  check_eq(mat.template get<0, 0>(), 1.0, "builder csr diagonal: (0,0)");
+  check_eq(mat.template get<1, 1>(), 2.0, "builder csr diagonal: (1,1)");
+  check_eq(mat.template get<2, 2>(), 3.0, "builder csr diagonal: (2,2)");
+  check_eq(mat.template get<0, 1>(), 0.0, "builder csr diagonal: zero element (0,1)");
+}
+
+struct SparsePatternCSR2x3 {
+  static constexpr int rows = 2;
+  static constexpr int cols = 3;
+  SPARSEMAT_HD static constexpr auto sparsity() {
+    return std::array<std::pair<int, int>, 3>{{{0, 0}, {0, 2}, {1, 1}}};
+  }
+};
+
+SPARSEMAT_HD void test_builder_csr_out_of_order_triples() {
+  SparseMatBuilderCSR<SparsePatternCSR2x3, double, IntType> builder;
+  // Triples supplied in a different order than sparsity(); build() must
+  // match each by (row, col) coordinate rather than by input position.
+  auto mat = builder.build({{{1, 1, 5.0}, {0, 2, 7.0}, {0, 0, 9.0}}});
+  check_eq(decltype(mat)::rows, IntType(2), "builder csr out-of-order: rows");
+  check_eq(decltype(mat)::cols, IntType(3), "builder csr out-of-order: cols");
+  check_eq(decltype(mat)::nonZeroCount, IntType(3), "builder csr out-of-order: nonZeroCount");
+  check_eq(mat.template get<0, 0>(), 9.0, "builder csr out-of-order: (0,0)");
+  check_eq(mat.template get<0, 2>(), 7.0, "builder csr out-of-order: (0,2)");
+  check_eq(mat.template get<1, 1>(), 5.0, "builder csr out-of-order: (1,1)");
+  check_eq(mat.template get<0, 1>(), 0.0, "builder csr out-of-order: zero element (0,1)");
+}
+
+struct DefaultTypePatternCSR2x2 {
+  static constexpr int rows = 2;
+  static constexpr int cols = 2;
+  SPARSEMAT_HD static constexpr auto sparsity() {
+    return std::array<std::pair<int, int>, 2>{{{0, 1}, {1, 0}}};
+  }
+};
+
+SPARSEMAT_HD void test_builder_csr_default_types() {
+  // Omits the DType/IntType template arguments, exercising the builder's
+  // documented double/int32_t defaults.
+  SparseMatBuilderCSR<DefaultTypePatternCSR2x2> builder;
+  auto mat = builder.build({{{0, 1, 4.0}, {1, 0, 6.0}}});
+  static_assert(std::is_same_v<decltype(mat)::DataType, double>,
+                "builder csr default types: DataType should default to double");
+  static_assert(std::is_same_v<decltype(mat)::Int, int32_t>,
+                "builder csr default types: Int should default to int32_t");
+  check_eq(mat.template get<0, 1>(), 4.0, "builder csr default types: (0,1)");
+  check_eq(mat.template get<1, 0>(), 6.0, "builder csr default types: (1,0)");
+  check_eq(mat.template get<0, 0>(), 0.0, "builder csr default types: zero element (0,0)");
+}
+
 SPARSEMAT_HD void test_trace() {
   // A = diag(1,2,3), trace = 6
   SparseMat<double, IntType, 3, 3, 0, 4, 8> a(1, 2, 3);
@@ -719,6 +853,12 @@ SPARSEMAT_HD inline void run_all_tests() {
   test_normalize_zero_returns_zero();
   test_normalize_inplace_zero_noop();
   test_dense();
+  test_builder_diagonal();
+  test_builder_dense();
+  test_builder_trailing_zero();
+  test_builder_csr_diagonal();
+  test_builder_csr_out_of_order_triples();
+  test_builder_csr_default_types();
   test_trace();
   test_dot();
   test_identity();
