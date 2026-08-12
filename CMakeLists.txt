@@ -125,29 +125,70 @@ target_include_directories(sparsemat INTERFACE
 
 target_compile_features(sparsemat INTERFACE cxx_std_20)
 
+# Consumers compiling this header as CUDA need --expt-relaxed-constexpr: the
+# SPARSEMAT_HD operations call constexpr functions (getSparseIndex, indices(),
+# ...) from __device__ context, which nvcc rejects by default. This repo's own
+# GPU targets pass the flag explicitly; without it here, a downstream project
+# doing target_link_libraries(theirs sparsemat::sparsemat) in a CUDA build hits
+# errors this project never sees.
+target_compile_options(sparsemat INTERFACE
+  $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-relaxed-constexpr>
+)
+
 option(SPARSEMAT_BUILD_EXAMPLES "Build examples" ON)
 if(SPARSEMAT_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
 
-# --- Compile-fail tests for SparseMat::validate_indicies() ---
-# Duplicate/out-of-bounds sparsity indices are rejected via static_assert, so
-# the only way to test them is to confirm the offending translation unit
+# --- Compile-fail tests for SparseMat's static_asserts ---
+# Invalid sparsity patterns (and other misuse) are rejected via static_assert,
+# so the only way to test them is to confirm the offending translation unit
 # fails to compile. A control case (unique, in-bounds indices) confirms these
 # tests fail for the *expected* reason rather than a broken include path.
+#
+# Each case runs as a real ctest that invokes the compiler at *test* time, via
+# `cmake --build` on a generated mini-project, rather than a configure-time
+# try_compile() whose verdict is baked into a `cmake -E true`/`false` stub.
+# The try_compile form had two problems: a failure reported nothing about why
+# (just a test named compile_X exiting 1), and the verdict was cached, so a
+# stale build directory kept reporting the old result until someone
+# reconfigured from scratch.
+set(SPARSEMAT_COMPILE_TEST_DIR ${CMAKE_BINARY_DIR}/compile_tests)
+
 function(sparsemat_add_compile_test name expect_success)
-  try_compile(SPARSEMAT_CT_${name}
-    ${CMAKE_BINARY_DIR}/compile_tests/${name}
-    ${CMAKE_SOURCE_DIR}/tests/compile_fail/${name}.cpp
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CMAKE_FLAGS -DINCLUDE_DIRECTORIES=${CMAKE_SOURCE_DIR}/include
+  set(case_dir ${SPARSEMAT_COMPILE_TEST_DIR}/${name})
+  file(MAKE_DIRECTORY ${case_dir})
+  file(WRITE ${case_dir}/CMakeLists.txt
+    "cmake_minimum_required(VERSION 3.16)\n"
+    "project(sparsemat_ct_${name} LANGUAGES CXX)\n"
+    "set(CMAKE_CXX_STANDARD 20)\n"
+    "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n"
+    "add_executable(ct ${CMAKE_SOURCE_DIR}/tests/compile_fail/${name}.cpp)\n"
+    "target_include_directories(ct PRIVATE ${CMAKE_SOURCE_DIR}/include)\n"
   )
-  if(SPARSEMAT_CT_${name} STREQUAL expect_success)
-    add_test(NAME compile_${name} COMMAND ${CMAKE_COMMAND} -E true)
+
+  if(expect_success)
+    set(will_fail FALSE)
   else()
-    add_test(NAME compile_${name} COMMAND ${CMAKE_COMMAND} -E false)
+    set(will_fail TRUE)
   endif()
+
+  add_test(NAME compile_${name}
+    COMMAND ${CMAKE_COMMAND}
+      -S ${case_dir}
+      -B ${case_dir}/build
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      --log-level=ERROR
+  )
+  add_test(NAME compile_${name}_build
+    COMMAND ${CMAKE_COMMAND} --build ${case_dir}/build
+  )
+  # Compiler diagnostics land in the ctest log either way, so a regression
+  # shows the actual static_assert message rather than a bare exit code.
+  set_tests_properties(compile_${name}_build PROPERTIES
+    WILL_FAIL ${will_fail}
+    DEPENDS compile_${name}
+  )
 endfunction()
 
 sparsemat_add_compile_test(valid_indices_control TRUE)
@@ -156,6 +197,9 @@ sparsemat_add_compile_test(out_of_bounds_index FALSE)
 sparsemat_add_compile_test(negative_index FALSE)
 sparsemat_add_compile_test(negative_dimensions FALSE)
 sparsemat_add_compile_test(dot_mismatched_length FALSE)
+sparsemat_add_compile_test(mixed_datatype FALSE)
+sparsemat_add_compile_test(compound_add_widens_pattern FALSE)
+sparsemat_add_compile_test(exceeds_nonzero_budget FALSE)
 
 include(GNUInstallDirs)
 

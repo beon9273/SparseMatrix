@@ -1,63 +1,80 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
-#include <span>
+#include <utility>
 
 #include "sparsemat/concepts/concepts.h"
+#include "sparsemat/operations/utils.h"
 
 namespace SparseLinearAlgebra::detail {
+
+/// Length of the diagonal of @c A — @c min(rows, cols).
+template<SparseMatrixType A>
+inline constexpr auto diagonal_length = (A::rows < A::cols) ? A::rows : A::cols;
+
+/**
+ * @brief Storage offsets of every *stored* diagonal entry of @c A, in row order.
+ *
+ * The compile-time part of set_diagonal is deciding which diagonal positions
+ * exist at all; once that list is known, writing to them is pure data
+ * movement and a runtime loop does it without a template instantiation per
+ * position (and without running into clang's 256-argument fold nesting limit
+ * on a large matrix).
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD constexpr auto stored_diagonal_offsets() {
+  using Int = typename A::Int;
+  std::array<Int,
+             static_cast<std::size_t>(SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros())>
+      offsets{};
+  constexpr auto grid = SparseLinearAlgebra::MatrixUtilities<A>::storage_index_grid();
+  std::size_t k = 0;
+  for (Int i = 0; i < diagonal_length<A>; ++i) {
+    const auto offset = grid[static_cast<std::size_t>((i * A::cols) + i)];
+    if (offset >= 0) {
+      offsets[k++] = offset;
+    }
+  }
+  return offsets;
+}
 
 /**
  * @brief Set every stored diagonal element of a sparse matrix to a single value.
  *
- * Iterates diagonal positions (N, N) at compile time.  Positions that are
- * structurally zero (not stored in the sparse format) are silently skipped.
+ * Structurally zero diagonal positions are silently skipped — the sparsity
+ * pattern is immutable, so there is nowhere to put the value.
  *
- * @tparam A     Sparse matrix type.
- * @tparam N     Current diagonal index (template recursion counter; leave at default).
- * @param  a     Matrix whose diagonal is to be set.
- * @param  value Scalar value written to every stored diagonal entry.
+ * @param a     Matrix whose diagonal is to be set.
+ * @param value Scalar value written to every stored diagonal entry.
  */
-template<SparseMatrixType A, typename A::Int N = 0>
+template<SparseMatrixType A>
 SPARSEMAT_HD void set_diagonal_impl(A& a, typename A::DataType value) {
-  constexpr auto min_dim = (A::rows < A::cols) ? A::rows : A::cols;
-  if constexpr (N < min_dim) {
-    constexpr auto idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
-    if constexpr (idx >= 0) {
-      a.values[idx] = value;
-    }
-    set_diagonal_impl<A, N + 1>(a, value);
+  constexpr auto offsets = stored_diagonal_offsets<A>();
+  for (auto offset : offsets) {
+    a.values[static_cast<std::size_t>(offset)] = value;
   }
 }
 
 /**
  * @brief Set the stored diagonal elements of a sparse matrix from a value array.
  *
- * Iterates diagonal positions (N, N) at compile time.  Only positions that are
- * structurally non-zero consume an entry from @p values; structurally-zero
- * diagonal positions are skipped without advancing @p index.
+ * Only positions that are structurally non-zero consume an entry from
+ * @p values; structurally-zero diagonal positions are skipped without
+ * consuming one. @c stored_diagonal_offsets() is already in row order, so the
+ * k-th entry of @p values lands in the k-th stored diagonal position.
  *
- * @tparam A      Sparse matrix type.
- * @tparam N      Current diagonal index (template recursion counter; leave at default).
- * @tparam index  Current position within @p values (template recursion counter; leave at default).
- * @param  a      Matrix whose diagonal is to be set.
- * @param  values Span of values to write into stored diagonal entries, in order.
+ * @param a      Matrix whose diagonal is to be set.
+ * @param values Values to write into stored diagonal entries, in row order.
  */
-template<SparseMatrixType A, typename A::Int N = 0, typename A::Int index = 0>
+template<SparseMatrixType A>
 SPARSEMAT_HD void set_diagonal_impl(
     A& a,
-    std::array<typename A::DataType, SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()>
-        values) {
-  constexpr auto min_dim = (A::rows < A::cols) ? A::rows : A::cols;
-  if constexpr (N < min_dim &&
-                index < SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()) {
-    constexpr auto idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
-    if constexpr (idx >= 0) {
-      a.values[idx] = values[index];
-      set_diagonal_impl<A, N + 1, index + 1>(a, values);
-    } else {
-      set_diagonal_impl<A, N + 1, index>(a, values);
-    }
+    const std::array<typename A::DataType,
+                     SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()>& values) {
+  constexpr auto offsets = stored_diagonal_offsets<A>();
+  for (std::size_t k = 0; k < offsets.size(); ++k) {
+    a.values[static_cast<std::size_t>(offsets[k])] = values[k];
   }
 }
 
@@ -87,8 +104,9 @@ SPARSEMAT_HD void set_diagonal(SparseMat& a, typename SparseMat::DataType value)
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD void set_diagonal(
     SparseMat& a,
-    std::array<typename SparseMat::DataType,
-               SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros()> values) {
+    const std::array<typename SparseMat::DataType,
+                     SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros()>&
+        values) {
   detail::set_diagonal_impl(a, values);
 }
 

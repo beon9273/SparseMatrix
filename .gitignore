@@ -1,5 +1,13 @@
 build
+build-*
 .vscode
-.clang*
 compile_commands.json
-.cspell.json
+
+# .clang-format / .clang-tidy / .cspell.json are tracked on purpose:
+# scripts/pre-commit and the CI lint job both depend on them existing, so a
+# fresh clone has to get them.
+#
+# .clangd is not: it pins an absolute path to one machine's checkout, so it is
+# editor-local configuration rather than something a clone should inherit.
+.clangd
+.cache

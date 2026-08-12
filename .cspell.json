@@ -1,0 +1,24 @@
+{
+  "words": [
+    "sparsemat",
+    "hadamard",
+    "frobenius",
+    "inplace",
+    "nonzero",
+    "endforeach",
+    "Eigen",
+    "BLAS",
+    "tridiagonal",
+    "ctest",
+    "Wextra",
+    "Werror",
+    "INCLUDEDIR",
+    "cppcoreguidelines",
+    "bugprone",
+    "vararg",
+    "cout",
+    "mult",
+    "endl",
+    "Kalman"
+  ]
+}

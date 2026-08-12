@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "sparsemat/concepts/concepts.h"
@@ -7,10 +9,29 @@
 namespace SparseLinearAlgebra {
 
 /// Outcome of a numeric solve/factorization.
-enum class SolveStatus {
+enum class SolveStatus : std::uint8_t {
   Success,
-  SingularMatrix,  ///< Hit a zero (or non-positive, for Cholesky) pivot.
+  SingularMatrix,  ///< Hit a negligible (or non-positive, for Cholesky) pivot.
 };
+
+/**
+ * @brief Relative magnitude below which a pivot is treated as singular.
+ *
+ * None of the factorizations here pivot, so a merely *tiny* pivot is as fatal
+ * as an exactly-zero one: it is divided through and yields enormous,
+ * meaningless multipliers. Callers get told via @c SolveStatus::SingularMatrix
+ * rather than silently receiving garbage with @c ok() == @c true.
+ *
+ * The value is a few epsilons of the scalar type — loose enough not to reject
+ * merely ill-conditioned-but-usable systems, tight enough to catch a pivot
+ * that has been annihilated by cancellation. It is multiplied by a magnitude
+ * scale drawn from the matrix at the call site, making the test relative
+ * rather than absolute.
+ */
+template<typename DataType>
+SPARSEMAT_HD constexpr DataType singular_pivot_threshold() {
+  return DataType(8) * std::numeric_limits<DataType>::epsilon();
+}
 
 /**
  * @brief Non-throwing result wrapper for solvers that may hit a zero pivot.

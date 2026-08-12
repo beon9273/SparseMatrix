@@ -6,11 +6,18 @@
 #include <type_traits>
 
 #include "sparsemat/operations/add.h"
+#include "sparsemat/operations/axpy.h"
+#include "sparsemat/operations/block_diagonal.h"
 #include "sparsemat/operations/cholesky.h"
+#include "sparsemat/operations/compare.h"
+#include "sparsemat/operations/convert.h"
 #include "sparsemat/operations/dense.h"
 #include "sparsemat/operations/diagonal.h"
+#include "sparsemat/operations/fuse.h"
 #include "sparsemat/operations/hadamard.h"
+#include "sparsemat/operations/invert.h"
 #include "sparsemat/operations/kronecker.h"
+#include "sparsemat/operations/least_squares.h"
 #include "sparsemat/operations/lu.h"
 #include "sparsemat/operations/multiply.h"
 #include "sparsemat/operations/scale.h"
@@ -20,6 +27,7 @@
 #include "sparsemat/operations/transpose.h"
 #include "sparsemat/operations/triangular.h"
 #include "sparsemat/operations/utils.h"
+#include "sparsemat/version.h"
 
 namespace SparseLinearAlgebra {
 
@@ -46,6 +54,18 @@ class SparseMat {
   static_assert(std::is_signed_v<IntType>, "SparseMat::Int must be a signed integer type.");
   static_assert(Rows > 0 && Cols > 0,
                 "SparseMat dimensions must be positive (Rows > 0 and Cols > 0).");
+  // Compile time and binary size scale with the stored-value count, so a
+  // runaway-density result is worth naming explicitly rather than letting it
+  // surface as a mysteriously slow build or an inscrutable compiler limit.
+  // See SPARSEMAT_MAX_NONZEROS in concepts/concepts.h to raise, lower, or
+  // disable this.
+  static_assert(SPARSEMAT_MAX_NONZEROS == 0 ||
+                    sizeof...(NonZeros) <= static_cast<std::size_t>(SPARSEMAT_MAX_NONZEROS),
+                "This SparseMat exceeds SPARSEMAT_MAX_NONZEROS stored values. Compile time "
+                "and binary size scale with that count, so this usually means an operation "
+                "chain produced a far denser result than intended (multiply and kronecker "
+                "both can). Check the density of the operands, or raise/disable the ceiling "
+                "by defining SPARSEMAT_MAX_NONZEROS before including sparsemat.");
 
   /// Helper that builds an N×M identity matrix from an index sequence.
   template<std::size_t... Is>
@@ -64,6 +84,18 @@ class SparseMat {
    */
   template<IntType R, IntType C, IntType... NZ>
   using Rebind = SparseMat<DType, IntType, R, C, NZ...>;
+
+  /**
+   * @brief Rebinds this template to a different scalar type, keeping the shape
+   *        and sparsity pattern.
+   *
+   * Used by @c convert() — the counterpart to @c Rebind, which varies the
+   * shape while holding the scalar type fixed.
+   *
+   * @tparam D New scalar element type.
+   */
+  template<typename D>
+  using RebindData = SparseMat<D, IntType, Rows, Cols, NonZeros...>;
 
   /// Scalar element type.
   using DataType = DType;
@@ -86,15 +118,27 @@ class SparseMat {
   }
 
   /**
-   * @brief Validates that the provided values array matches the sparsity pattern.
+   * @brief Validates the sparsity pattern given in the @c NonZeros pack.
    *
-   * Checks that indices provided for the sparsity pattern are within bounds and unique.
+   * Checks that every index is non-negative, within bounds (< Rows*Cols), and
+   * that no index is repeated. Evaluated by the @c static_assert immediately
+   * below, so an invalid pattern is a compile error at the point of
+   * declaration.
    *
-   * @param vals Array of values to validate.
-   * @return     @c true if the sparsity pattern is valid, @c false otherwise.
+   * Duplicate detection marks each index in a @c Rows*Cols bitmap rather than
+   * comparing every pair, making this O(Rows*Cols + nonZeroCount) instead of
+   * O(nonZeroCount²). That matters because this assert fires for *every*
+   * @c SparseMat instantiation, including the fully-dense results of
+   * @c dense(): at 32x32 the quadratic form was ~1M constexpr operations,
+   * which is enough to exhaust nvcc's constexpr-evaluation budget ("excessive
+   * constexpr function call complexity") even though g++ and clang accept it.
+   * This was the real remaining ceiling on matrix size.
+   *
+   * @return @c true if the sparsity pattern is valid, @c false otherwise.
    */
   [[nodiscard]] SPARSEMAT_HD static constexpr bool validate_indices() {
     constexpr auto inds = indices();
+    std::array<bool, static_cast<std::size_t>(Rows) * static_cast<std::size_t>(Cols)> seen{};
     for (IntType i = 0; i < nonZeroCount; ++i) {
       if (inds[i] < 0) {
         return false;
@@ -102,11 +146,11 @@ class SparseMat {
       if (inds[i] >= rows * cols) {
         return false;
       }
-      for (IntType j = i + 1; j < nonZeroCount; ++j) {
-        if (inds[i] == inds[j]) {
-          return false;
-        }
+      const auto slot = static_cast<std::size_t>(inds[i]);
+      if (seen[slot]) {
+        return false;  // duplicate index
       }
+      seen[slot] = true;
     }
     return true;
   }
@@ -126,16 +170,25 @@ class SparseMat {
   /**
    * @brief Variadic constructor; each argument initialises one non-zero slot.
    *
-   * The number of arguments must equal @c nonZeroCount; a static assertion
-   * enforces this at compile time.
+   * The number of arguments must equal @c nonZeroCount, and every argument
+   * must be convertible to @c DataType.
+   *
+   * Both requirements are constraints rather than a body @c static_assert so
+   * that this constructor drops out of overload resolution instead of hard-
+   * erroring when it doesn't apply. Unconstrained, it accepts any argument
+   * list at all as far as overload resolution can see: @c SparseMat would
+   * satisfy @c std::is_constructible_v with completely unrelated types, would
+   * act as a greedy converting constructor in any overload set it appears in,
+   * and a genuinely bad call would surface as a @c static_cast error deep
+   * inside the constructor body rather than as "no matching constructor".
    *
    * @tparam Vals Deduced value types (must be convertible to @c DataType).
    * @param  vals Values in the same order as the @c NonZeros index pack.
    */
   template<typename... Vals>
-  SPARSEMAT_HD SparseMat(Vals... vals) : values{static_cast<DataType>(vals)...} {
-    static_assert(sizeof...(Vals) == nonZeroCount, "Number of values must match non-zero count.");
-  }
+    requires(sizeof...(Vals) == static_cast<std::size_t>(nonZeroCount) &&
+             (std::is_convertible_v<Vals, DType> && ...))
+  SPARSEMAT_HD SparseMat(Vals... vals) : values{static_cast<DataType>(vals)...} {}
 
   // --- Static factories ---
 
@@ -191,6 +244,75 @@ class SparseMat {
       return values[index];
     }
     return static_cast<DataType>(0);
+  }
+
+  /**
+   * @brief Runtime element read at position (i, j); alias for @c get(i, j).
+   *
+   * Read-only by design: there is deliberately no reference-returning
+   * overload, because a structurally zero position has no storage to hand
+   * back a reference to, and returning a reference to a shared dummy zero
+   * would let `m(0, 1) = 5.0` silently do nothing. Use @c set(i, j, value),
+   * which reports whether the write landed.
+   *
+   * @param i Row index.
+   * @param j Column index.
+   * @return  Element value, or zero if the position is structurally zero.
+   */
+  [[nodiscard]] SPARSEMAT_HD DataType operator()(Int i, Int j) const { return get(i, j); }
+
+  // --- Iteration over stored values ---
+  //
+  // Iterates the packed storage, i.e. exactly the non-zero positions, in flat
+  // row-major index order. Pair with indices() (a parallel array) or use
+  // entries() below when the positions matter too.
+
+  /// Number of stored (non-zero) elements — the length of the iteration range.
+  [[nodiscard]] SPARSEMAT_HD constexpr std::size_t size() const {
+    return static_cast<std::size_t>(nonZeroCount);
+  }
+
+  /// @c true if this matrix stores no values at all (the structural zero matrix).
+  [[nodiscard]] SPARSEMAT_HD constexpr bool empty() const { return nonZeroCount == 0; }
+
+  [[nodiscard]] SPARSEMAT_HD auto begin() { return values.begin(); }
+  [[nodiscard]] SPARSEMAT_HD auto end() { return values.end(); }
+  [[nodiscard]] SPARSEMAT_HD auto begin() const { return values.begin(); }
+  [[nodiscard]] SPARSEMAT_HD auto end() const { return values.end(); }
+  [[nodiscard]] SPARSEMAT_HD auto cbegin() const { return values.cbegin(); }
+  [[nodiscard]] SPARSEMAT_HD auto cend() const { return values.cend(); }
+
+  /// One stored element, as returned by @c entries().
+  struct Entry {
+    Int row;         ///< Row index of the stored element.
+    Int col;         ///< Column index of the stored element.
+    DataType value;  ///< The stored value.
+  };
+
+  /**
+   * @brief Returns every stored element as a (row, col, value) triple.
+   *
+   * Saves callers from re-deriving positions out of @c indices() by hand,
+   * which previously was the only way to iterate structure and values
+   * together. Returned by value (like @c indices()) so the result is a local
+   * copy usable from both host and device code.
+   *
+   * @code
+   * for (auto [row, col, value] : m.entries()) { ... }
+   * @endcode
+   */
+  [[nodiscard]] SPARSEMAT_HD auto entries() const {
+    std::array<Entry, static_cast<std::size_t>(nonZeroCount)> result{};
+    constexpr auto inds = indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nonZeroCount); ++i) {
+        result[i] =
+            Entry{static_cast<Int>(inds[i] / cols), static_cast<Int>(inds[i] % cols), values[i]};
+      }
+    }
+    return result;
   }
 
   /// Returns the sum of the diagonal elements (tr(A)).
@@ -371,10 +493,17 @@ class SparseMat {
    * Dispatches at compile time based on the sparsity pattern:
    * - Lower triangular → forward substitution via @c forward_solve.
    * - Upper triangular → back substitution via @c backward_solve.
-   * - Neither → LU factorization via @c lu_solve (no pivoting; requires a non-singular,
-   * pivot-stable matrix).
+   * - Neither → LU factorization via @c lu_solve.
    *
    * A diagonal matrix satisfies both conditions; forward substitution is used.
+   *
+   * @warning The LU path does **no pivoting**. It is only valid for matrices
+   * that factorize stably without row swaps (diagonally dominant, or
+   * otherwise pivot-free). A matrix that merely *needs* a row swap is
+   * reported as singular via @c ok() rather than silently solved, but a
+   * matrix that is pivot-stable yet badly conditioned will still return a
+   * poor answer with @c ok() == @c true. Check @c ok() on the result, and
+   * prefer @c cholesky() when the matrix is symmetric positive definite.
    *
    * @tparam Matrix Right-hand side column vector type.
    * @param  b      Right-hand side vector.
@@ -401,7 +530,7 @@ class SparseMat {
    * @return        Sum matrix.
    */
   template<typename Matrix>
-  SPARSEMAT_HD auto add(const Matrix& other) const {
+  [[nodiscard]] SPARSEMAT_HD auto add(const Matrix& other) const {
     return SparseLinearAlgebra::add(*this, other);
   }
 
@@ -434,6 +563,32 @@ class SparseMat {
     static_assert(rows == 1 && Matrix::cols == 1 && cols == Matrix::rows,
                   "Dot product requires 1xN times Nx1 vectors with matching length.");
     return mult(b).template get<0, 0>();
+  }
+
+  /**
+   * @brief Fused multiply-add: @c alpha * (*this) * @p x + @p beta * @p y,
+   *        in a single pass.
+   *
+   * Computes @c alpha*A*x + beta*y without materializing the intermediate
+   * product @c A*x. @p x and @p y must be column vectors, with @p x's
+   * length matching @c cols and @p y's length matching @c rows. @p alpha
+   * and @p beta default to @c 1, so @c axpy(x, y) alone computes plain
+   * @c A*x + y.
+   *
+   * @tparam VecX Column-vector type multiplied by @c *this.
+   * @tparam VecY Column-vector type added to the product.
+   * @param  x     Vector multiplied by @c *this.
+   * @param  y     Vector added to the product.
+   * @param  alpha Scalar multiplier for @c (*this)*x.
+   * @param  beta  Scalar multiplier for @p y.
+   * @return       Result column vector @c alpha*(*this)*x + beta*y.
+   */
+  template<typename VecX, typename VecY>
+  [[nodiscard]] SPARSEMAT_HD auto axpy(const VecX& x,
+                                       const VecY& y,
+                                       DataType alpha = DataType(1),
+                                       DataType beta = DataType(1)) const {
+    return SparseLinearAlgebra::axpy(*this, x, y, alpha, beta);
   }
 
   /**
@@ -470,7 +625,7 @@ class SparseMat {
   /**
    * @brief Returns the transpose of this matrix.
    *
-   * Produces a @c SparseMat<DType, Cols, Rows, ...> with remapped indices.
+   * Produces a @c SparseMat<DType, IntType, Cols, Rows, ...> with remapped indices.
    *
    * @return Transposed matrix.
    */
@@ -562,6 +717,59 @@ class SparseMat {
   }
 
   /**
+   * @brief Computes the determinant.
+   *
+   * Uses the diagonal directly for a structurally triangular matrix, and the
+   * LU factorization otherwise (no pivoting, as everywhere else). Check
+   * @c ok() before trusting the value — see @c SparseLinearAlgebra::determinant.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto determinant() const
+    requires(rows == cols)
+  {
+    return SparseLinearAlgebra::determinant(*this);
+  }
+
+  /**
+   * @brief Returns @c A⁻¹, by solving @c A*X = I.
+   *
+   * @note The inverse of a sparse matrix is generally dense, so the result
+   * type carries many more stored values than this one. Prefer @c solve() when
+   * you only need @c A⁻¹b for specific right-hand sides — it is faster and
+   * more accurate. Use @c cholesky_inverse() when the matrix is SPD.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto inverse() const
+    requires(rows == cols)
+  {
+    return SparseLinearAlgebra::inverse(*this);
+  }
+
+  /**
+   * @brief Solves @c *this * x = @p b in the least-squares sense, for a
+   *        non-square matrix.
+   *
+   * @c solve() requires a square matrix; this handles the rectangular cases —
+   * minimising @c ||Ax-b||₂ when overdetermined, and returning the
+   * minimum-norm solution when underdetermined. It works via the normal
+   * equations, which squares the condition number; see
+   * @c SparseLinearAlgebra::least_squares_solve for when that matters.
+   */
+  template<typename Matrix>
+  [[nodiscard]] SPARSEMAT_HD auto least_squares_solve(const Matrix& b) const {
+    return SparseLinearAlgebra::least_squares_solve(*this, b);
+  }
+
+  /**
+   * @brief Composes block-diagonally with @p b: @c diag(*this, b).
+   *
+   * Result is (rows + b.rows) x (cols + b.cols), with this matrix top-left and
+   * @p b bottom-right. Stored-value count is exactly the sum of the two.
+   */
+  template<typename Matrix>
+  [[nodiscard]] SPARSEMAT_HD auto block_diagonal(const Matrix& b) const {
+    return SparseLinearAlgebra::block_diagonal(*this, b);
+  }
+
+  /**
    * @brief Computes the Frobenius norm: √(Σ aᵢⱼ²) over all non-zero elements.
    * @return Frobenius norm as the matrix's @c DataType.
    */
@@ -570,13 +778,57 @@ class SparseMat {
   }
 
   /**
-   * @brief Expands the sparse matrix into a fully dense row-major array.
+   * @brief Expands the sparse matrix into a fully dense @c SparseMat.
+   *
+   * The result is another @c SparseMat whose sparsity pattern covers every
+   * position, so structural zeros become explicitly stored @c DataType(0)
+   * values. It is *not* a bare array: keeping it a @c SparseMat is what lets
+   * a densified result feed straight back into any other operation (see the
+   * Kalman example, which chains @c .add(Q).dense() across filter steps).
+   *
+   * Use @c to_array() when a plain row-major buffer is what's wanted.
+   *
+   * @return A @c SparseMat<DataType, Int, Rows, Cols, 0, 1, ..., Rows*Cols-1>.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto dense() const { return SparseLinearAlgebra::dense(*this); }
+
+  /**
+   * @brief Expands the sparse matrix into a plain dense row-major array.
    *
    * Zero positions are explicitly written as @c DataType(0).
    *
    * @return @c std::array<DataType, Rows*Cols> in row-major order.
    */
-  [[nodiscard]] SPARSEMAT_HD auto dense() const { return SparseLinearAlgebra::dense(*this); }
+  [[nodiscard]] SPARSEMAT_HD auto to_array() const {
+    std::array<DataType, static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols)> result{};
+    constexpr auto inds = indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nonZeroCount); ++i) {
+        result[static_cast<std::size_t>(inds[i])] = values[i];
+      }
+    }
+    return result;
+  }
+
+  /**
+   * @brief Returns a copy of this matrix with its scalar type changed to @p D.
+   *
+   * Binary operations reject mixed scalar types rather than silently
+   * promoting or truncating one side; this is the explicit opt-in. The
+   * sparsity pattern, dimensions, and index type are all preserved.
+   *
+   * @code
+   * auto as_double = float_matrix.template convert<double>();
+   * @endcode
+   *
+   * @tparam D Target scalar element type.
+   */
+  template<typename D>
+  [[nodiscard]] SPARSEMAT_HD auto convert() const {
+    return SparseLinearAlgebra::convert<D>(*this);
+  }
 
   // --- Operator overloads ---
 
@@ -598,12 +850,59 @@ class SparseMat {
     return subtract(rhs);
   }
 
+  /** @brief Unary negation: returns a copy with every stored value negated. */
+  [[nodiscard]] SPARSEMAT_HD auto operator-() const { return scale(static_cast<DataType>(-1)); }
+
   /** @brief Scalar multiply (returns new matrix): @c *this * @p factor. */
   SPARSEMAT_HD auto operator*(DataType factor) const { return scale(factor); }
+
+  /** @brief Scalar divide (returns new matrix): @c *this / @p divisor. */
+  [[nodiscard]] SPARSEMAT_HD auto operator/(DataType divisor) const {
+    return scale(static_cast<DataType>(1) / divisor);
+  }
 
   /** @brief Scalar multiply in place: @c *this *= @p factor. */
   SPARSEMAT_HD SparseMat& operator*=(DataType factor) {
     scale_inplace(factor);
+    return *this;
+  }
+
+  /** @brief Scalar divide in place: @c *this /= @p divisor. */
+  SPARSEMAT_HD SparseMat& operator/=(DataType divisor) {
+    scale_inplace(static_cast<DataType>(1) / divisor);
+    return *this;
+  }
+
+  /**
+   * @brief Element-wise addition in place: @c *this += @p rhs.
+   *
+   * Unlike @c operator+, this cannot widen the sparsity pattern — the pattern
+   * is part of the type and @c *this has to keep its own. @p rhs's non-zeros
+   * must therefore be a subset of this matrix's, which is checked at compile
+   * time. Use @c a = a + b when the union pattern is what's wanted.
+   */
+  template<typename Matrix>
+  SPARSEMAT_HD SparseMat& operator+=(const Matrix& rhs) {
+    auto result = add(rhs);
+    static_assert(std::is_same_v<decltype(result), SparseMat>,
+                  "operator+= cannot change the sparsity pattern: the right-hand operand has "
+                  "non-zeros this matrix does not. Use 'a = a + b' to get the union pattern.");
+    values = result.values;
+    return *this;
+  }
+
+  /**
+   * @brief Element-wise subtraction in place: @c *this -= @p rhs.
+   *
+   * Same subset requirement as @c operator+=.
+   */
+  template<typename Matrix>
+  SPARSEMAT_HD SparseMat& operator-=(const Matrix& rhs) {
+    auto result = subtract(rhs);
+    static_assert(std::is_same_v<decltype(result), SparseMat>,
+                  "operator-= cannot change the sparsity pattern: the right-hand operand has "
+                  "non-zeros this matrix does not. Use 'a = a - b' to get the union pattern.");
+    values = result.values;
     return *this;
   }
 
@@ -619,13 +918,17 @@ class SparseMat {
    * signature, so there's no portable way to make this callable from a
    * kernel.
    *
-   * @tparam i Current compile-time index into @c values (default 0).
+   * Iterates the packed storage directly rather than recursing over it, so
+   * this no longer costs one template instantiation per stored value.
    */
-  template<IntType i = 0>
   void print() const {
-    if constexpr (i < nonZeroCount) {
-      std::cout << "Value at index " << indices()[i] << ": " << values[i] << '\n';
-      print<i + 1>();
+    constexpr auto inds = indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nonZeroCount); ++i) {
+        std::cout << "Value at index " << inds[i] << ": " << values[i] << '\n';
+      }
     }
   }
 
@@ -635,15 +938,29 @@ class SparseMat {
    * Each row is printed on its own line with space-separated values.
    */
   void printDense() const {
-    auto d = dense();
+    const auto d = to_array();
     for (IntType i = 0; i < rows; ++i) {
       for (IntType j = 0; j < cols; ++j) {
-        std::cout << d[(i * cols) + j] << " ";
+        std::cout << d[static_cast<std::size_t>((i * cols) + j)] << " ";
       }
       std::cout << '\n';
     }
   }
 };
+
+/**
+ * @brief Scalar multiply with the scalar on the left: @p factor * @p m.
+ *
+ * The member @c operator* only covers `matrix * scalar`; this free function
+ * completes the pair so both orderings work.
+ *
+ * @param factor Scalar multiplier.
+ * @param m      Matrix to scale.
+ */
+template<SparseMatrixType Matrix>
+[[nodiscard]] SPARSEMAT_HD auto operator*(typename Matrix::DataType factor, const Matrix& m) {
+  return m.scale(factor);
+}
 
 /**
  * @brief Aliases for commonly used sparse matrix types with specific data and index types.
@@ -711,3 +1028,6 @@ SPARSEMAT_HD auto dense() {
 }
 
 }  // namespace SparseLinearAlgebra
+
+#include "sparsemat/builders/patterns.h"
+#include "sparsemat/builders/tuple_builder.h"

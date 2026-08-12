@@ -22,9 +22,12 @@ class Transpose {
   static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
   static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
 
+  // Precomputed once — see Add::a_grid/b_grid for why (identical reasoning).
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+
   /// Returns true if (row, col) in the result corresponds to a non-zero at (col, row) in the input.
-  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(int row, int col) {
-    return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(col, row));
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return a_grid[col][row];
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
@@ -37,35 +40,54 @@ class Transpose {
     return SparseLinearAlgebra::OperationUtilities<Transpose>::calculate_sparsity();
   }
 
-  /// Recursively copies a.values[J,I] into r.values[I,J] for every non-zero result position.
-  template<SparseMatrixType Result, Int I, Int J>
-  SPARSEMAT_HD static void transpose(Result& r, const SparseMat& a) {
-    if constexpr (I >= Result::rows) {
+  /// Copies a.values[J,I] into result storage slot @p Idx (flat row-major
+  /// index @c Result::indices()[Idx] == I*Result::cols+J). Iterating the
+  /// result's own sparsity array (rather than the full rows*cols grid) keeps
+  /// instantiation count and compile-time work proportional to the result's
+  /// non-zero count instead of its dimensions.
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const SparseMat& a) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    constexpr auto a_index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
+    static_assert(a_index >= 0,
+                  "Transpose index mismatch: expected non-zero element in the original matrix.");
+    r.values[Idx] = a.values[a_index];
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const SparseMat& a) {
+    if constexpr (Count == 0) {
       return;
-    } else if constexpr (J >= Result::cols) {
-      return transpose<Result, I + 1, 0>(r, a);
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, std::make_index_sequence<Count>{});
     } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
-        static_assert(
-            a_index >= 0,
-            "Transpose index mismatch: expected non-zero element in the original matrix.");
-        r.values[sparse_index] = a.values[a_index];
-      }
-      transpose<Result, I, J + 1>(r, a);
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a);
+      fill_range<Result, Begin + half, Count - half>(r, a);
     }
   }
 
-  /// Constructs the transposed SparseMat and fills it via the recursive helper.
+  /// Constructs the transposed SparseMat and fills it via fill_all.
   SPARSEMAT_HD static auto transpose(const SparseMat& a) {
     constexpr auto sparsity = calculate_sparsity();
     auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
         template make<SparseMat::cols, SparseMat::rows, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    transpose<decltype(result), 0, 0>(result, a);
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a);
     return result;
   }
 };

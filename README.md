@@ -20,7 +20,8 @@ using compile-time constructs( e.g. constexpr if).
 Limitations: 
   - entering sparsity patterns is awkward and bugprone. 
   - every distinct sparsity pattern is a distinct type, which makes compile times long for large configurations and binary size could expload pretty easily. 
-  - recursive templates are used to unroll matrix operations. Template recursion limits mean this will only work for small matrices.
+  - matrix operations are unrolled at compile time via `std::index_sequence`/fold expressions (not, as in earlier versions, linear template recursion — that had a hard ceiling around the compiler's default ~900-deep template-instantiation budget, capping matrices at roughly O(10x10)). Every operation is now O(1) in instantiation depth regardless of matrix size. What remains is the compile-time/binary-size cost above — that scales with how many non-zeros an operation actually touches (density), not with recursion depth, so a genuinely sparse 40x40+ matrix is practical, while a dense-ish one of the same size can still be slow to compile.
+  - the practical size limit is now the compiler's *constexpr evaluation* budget rather than its instantiation depth, and nvcc's is markedly tighter than g++'s or clang's. Sparsity computation is memoized into dense boolean grids to stay within it (see `MatrixUtilities::to_dense_bool`).
   - a certain level of sparsity is required.  Whether the performance gain is worth that cost depends heavily on how sparse your matrices are and how many operations you're doing.
 
 
@@ -35,6 +36,19 @@ SparseMat<double, int, 3, 3, 0, 1, 2> B(4, 5, 6);  // first row only
 // C === SparseMat<double, int, 3, 3, 0, 3, 6>
 auto C = A.mult(B);
 ```
+
+### Compile-time budget
+
+Compile time and binary size scale with how many non-zeros a result actually has, and an operation chain can quietly produce a much denser result than intended (`multiply` and `kronecker` both can). When that happens the symptom is a build that takes minutes, or a compiler that exhausts some internal budget and reports something inscrutable about a non-type template argument — neither of which points at the cause.
+
+`SPARSEMAT_MAX_NONZEROS` turns that into a named error, at the instantiation responsible:
+
+```cpp
+#define SPARSEMAT_MAX_NONZEROS 512   // fail the build past 512 stored values
+#include "sparsemat.h"
+```
+
+The default is 4096 — generous enough not to interfere with ordinary use (a fully dense 64×64 fits), low enough to catch runaway density. Define it to `0` to disable the check.
 
 ## Requirements
 
@@ -106,6 +120,46 @@ SparseMat<double, int, 2, 2, 0, 3> m;             // zero-initialized
 SparseMat<double, int, 2, 2, 0, 3> m(1.0, 2.0);  // value per non-zero
 ```
 
+Writing the `NonZeros` pack by hand means computing flat (`row*cols+col`) indices yourself and keeping the constructor's value list in that exact order — easy to get wrong as a matrix grows. `make_sparse_matrix()` builds the same type from a plain list of `(row, col, value)` entries instead, in any order:
+
+```cpp
+constexpr auto entries = std::array{
+    SparseLinearAlgebra::SparseEntry{0, 0, 4.0},
+    SparseLinearAlgebra::SparseEntry{1, 1, 2.0},
+    SparseLinearAlgebra::SparseEntry{0, 1, 5.0},
+};
+auto A = SparseLinearAlgebra::make_sparse_matrix<double, int, 3, 3, entries>();
+```
+
+`entries` has to be a named `constexpr` variable (a C++20 non-type template argument, since it determines the resulting type) — see `include/sparsemat/api/sparsemat.h` for the full doc comment. Duplicate or out-of-bounds entries are caught by the same `static_assert` a hand-written declaration would hit.
+
+### Pattern builders
+
+Writing flat index packs by hand is the limitation this library leads with, and `make_sparse_matrix()` only helps when the values are known up front. These build the *shape* — every stored value starts at zero, to be filled in later or repeatedly:
+
+```cpp
+using namespace SparseLinearAlgebra;
+
+auto t = tridiagonal<double, int, 5>();              // 5x5, 13 stored values
+auto v = tridiagonal<double, int, 5>(-1.0, 4.0, -1.0);  // ... with constant bands
+auto b = banded<double, int, 8, 8, 2, 1>();          // 2 sub-, 1 super-diagonal
+auto d = banded<double, int, 4, 4, 0, 0>();          // diagonal
+
+// Give only the lower triangle; mirror positions are added for you.
+constexpr auto lower = std::array{
+    SparsePosition{0, 0}, SparsePosition{1, 0}, SparsePosition{1, 1},
+};
+auto s = symmetric_from_lower<double, int, 2, lower>();
+
+// Or an arbitrary pattern, in any order.
+constexpr auto shape = std::array{SparsePosition{1, 1}, SparsePosition{0, 0}};
+auto p = make_pattern<double, int, 2, 2, shape>();
+```
+
+Positions are sorted internally, so declaration order does not affect the resulting type, and exact duplicates collapse rather than tripping the duplicate-index `static_assert`.
+
+`block_diagonal(a, b)` composes two matrices into `diag(a, b)`. Unlike `kronecker`, whose result pattern is the *product* of both operands', this one is the *sum* — the result has exactly `nnz(a) + nnz(b)` stored values — which makes it the cheap way to fold several independent sub-problems into one solve.
+
 ### Element access
 
 ```cpp
@@ -114,6 +168,69 @@ m.get(i, j)         // runtime indices
 m.set<I, J>(value)  // compile-time; static_assert if (I,J) is a zero index
 m.set(i, j, value)  // runtime; returns false if (I,J) is a zero index
 m.fill(value)       // set all non-zero storage to value
+m(i, j)             // runtime read; alias for get(i, j)
+```
+
+`m(i, j)` is read-only on purpose. A structurally zero position has no storage to return a reference to, so a reference-returning overload would have to hand back a shared dummy and let `m(0, 1) = 5.0` silently do nothing. Use `set(i, j, value)`, which returns `false` when the write does not land.
+
+Stored values are iterable directly, and `entries()` pairs each with its position:
+
+```cpp
+for (double value : m) { ... }                     // stored (non-zero) values, in index order
+for (auto [row, col, value] : m.entries()) { ... }  // ... with their positions
+m.size();                                           // number of stored values
+```
+
+### Fusing a chain of operations
+
+Every operator materializes its result, so `2*A + 3*B - C` builds three intermediate matrices to produce one answer. `fuse()` applies a function across several matrices element-wise in a single pass, materializing only the result:
+
+```cpp
+// Three temporaries: A*2, B*3, and the sum.
+auto eager = a.scale(2.0).add(b.scale(3.0)).subtract(c);
+
+// None.
+auto fused = SparseLinearAlgebra::fuse(
+    [](double x, double y, double z) { return (2 * x) + (3 * y) - z; }, a, b, c);
+```
+
+Both produce the same type and the same values. Any arity works, operands may repeat, and a position that is structurally zero in some operand simply contributes `0` to the function — so `fn` always gets one value per operand.
+
+This generalizes the fusions the library already hand-rolls: `add(a, b, alpha, beta)`, `hadamard(a, b, multiplier)`, and `axpy` all exist to avoid exactly these intermediates.
+
+**Element-wise only.** Each operand is read at the same `(i,j)` as the result, so `fuse` cannot express a matrix product — use `multiply` for that. The restriction is the point: because each operand element is touched exactly once per result element, there is nothing to recompute and fusing always pays. Fusing across a product would not, since each result element there reads a whole row and column.
+
+**Result pattern.** By default the result stores the *union* of the operands' patterns. That is correct for any `fn` with `fn(0,...,0) == 0`, but not always minimal — a position stored by only one operand stays stored even if `fn` maps it to zero. For product-like functions, where a structurally zero operand forces a zero result, ask for the tighter pattern:
+
+```cpp
+auto weighted = SparseLinearAlgebra::fuse<SparseLinearAlgebra::FusePattern::Intersection>(
+    [](double x, double y) { return x * y * 0.5; }, a, b);
+```
+
+**Nothing lazy escapes.** Evaluation finishes before `fuse` returns; there is no expression object holding references to the operands. The usual expression-template hazard — an expression captured with `auto` outliving the matrices it refers to — cannot arise here.
+
+**On the GPU**, `fn` is called from wherever `fuse` is called, so it must be device-callable. A struct with a `SPARSEMAT_HD operator()` works on every toolchain, as does a lambda written inside a kernel. A lambda defined in host code and passed into device code needs nvcc's `--extended-lambda`, which this library does not require of its consumers.
+
+### Comparison
+
+`==` and `!=` compare *values*, not sparsity patterns — two matrices are equal when every element matches, whether or not both store that position explicitly. This matters because derived result patterns are often wider than the values warrant (`add` unions both operands' patterns, so `a + b` can hold an explicit `0.0` where a hand-written literal holds a structural zero):
+
+```cpp
+a == a.dense()                          // true — same values, different patterns
+SparseLinearAlgebra::approx_equal(a, b, 1e-9)  // tolerant form, for post-solve results
+```
+
+`==` is exact; use `approx_equal` for anything that has been through a factorization.
+
+### Scalar types
+
+Binary operations require both operands to have the same `DataType`. Mixed types are a compile error rather than a silent promotion or truncation — the result would have to pick one type, and quietly narrowing a `double` operand into a `float` result is hard to notice afterwards. Convert explicitly to opt in:
+
+```cpp
+SparseMat<float, int, 3, 3, 0, 4, 8>  f(1, 2, 3);
+SparseMat<double, int, 3, 3, 0, 4, 8> d(1, 2, 3);
+// auto bad = f.add(d);                  // static_assert: mixed DataType
+auto good = f.convert<double>().add(d);  // explicit, no surprise
 ```
 
 ### Operations
@@ -126,6 +243,7 @@ All operations return a new matrix with the result sparsity inferred at compile 
 | `a.add(b)` | Addition (result sparsity = union) |
 | `a.subtract(b)` | Subtraction (result sparsity = union) |
 | `a.hadamard(b)` | Element-wise multiply (result sparsity = intersection) |
+| `fuse(fn, a, b, ...)` | Apply `fn` element-wise across several matrices in one pass, no intermediates |
 | `a.kronecker(b)` | Kronecker (tensor) product |
 | `a.transpose()` | Matrix transpose |
 | `a.scale(factor)` | Scalar multiply, returns new matrix |
@@ -137,7 +255,7 @@ All operations return a new matrix with the result sparsity inferred at compile 
 | `a.frobenius()` | Frobenius norm (scalar) |
 | `a.trace()` | Sum of diagonal elements |
 | `a.dot(b)` | Dot product; `a` must be a 1×N row vector and `b` an N×1 column vector |
-| `a.solve(b)` | Solve `a * x = b`; dispatches to forward/backward substitution or LU depending on sparsity |
+| `a.solve(b)` | Solve `a * x = b`; dispatches to forward/backward substitution or LU depending on sparsity (LU path does **no pivoting** — see below) |
 | `a.cholesky()` | Cholesky factorization; returns a `Result<CholeskyFactor<L>>` — check `.ok()` before calling `.solve(b)` |
 | `a.set_diagonal(value)` / `a.set_diagonal(values)` | Write to every stored diagonal entry, from a scalar or a `std::array` |
 | `a.is_structurally_symmetric()` | Sparsity pattern is symmetric (values ignored) |
@@ -145,14 +263,38 @@ All operations return a new matrix with the result sparsity inferred at compile 
 | `a.is_full_symmetric(tol)` | Full dense matrix equals its transpose within `tol` |
 | `a.is_structurally_lower_triangular()` / `a.is_structurally_upper_triangular()` | No above/below-diagonal non-zeros |
 | `a.is_numerically_lower_triangular(tol)` / `a.is_numerically_upper_triangular(tol)` | Above/below-diagonal stored values are within `tol` of zero |
-| `a.dense()` | Convert to a dense array |
+| `a.determinant()` | Determinant, via the diagonal for triangular matrices and LU otherwise |
+| `a.inverse()` / `cholesky_inverse(a)` | Matrix inverse by solving `A*X = I` (result is generally dense) |
+| `a.least_squares_solve(b)` | Least-squares / minimum-norm solve for non-square `a` |
+| `a.block_diagonal(b)` | Compose block-diagonally: `diag(a, b)` |
+| `a.dense()` | Densify: same values, but with every position stored (returns a `SparseMat`) |
+| `a.to_array()` | Convert to a plain `std::array<DataType, Rows*Cols>` in row-major order |
+| `a.convert<T>()` | Copy with the scalar type changed to `T` |
+| `a.entries()` | Every stored element as a `(row, col, value)` triple |
+| `a == b` / `a != b` / `approx_equal(a, b, tol)` | Element-wise comparison by value (patterns need not match) |
 | `a.print()` | Print non-zero values with their flat indices |
 | `a.printDense()` | Print the full matrix, including zeros |
 + more 
 
-Free functions are also available under `SparseLinearAlgebra::` (`multiply`, `add`, `subtract`, `hadamard`, `kronecker`, `transpose`, `scale`, `scale_inplace`, `shift`, `shift_inplace`, `normalize`, `normalize_inplace`, `frobenius`, `trace`, `dense`, `power<N>`, `forward_solve`, `backward_solve`, `lu_solve`, `cholesky_solve`).
+Free functions are also available under `SparseLinearAlgebra::` (`multiply`, `add`, `subtract`, `hadamard`, `kronecker`, `transpose`, `scale`, `scale_inplace`, `shift`, `shift_inplace`, `normalize`, `normalize_inplace`, `frobenius`, `trace`, `dense`, `fuse`, `power<N>`, `forward_solve`, `backward_solve`, `lu_solve`, `cholesky_solve`).
 
 Solvers and factorizations (`solve`, `cholesky`, `lu_solve`, `forward_solve`, `backward_solve`, `cholesky_solve`, `lu_factorize`, `cholesky_factorize`) return a `Result<T>` rather than throwing, since these routines are also usable from CUDA device code where exceptions aren't available. Check `.ok()` (or `bool(result)`) before calling `.value()` — a failed result still holds a value, but it is not meaningful.
+
+**Non-square systems.** `solve()` requires a square matrix. `least_squares_solve(b)` handles the rectangular cases: minimising `||Ax-b||₂` when overdetermined, and returning the minimum-norm solution when underdetermined. It works via the normal equations (`AᵀA x = Aᵀb`, solved with Cholesky), which **squares the condition number** — a matrix that is merely ill-conditioned for a direct solve can be numerically hopeless here, and a rank-deficient one fails outright via `ok()`. A QR-based solve avoids this and is the right answer for anything demanding; it isn't implemented because a compile-time-sparsity Householder QR is a much larger piece of work than reusing the existing Cholesky. `residual(a, x, b)` gives `A*x - b` for measuring the fit, since a least-squares solution doesn't generally satisfy `A*x == b`.
+
+**Inverses are dense.** `inverse()` (and `cholesky_inverse()` for SPD matrices) solve `A*X = I` using the existing block-RHS triangular solves. The inverse of a sparse matrix is generally dense, so the result type carries many more stored values than the input — this is the one operation where compile-time sparsity works against you. Prefer `solve()` when you only need `A⁻¹b` for particular right-hand sides; it's faster and more accurate.
+
+**No pivoting.** Neither the LU nor the Cholesky path does row swaps, so both are only valid for matrices that factorize stably without them (diagonally dominant, or otherwise pivot-free). A pivot that is merely *tiny* is as fatal as an exactly-zero one, so both report it as singular via `ok()` rather than dividing through and returning garbage. A pivot-stable but badly conditioned matrix will still return a poor answer with `ok() == true`; prefer `cholesky()` when the matrix is symmetric positive definite.
+
+### Operators
+
+```cpp
+a * b     a + b     a - b     -a          // matrix arithmetic
+a * 2.0   2.0 * a   a / 2.0               // scalar arithmetic, either ordering
+a *= 2.0  a /= 2.0  a += b    a -= b      // in place
+```
+
+`+=` and `-=` cannot widen the sparsity pattern — it is part of the type, so the left operand has to keep its own. The right operand's non-zeros must be a subset, which is checked at compile time; use `a = a + b` when the union pattern is what you want.
 
 ### Static factories
 
@@ -254,7 +396,7 @@ Configuration                 Operation                sparsemat  Eigen sparse  
 
 **Solving linear systems** (`5x5 SPD tridiagonal`) — `cholesky_solve`/`lu_solve` factorize and solve in one call, timed the same way as constructing+solving an Eigen solver each iteration. sparsemat's Cholesky solve is ~20–30× faster than `Eigen::SimplicialLLT` and ~3.5–4.5× faster than dense `.llt()`, since the fill-in pattern and every zero pivot skip are known at compile time — there's no runtime symbolic analysis step to pay for. Cholesky beats LU by roughly 2× here (as expected: LU does twice the factorization work on a matrix that's actually SPD), and the gap between 1 RHS and 3 RHS is much smaller than 3× because the RHS columns share the same factorization and just add more of the recursive-template solve step.
 
-**Conclusion** It is probably a wash -- Defining sparsity at Runtime is a pain (and really error prone). It is probably not worth it.
+**Conclusion (CPU)** On the CPU it is probably a wash. sparsemat beats `Eigen::SparseMatrix` comfortably, but that is the easy comparison — at these sizes Eigen's own *dense* fixed-size matrices are already about as fast, except for multiply on 8x8. Set against the cost of declaring sparsity patterns at compile time (awkward, error prone, and slow to compile), the CPU case does not obviously pay for itself. See the GPU conclusion below for where it does.
 
 To run the benchmarks yourself, run:
 ```bash
@@ -324,6 +466,12 @@ Configuration           Batch N            sparsemat GPU     Eigen dense GPU    
 ----------------------------------------------------------------------------------------------------
 ```
 <!-- BENCHMARK_TABLE_GPU:END -->
+
+**Conclusion (GPU)** This is where the design pays for itself, and it is also the workload it was built for. At 5x5 and 8x8, sparsemat is roughly 2–4x faster per instance than the same one-thread-per-instance kernel using `Eigen::Matrix`, and the gap widens with size as compile-time zero elimination removes more work — the opposite of the CPU picture, where Eigen dense had already caught up. The Cholesky solve has no dense-GPU column at all because Eigen's `LLT` is not device-callable, so for a batch of small SPD solves inside a kernel there is no real alternative to compare against.
+
+Note the CPU column in that table is the same workload run single-threaded on the host: 400–1000 ns/instance against roughly 0.2–0.5 ns on the GPU. Batched small-matrix work is exactly the case where moving to the GPU helps, and it is the original motivation — billions of independent Kalman filters, each doing many small sparse operations.
+
+So the honest summary is: on the CPU, probably not worth the ergonomic cost; on the GPU, for batched small sparse problems, it is.
 
 ## Example
 

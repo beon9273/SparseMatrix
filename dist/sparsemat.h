@@ -21,6 +21,38 @@
 #define SPARSEMAT_HD
 #endif
 
+/**
+ * @def SPARSEMAT_MAX_NONZEROS
+ * @brief Ceiling on the stored-value count of any single @c SparseMat, enforced
+ *        by @c static_assert.
+ *
+ * Compile time and binary size are the real costs of encoding sparsity in the
+ * type system, and both scale with how many non-zeros an operation's result
+ * actually has. When a chain of operations quietly produces a much denser
+ * result than intended — and multiply and Kronecker both can — the symptom is a
+ * build that takes minutes, or a compiler that runs out of some internal
+ * budget and reports something inscrutable about a non-type template argument
+ * not being a constant expression. Neither points at the cause.
+ *
+ * This turns that into a named error naming the actual count, at the
+ * instantiation that caused it. The default is deliberately generous: it should
+ * catch runaway density, not ordinary use (a fully dense 64x64 fits). Lower it
+ * to put a tighter budget on a particular translation unit, raise it if you
+ * genuinely need larger results, or define it to 0 to disable the check:
+ *
+ * @code
+ * // Fail the build if any single matrix exceeds 512 stored values.
+ * #define SPARSEMAT_MAX_NONZEROS 512
+ * #include "sparsemat/api/sparsemat.h"
+ * @endcode
+ */
+// This has to be a macro rather than a constexpr constant: the whole point is
+// that a consumer can override it by defining it before including this header.
+#if !defined(SPARSEMAT_MAX_NONZEROS)
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define SPARSEMAT_MAX_NONZEROS 4096
+#endif
+
 namespace SparseLinearAlgebra {
 
 template<typename SparseMatrix>
@@ -97,6 +129,20 @@ template<typename T>
 concept SparseMatrixType = SparseMatrixBase<T> && RebindType<T>;
 
 /**
+ * @brief Concept satisfied when two sparse matrix types share a scalar type.
+ *
+ * Binary operations in this library do not promote mixed scalar types: the
+ * result would have to pick one, and silently truncating a @c double operand
+ * to a @c float result is exactly the kind of precision loss that is very hard
+ * to notice after the fact. Mismatches are therefore rejected at compile time
+ * (the only place they *can* be rejected — exceptions are not usable in the
+ * @c SPARSEMAT_HD device code these operations must support). Convert
+ * explicitly with @c convert<T>() to opt into the change.
+ */
+template<typename A, typename B>
+concept SameDataType = std::is_same_v<typename A::DataType, typename B::DataType>;
+
+/**
  * @brief Concept satisfied by the internal operation policy classes
  *        (e.g. @c Multiply, @c Add, @c Kronecker).
  *
@@ -119,8 +165,50 @@ concept OperationType = requires {
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/utils.h ----
 
+#include <utility>
+
 
 namespace SparseLinearAlgebra {
+
+/**
+ * @brief Largest number of terms to put in a single fold expression.
+ *
+ * clang caps expression nesting at 256 (`-fbracket-depth`), and a fold
+ * expression counts against it: `(f<Is>(), ...)` over more than 256 indices is
+ * rejected outright with "instantiating fold expression with N arguments
+ * exceeded expression nesting limit of 256". Since an operation's fold runs
+ * over its result's non-zero count, that ceiling is reached by ordinary
+ * matrices — a 60x60 tridiagonal squared has 294 non-zeros — so unrolling has
+ * to be split into chunks rather than emitted as one flat fold.
+ *
+ * 64 leaves generous headroom under the limit while keeping the number of
+ * chunk-splitting instantiations small.
+ */
+inline constexpr std::size_t kUnrollChunkSize = 64;
+
+/**
+ * @brief Chunked unrolling.
+ *
+ * Each operation drives its per-element step function through a
+ * @c fill_range<Begin, Count> helper that halves @p Count until it fits in one
+ * fold of at most @c kUnrollChunkSize terms. Recursion depth is
+ * log2(Count / kUnrollChunkSize) — 3 for a thousand elements, versus the
+ * Count-deep linear recursion that blows the compiler's 900-deep instantiation
+ * budget, and without the flat fold's 256-term nesting ceiling.
+ *
+ * Splitting preserves order: the low half is fully expanded before the high
+ * half, and within a chunk the comma operator in a fold expression is the
+ * built-in sequencing comma. That matters for the operations whose steps are
+ * order-dependent (the triangular solves, and the column loops in the LU and
+ * Cholesky factorizations).
+ *
+ * The helpers are written out per operation, over each one's existing
+ * @c fill_cell static member, rather than factored into one generic
+ * higher-order function here: a generic version would have to take a callable,
+ * and the natural way to pass one is a lambda — which nvcc only accepts in
+ * @c __device__ code under @c --extended-lambda, a flag this library should
+ * not force on its consumers.
+ */
 
 /**
  * @brief Compile-time utilities for inspecting the sparsity pattern of a
@@ -201,6 +289,77 @@ class MatrixUtilities {
     return Int(-1);
   }
 
+  /**
+   * @brief Builds a dense row-major boolean grid marking every structurally
+   *        non-zero position, from the compact @c indices() array.
+   *
+   * @c isNonZero()/@c getSparseIndex() are each an @c O(nonZeroCount) linear
+   * scan. That's fine for a one-off lookup, but operations whose
+   * @c is_result_index_nonzero() needs many lookups per call (e.g. Multiply,
+   * checking every shared index @c k) or gets called @c O(rows*cols) times
+   * by @c OperationUtilities — which is every operation's sparsity
+   * computation — pay that scan cost repeatedly, un-memoized, for the same
+   * matrix. Precomputing this grid once (here, @c O(rows*cols) to
+   * zero-initialize plus @c O(nonZeroCount) to populate) turns each
+   * subsequent lookup into an @c O(1) array access instead. This matters a
+   * lot for constexpr-evaluation cost at larger matrix sizes: an unmemoized
+   * scan-per-lookup pattern compounds into the compiler's constexpr
+   * evaluation step budget (distinct from, and unrelated to, the
+   * template-instantiation-depth budget) well before a matrix gets large
+   * enough to need it for any other reason.
+   *
+   * @return @c std::array<std::array<bool, cols>, rows> with @c true at
+   *         every structurally non-zero (row, col).
+   */
+  SPARSEMAT_HD constexpr static auto to_dense_bool() {
+    std::array<std::array<bool, static_cast<std::size_t>(SparseMatrix::cols)>,
+               static_cast<std::size_t>(SparseMatrix::rows)>
+        grid{};
+    for (auto idx : SparseMatrix::indices()) {
+      grid[idx / SparseMatrix::cols][idx % SparseMatrix::cols] = true;
+    }
+    return grid;
+  }
+
+  /**
+   * @brief Builds a flat row-major table mapping each position to its offset
+   *        in @c values[], or @c -1 if the position is structurally zero.
+   *
+   * The @c to_dense_bool() grid answers "is this position stored?"; this
+   * answers "*where* is it stored?", which is what any operation that moves
+   * values around (rather than deciding sparsity) actually needs.
+   *
+   * Its purpose is to let those operations use an ordinary runtime loop
+   * instead of a compile-time fold. Folds are the right tool where there is
+   * zero-skipping to exploit — multiply, add, the solves — because a
+   * structurally-zero term can be eliminated entirely at compile time. But
+   * @c dense(), @c trace(), @c set_diagonal() and the comparison operators
+   * just copy or read values; there is nothing to eliminate, so a fold buys
+   * nothing and costs a template instantiation per element. It also imposes a
+   * hard ceiling: clang rejects a fold expression with more than 256
+   * arguments ("exceeded expression nesting limit"), which a 32x32 dense
+   * matrix (1024 stored values) trips immediately. A runtime loop over this
+   * table is O(1) per lookup, has no size ceiling on any compiler, and
+   * optimizes to the same code for the small matrices this library targets.
+   *
+   * @return @c std::array<Int, rows*cols> of storage offsets, @c -1 where
+   *         the position is structurally zero.
+   */
+  SPARSEMAT_HD constexpr static auto storage_index_grid() {
+    std::array<Int,
+               static_cast<std::size_t>(SparseMatrix::rows) *
+                   static_cast<std::size_t>(SparseMatrix::cols)>
+        grid{};
+    for (auto& slot : grid) {
+      slot = Int(-1);
+    }
+    constexpr auto inds = SparseMatrix::indices();
+    for (Int i = 0; i < SparseMatrix::nonZeroCount; ++i) {
+      grid[static_cast<std::size_t>(inds[i])] = i;
+    }
+    return grid;
+  }
+
   SPARSEMAT_HD constexpr static auto diagonal_nonzeros() {
     Int count = 0;
     for (Int i = 0; i < SparseMatrix::rows && i < SparseMatrix::cols; ++i) {
@@ -259,7 +418,13 @@ class OperationUtilities {
    * @return @c std::array<typename Operation::Int, num_nonzeros()> of flat indices.
    */
   SPARSEMAT_HD constexpr static auto calculate_sparsity() {
-    std::array<Int, num_nonzeros()> sparsity{};
+    // Explicit cast: num_nonzeros() returns the matrix's signed Int type,
+    // but std::array's size is std::size_t. nvcc's frontend rejects the
+    // implicit signed-to-unsigned conversion as narrowing once the
+    // surrounding non-type template argument list gets large enough (seen
+    // in practice once a matrix has on the order of a hundred-plus stored
+    // elements), even though g++/clang accept it unconditionally.
+    std::array<Int, static_cast<std::size_t>(num_nonzeros())> sparsity{};
     Int c = 0;
     for (Int i = 0; i < Operation::rows; i++) {
       for (Int j = 0; j < Operation::cols; j++) {
@@ -277,11 +442,14 @@ class OperationUtilities {
 namespace SparseLinearAlgebra::detail {
 
 /**
- * @brief Implementation policy for sparse matrix addition and subtraction.
+ * @brief Implementation policy for sparse matrix addition, subtraction, and
+ *        scaled addition.
  *
- * Computes @c a + multiplier*b.  Using @c multiplier = 1 gives addition;
- * @c multiplier = -1 gives subtraction.  Result sparsity is the union of both
- * input sparsity patterns.
+ * Computes @c alpha*a + beta*b.  Using @c alpha = beta = 1 gives addition;
+ * @c alpha = 1, @c beta = -1 gives subtraction; any other combination gives
+ * a general scaled addition without a separate scale pass over either
+ * operand.  Result sparsity is the union of both input sparsity patterns
+ * (independent of the runtime values of @c alpha/@c beta).
  *
  * @tparam SparseMat  Left-hand matrix type.
  * @tparam SparseMat1 Right-hand matrix type; must have the same shape as
@@ -292,16 +460,26 @@ class Add {
  public:
   static_assert(SparseMat::rows == SparseMat1::rows && SparseMat::cols == SparseMat1::cols,
                 "Incompatible matrix dimensions for addition.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, SparseMat1>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
 
   using DataType = typename SparseMat::DataType;
   using Int = typename SparseMat::Int;
   static constexpr auto rows = SparseMat::rows;
-  static constexpr auto cols = SparseMat1::cols;
+  static constexpr auto cols = SparseMat::cols;
+
+  // Precomputed once per (SparseMat, SparseMat1) instantiation — not per
+  // is_result_index_nonzero call — so each of the O(rows*cols) calls
+  // OperationUtilities makes below is an O(1) grid lookup instead of two
+  // O(nonZeroCount) linear scans. See MatrixUtilities::to_dense_bool().
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::to_dense_bool();
 
   /// Returns true if (row, col) is non-zero in either input matrix.
   SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
-    return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, col) ||
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(row, col));
+    return a_grid[row][col] || b_grid[row][col];
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
@@ -314,44 +492,77 @@ class Add {
     return SparseLinearAlgebra::OperationUtilities<Add>::calculate_sparsity();
   }
 
-  /// Recursively fills result positions (I,J) with a[I,J] + multiplier*b[I,J].
-  template<SparseMatrixType Result, Int I, Int J>
-  SPARSEMAT_HD static void recursive_add(Result& r,
-                                         const SparseMat& a,
-                                         const SparseMat1& b,
-                                         const DataType multiplier) {
-    if constexpr (I >= SparseMat::rows) {
-      return;
-    } else if constexpr (J >= SparseMat1::cols) {
-      return recursive_add<Result, I + 1, 0>(r, a, b, multiplier);
-    } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-        constexpr auto b_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
+  /// Fills result storage slot @p Idx (whose flat row-major index is
+  /// @c Result::indices()[Idx]) with alpha*a[I,J] + beta*b[I,J]. Iterating
+  /// only over the result's own sparsity array — rather than recursing over
+  /// every (I,J) in the full rows*cols grid — keeps both the number of
+  /// template instantiations and the compile-time work proportional to the
+  /// result's non-zero count instead of its dimensions.
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r,
+                                     const SparseMat& a,
+                                     const SparseMat1& b,
+                                     const DataType alpha,
+                                     const DataType beta) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    constexpr auto a_index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+    constexpr auto b_index = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
 
-        r.values[sparse_index] = 0;
-        if constexpr (a_index >= 0) {
-          r.values[sparse_index] = a.values[a_index];
-        }
-        if constexpr (b_index >= 0) {
-          r.values[sparse_index] += multiplier * b.values[b_index];
-        }
-      }
-      recursive_add<Result, I, J + 1>(r, a, b, multiplier);
+    DataType value = 0;
+    if constexpr (a_index >= 0) {
+      value = alpha * a.values[a_index];
+    }
+    if constexpr (b_index >= 0) {
+      value += beta * b.values[b_index];
+    }
+    r.values[Idx] = value;
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      const DataType alpha,
+                                      const DataType beta,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b, alpha, beta), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      const DataType alpha,
+                                      const DataType beta) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, alpha, beta, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b, alpha, beta);
+      fill_range<Result, Begin + half, Count - half>(r, a, b, alpha, beta);
     }
   }
 
-  /// Constructs the result SparseMat and fills it via recursive_add.
-  SPARSEMAT_HD static auto add(const SparseMat& a, const SparseMat1& b, const DataType multiplier) {
+  /// Constructs the result SparseMat and fills it via fill_all.
+  SPARSEMAT_HD static auto add(const SparseMat& a,
+                               const SparseMat1& b,
+                               const DataType alpha,
+                               const DataType beta) {
     constexpr auto sparsity = calculate_sparsity();
     auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
-        template make<SparseMat::rows, SparseMat1::cols, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    recursive_add<decltype(result), 0, 0>(result, a, b, multiplier);
+        template make<SparseMat::rows, SparseMat::cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(
+        result, a, b, alpha, beta);
     return result;
   }
 };
@@ -373,14 +584,14 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 SPARSEMAT_HD auto add(const A& a, const B& b) {
-  return detail::Add<A, B>::add(a, b, 1);
+  return detail::Add<A, B>::add(a, b, 1, 1);
 }
 
 /**
  * @brief Element-wise subtraction of two sparse matrices: @p a - @p b.
  *
- * Equivalent to @c scaled_add(a, b, -1).  Result sparsity is the union of
- * both input patterns.
+ * Equivalent to @c add(a, b, 1, -1).  Result sparsity is the union of both
+ * input patterns.
  *
  * @tparam A Left-hand matrix type.
  * @tparam B Right-hand matrix type.
@@ -390,27 +601,381 @@ SPARSEMAT_HD auto add(const A& a, const B& b) {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 SPARSEMAT_HD auto subtract(const A& a, const B& b) {
-  return detail::Add<A, B>::add(a, b, -1);
+  return detail::Add<A, B>::add(a, b, 1.0, -1.0);
 }
 
 /**
- * @brief Computes @p a + @p multiplier × @p b in a single fused operation.
+ * @brief Computes @p alpha*a + @p beta*b in a single fused operation.
  *
- * Avoids a separate scale pass; @p multiplier is applied element-wise to
- * @p b during the addition traversal.  Result sparsity is the union of both
- * input patterns.
+ * Avoids separate scale passes; @p alpha and @p beta are applied
+ * element-wise to @p a and @p b respectively during the same traversal that
+ * computes the sum.  Result sparsity is the union of both input patterns.
  *
  * @tparam A        Left-hand matrix type.
  * @tparam B        Right-hand matrix type.
- * @tparam DataType Scalar type of the multiplier.
- * @param  a          Base matrix.
- * @param  b          Matrix to scale and add.
- * @param  multiplier Scalar factor applied to @p b before adding.
- * @return            Result matrix @c a + multiplier*b.
+ * @tparam DataType Scalar type of @p alpha and @p beta.
+ * @param  a     Left-hand operand.
+ * @param  b     Right-hand operand.
+ * @param  alpha Scalar factor applied to @p a.
+ * @param  beta  Scalar factor applied to @p b.
+ * @return       Result matrix @c alpha*a + beta*b.
  */
 template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
-SPARSEMAT_HD auto scaled_add(const A& a, const B& b, const DataType multiplier) {
-  return detail::Add<A, B>::add(a, b, multiplier);
+SPARSEMAT_HD auto add(const A& a, const B& b, const DataType alpha, const DataType beta) {
+  return detail::Add<A, B>::add(a, b, alpha, beta);
+}
+
+/**
+ * @brief Computes @p a + @p beta*b in a single fused operation.
+ *
+ * Convenience overload equivalent to @c add(a, b, 1, beta): @p alpha is
+ * implicitly @c 1, so only @p b is scaled.  Avoids a separate scale pass;
+ * @p beta is applied element-wise to @p b during the addition traversal.
+ * Result sparsity is the union of both input patterns.
+ *
+ * @tparam A        Left-hand matrix type.
+ * @tparam B        Right-hand matrix type.
+ * @tparam DataType Scalar type of @p beta.
+ * @param  a    Base matrix, added unscaled.
+ * @param  b    Matrix to scale and add.
+ * @param  beta Scalar factor applied to @p b before adding.
+ * @return      Result matrix @c a + beta*b.
+ */
+template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
+SPARSEMAT_HD auto add(const A& a, const B& b, const DataType beta) {
+  return detail::Add<A, B>::add(a, b, 1.0, beta);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/axpy.h ----
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for the fused operation @c z = alpha*A*x + beta*y.
+ *
+ * Computes @c alpha*A*x + beta*y in a single traversal, without materializing
+ * the intermediate product @c A*x as its own @c SparseMat. @c A is a sparse
+ * matrix, @c x is a sparse column vector compatible with @c A's columns,
+ * and @c y is a sparse column vector compatible with @c A's rows. Result
+ * sparsity is the union of @c A*x's structural sparsity and @c y's
+ * sparsity (independent of the runtime values of @c alpha/@c beta).
+ *
+ * @tparam SparseMat Sparse matrix type (the @c A operand).
+ * @tparam VecX      Sparse column vector type; @c VecX::rows must equal
+ *                   @c SparseMat::cols.
+ * @tparam VecY      Sparse column vector type; @c VecY::rows must equal
+ *                   @c SparseMat::rows.
+ */
+template<SparseMatrixType SparseMat, SparseMatrixType VecX, SparseMatrixType VecY>
+class Axpy {
+ public:
+  static_assert(VecX::cols == 1 && VecY::cols == 1, "Axpy requires x and y to be column vectors.");
+  static_assert(SparseMat::cols == VecX::rows,
+                "Axpy requires x's length to match A's column count.");
+  static_assert(SparseMat::rows == VecY::rows, "Axpy requires y's length to match A's row count.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, VecX> &&
+                    SparseLinearAlgebra::SameDataType<SparseMat, VecY>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = VecY::cols;
+
+  // Precomputed once — see Add::a_grid/b_grid (add.h) for why.
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  static constexpr auto x_grid = SparseLinearAlgebra::MatrixUtilities<VecX>::to_dense_bool();
+  static constexpr auto y_grid = SparseLinearAlgebra::MatrixUtilities<VecY>::to_dense_bool();
+
+  /// Returns true if row @p row of the result (A*x + y) is non-zero: either
+  /// A*x has a non-zero contribution there, or y does.
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int /*col*/) {
+    if (y_grid[row][0]) {
+      return true;
+    }
+    for (Int k = 0; k < SparseMat::cols; ++k) {
+      if (a_grid[row][k] && x_grid[k][0]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Axpy>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Axpy>::calculate_sparsity();
+  }
+
+  /// Single term of the A[I,*] . x[*] inner product at index k: A[I,k]*x[k]
+  /// if both are structurally non-zero, else 0.
+  template<Int I, Int k>
+  SPARSEMAT_HD static DataType dot_row_term(const SparseMat& a, const VecX& x) {
+    if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(I, k) &&
+                  SparseLinearAlgebra::MatrixUtilities<VecX>().isNonZero(k, 0)) {
+      constexpr auto a_index =
+          SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, k);
+      constexpr auto x_index = SparseLinearAlgebra::MatrixUtilities<VecX>::getSparseIndex(k, 0);
+      return a.values[a_index] * x.values[x_index];
+    } else {
+      return DataType(0);
+    }
+  }
+
+  /// Compile-time accumulation of A[I,*] . x[*] via a fold over all columns
+  /// k. The right-fold form (pack + ...) matches the original recursion's
+  /// right-associated summation order exactly.
+  template<Int I, std::size_t... Ks>
+  SPARSEMAT_HD static DataType dot_row_fold(const SparseMat& a,
+                                            const VecX& x,
+                                            std::index_sequence<Ks...> /*seq*/) {
+    return (dot_row_term<I, Ks>(a, x) + ...);
+  }
+
+  template<Int I>
+  SPARSEMAT_HD static DataType dot_row(const SparseMat& a, const VecX& x) {
+    return dot_row_fold<I>(a,
+                           x,
+                           std::make_index_sequence<static_cast<std::size_t>(SparseMat::cols)>{});
+  }
+
+  /// Fills result storage slot @p Idx (whose row is @c Result::indices()[Idx],
+  /// since the result is a column vector) with alpha*dot_row(A,x) + beta*y[I].
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(
+      Result& r, const SparseMat& a, const VecX& x, const VecY& y, DataType alpha, DataType beta) {
+    constexpr Int I = Result::indices()[Idx];
+    DataType value = alpha * dot_row<I>(a, x);
+    constexpr auto y_index = SparseLinearAlgebra::MatrixUtilities<VecY>::getSparseIndex(I, 0);
+    if constexpr (y_index >= 0) {
+      value += beta * y.values[y_index];
+    }
+    r.values[Idx] = value;
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      const VecX& x,
+                                      const VecY& y,
+                                      DataType alpha,
+                                      DataType beta,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, x, y, alpha, beta), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(
+      Result& r, const SparseMat& a, const VecX& x, const VecY& y, DataType alpha, DataType beta) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, x, y, alpha, beta, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, x, y, alpha, beta);
+      fill_range<Result, Begin + half, Count - half>(r, a, x, y, alpha, beta);
+    }
+  }
+
+  /// Constructs the result vector and fills it via fill_all, in a single
+  /// pass (no separate scaling pass over r.values — that would have to
+  /// re-derive each row's sparse storage index anyway, since not every row
+  /// is necessarily stored).
+  SPARSEMAT_HD static auto axpy(
+      const SparseMat& a, const VecX& x, const VecY& y, DataType alpha, DataType beta) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
+        template make<SparseMat::rows, 1, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(
+        result, a, x, y, alpha, beta);
+    return result;
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Computes @c alpha*A*x + beta*y in a single fused pass, without
+ *        materializing the intermediate product @c A*x.
+ *
+ * @c alpha and @c beta default to @c 1, so @c axpy(a, x, y) alone computes
+ * plain @c A*x + y.
+ *
+ * @tparam A    Sparse matrix type.
+ * @tparam VecX Sparse column-vector type; length must equal @c A::cols.
+ * @tparam VecY Sparse column-vector type; length must equal @c A::rows.
+ * @param  a     Matrix operand.
+ * @param  x     Vector multiplied by @p a.
+ * @param  y     Vector added to the product.
+ * @param  alpha Scalar multiplier for @c A*x.
+ * @param  beta  Scalar multiplier for @p y.
+ * @return       Result column vector @c alpha*a*x + beta*y.
+ */
+template<SparseMatrixType A, SparseMatrixType VecX, SparseMatrixType VecY>
+SPARSEMAT_HD auto axpy(const A& a,
+                       const VecX& x,
+                       const VecY& y,
+                       typename A::DataType alpha = typename A::DataType(1),
+                       typename A::DataType beta = typename A::DataType(1)) {
+  return detail::Axpy<A, VecX, VecY>::axpy(a, x, y, alpha, beta);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/block_diagonal.h ----
+
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for the block-diagonal composition
+ *        @c diag(A, B).
+ *
+ * Produces an (A.rows + B.rows) x (A.cols + B.cols) matrix holding @c A in the
+ * top-left block and @c B in the bottom-right, with the two off-diagonal
+ * blocks structurally zero:
+ * @code
+ *   [ A  0 ]
+ *   [ 0  B ]
+ * @endcode
+ *
+ * Unlike @c Kronecker — whose result pattern is the *product* of both
+ * operands' patterns and so grows fast — this is the *sum*: the result has
+ * exactly @c nonZeroCount(A) + nonZeroCount(B) stored values, no matter how
+ * the two patterns relate. That makes it the cheap way to assemble one solve
+ * out of several independent sub-problems, which is the usual reason to want
+ * it.
+ *
+ * @tparam SparseMat  Top-left block type.
+ * @tparam SparseMat1 Bottom-right block type.
+ */
+template<SparseMatrixType SparseMat, SparseMatrixType SparseMat1>
+class BlockDiagonal {
+ public:
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, SparseMat1>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows + SparseMat1::rows;
+  static constexpr auto cols = SparseMat::cols + SparseMat1::cols;
+
+  /// Position (row, col) is stored iff it falls inside one of the two blocks
+  /// and is stored in that block.
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    if (row < SparseMat::rows && col < SparseMat::cols) {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(row, col);
+    }
+    if (row >= SparseMat::rows && col >= SparseMat::cols) {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMat1>::isNonZero(row - SparseMat::rows,
+                                                                         col - SparseMat::cols);
+    }
+    return false;  // off-diagonal block
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<BlockDiagonal>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<BlockDiagonal>::calculate_sparsity();
+  }
+
+  /**
+   * @brief Copies both blocks into the result.
+   *
+   * A runtime scatter over each operand's stored values rather than a
+   * compile-time fold over result positions: this is pure data movement with
+   * no structurally-zero term to eliminate, so unrolling buys nothing (see the
+   * note on @c MatrixUtilities::storage_index_grid()). Each block's values are
+   * copied straight across, offset into the result's coordinate space.
+   */
+  template<typename Result>
+  SPARSEMAT_HD static void fill(Result& r, const SparseMat& a, const SparseMat1& b) {
+    constexpr auto result_offsets =
+        SparseLinearAlgebra::MatrixUtilities<Result>::storage_index_grid();
+    constexpr auto a_indices = SparseMat::indices();
+    constexpr auto b_indices = SparseMat1::indices();
+
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (SparseMat::nonZeroCount != 0) {
+      for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+        const Int row = a_indices[k] / SparseMat::cols;
+        const Int col = a_indices[k] % SparseMat::cols;
+        r.values[static_cast<std::size_t>(
+            result_offsets[static_cast<std::size_t>((row * cols) + col)])] = a.values[k];
+      }
+    }
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (SparseMat1::nonZeroCount != 0) {
+      for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat1::nonZeroCount); ++k) {
+        const Int row = (b_indices[k] / SparseMat1::cols) + SparseMat::rows;
+        const Int col = (b_indices[k] % SparseMat1::cols) + SparseMat::cols;
+        r.values[static_cast<std::size_t>(
+            result_offsets[static_cast<std::size_t>((row * cols) + col)])] = b.values[k];
+      }
+    }
+  }
+
+  SPARSEMAT_HD static auto block_diagonal(const SparseMat& a, const SparseMat1& b) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill<decltype(result)>(result, a, b);
+    return result;
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Composes two matrices block-diagonally: @c diag(a, b).
+ *
+ * The result is (a.rows + b.rows) x (a.cols + b.cols), with @p a in the
+ * top-left block, @p b in the bottom-right, and the off-diagonal blocks
+ * structurally zero. Its stored-value count is exactly the sum of the two
+ * inputs'.
+ *
+ * @code
+ * auto stacked = SparseLinearAlgebra::block_diagonal(a, b);
+ * auto x = stacked.solve(rhs);   // both sub-problems in one solve
+ * @endcode
+ *
+ * @tparam A Top-left block type.
+ * @tparam B Bottom-right block type.
+ * @param  a Top-left block.
+ * @param  b Bottom-right block.
+ * @return   Block-diagonal composition of @p a and @p b.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto block_diagonal(const A& a, const B& b) {
+  return detail::BlockDiagonal<A, B>::block_diagonal(a, b);
 }
 
 }  // namespace SparseLinearAlgebra
@@ -420,62 +985,76 @@ SPARSEMAT_HD auto scaled_add(const A& a, const B& b, const DataType multiplier) 
 
 // ---- sparsemat/operations/diagonal.h ----
 
-#include <span>
 
 
 namespace SparseLinearAlgebra::detail {
 
+/// Length of the diagonal of @c A — @c min(rows, cols).
+template<SparseMatrixType A>
+inline constexpr auto diagonal_length = (A::rows < A::cols) ? A::rows : A::cols;
+
+/**
+ * @brief Storage offsets of every *stored* diagonal entry of @c A, in row order.
+ *
+ * The compile-time part of set_diagonal is deciding which diagonal positions
+ * exist at all; once that list is known, writing to them is pure data
+ * movement and a runtime loop does it without a template instantiation per
+ * position (and without running into clang's 256-argument fold nesting limit
+ * on a large matrix).
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD constexpr auto stored_diagonal_offsets() {
+  using Int = typename A::Int;
+  std::array<Int,
+             static_cast<std::size_t>(SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros())>
+      offsets{};
+  constexpr auto grid = SparseLinearAlgebra::MatrixUtilities<A>::storage_index_grid();
+  std::size_t k = 0;
+  for (Int i = 0; i < diagonal_length<A>; ++i) {
+    const auto offset = grid[static_cast<std::size_t>((i * A::cols) + i)];
+    if (offset >= 0) {
+      offsets[k++] = offset;
+    }
+  }
+  return offsets;
+}
+
 /**
  * @brief Set every stored diagonal element of a sparse matrix to a single value.
  *
- * Iterates diagonal positions (N, N) at compile time.  Positions that are
- * structurally zero (not stored in the sparse format) are silently skipped.
+ * Structurally zero diagonal positions are silently skipped — the sparsity
+ * pattern is immutable, so there is nowhere to put the value.
  *
- * @tparam A     Sparse matrix type.
- * @tparam N     Current diagonal index (template recursion counter; leave at default).
- * @param  a     Matrix whose diagonal is to be set.
- * @param  value Scalar value written to every stored diagonal entry.
+ * @param a     Matrix whose diagonal is to be set.
+ * @param value Scalar value written to every stored diagonal entry.
  */
-template<SparseMatrixType A, typename A::Int N = 0>
+template<SparseMatrixType A>
 SPARSEMAT_HD void set_diagonal_impl(A& a, typename A::DataType value) {
-  constexpr auto min_dim = (A::rows < A::cols) ? A::rows : A::cols;
-  if constexpr (N < min_dim) {
-    constexpr auto idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
-    if constexpr (idx >= 0) {
-      a.values[idx] = value;
-    }
-    set_diagonal_impl<A, N + 1>(a, value);
+  constexpr auto offsets = stored_diagonal_offsets<A>();
+  for (auto offset : offsets) {
+    a.values[static_cast<std::size_t>(offset)] = value;
   }
 }
 
 /**
  * @brief Set the stored diagonal elements of a sparse matrix from a value array.
  *
- * Iterates diagonal positions (N, N) at compile time.  Only positions that are
- * structurally non-zero consume an entry from @p values; structurally-zero
- * diagonal positions are skipped without advancing @p index.
+ * Only positions that are structurally non-zero consume an entry from
+ * @p values; structurally-zero diagonal positions are skipped without
+ * consuming one. @c stored_diagonal_offsets() is already in row order, so the
+ * k-th entry of @p values lands in the k-th stored diagonal position.
  *
- * @tparam A      Sparse matrix type.
- * @tparam N      Current diagonal index (template recursion counter; leave at default).
- * @tparam index  Current position within @p values (template recursion counter; leave at default).
- * @param  a      Matrix whose diagonal is to be set.
- * @param  values Span of values to write into stored diagonal entries, in order.
+ * @param a      Matrix whose diagonal is to be set.
+ * @param values Values to write into stored diagonal entries, in row order.
  */
-template<SparseMatrixType A, typename A::Int N = 0, typename A::Int index = 0>
+template<SparseMatrixType A>
 SPARSEMAT_HD void set_diagonal_impl(
     A& a,
-    std::array<typename A::DataType, SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()>
-        values) {
-  constexpr auto min_dim = (A::rows < A::cols) ? A::rows : A::cols;
-  if constexpr (N < min_dim &&
-                index < SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()) {
-    constexpr auto idx = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(N, N);
-    if constexpr (idx >= 0) {
-      a.values[idx] = values[index];
-      set_diagonal_impl<A, N + 1, index + 1>(a, values);
-    } else {
-      set_diagonal_impl<A, N + 1, index>(a, values);
-    }
+    const std::array<typename A::DataType,
+                     SparseLinearAlgebra::MatrixUtilities<A>::diagonal_nonzeros()>& values) {
+  constexpr auto offsets = stored_diagonal_offsets<A>();
+  for (std::size_t k = 0; k < offsets.size(); ++k) {
+    a.values[static_cast<std::size_t>(offsets[k])] = values[k];
   }
 }
 
@@ -505,24 +1084,45 @@ SPARSEMAT_HD void set_diagonal(SparseMat& a, typename SparseMat::DataType value)
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD void set_diagonal(
     SparseMat& a,
-    std::array<typename SparseMat::DataType,
-               SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros()> values) {
+    const std::array<typename SparseMat::DataType,
+                     SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros()>&
+        values) {
   detail::set_diagonal_impl(a, values);
 }
 
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/result.h ----
 
-#include <utility>
+#include <cstdint>
+#include <limits>
 
 
 namespace SparseLinearAlgebra {
 
 /// Outcome of a numeric solve/factorization.
-enum class SolveStatus {
+enum class SolveStatus : std::uint8_t {
   Success,
-  SingularMatrix,  ///< Hit a zero (or non-positive, for Cholesky) pivot.
+  SingularMatrix,  ///< Hit a negligible (or non-positive, for Cholesky) pivot.
 };
+
+/**
+ * @brief Relative magnitude below which a pivot is treated as singular.
+ *
+ * None of the factorizations here pivot, so a merely *tiny* pivot is as fatal
+ * as an exactly-zero one: it is divided through and yields enormous,
+ * meaningless multipliers. Callers get told via @c SolveStatus::SingularMatrix
+ * rather than silently receiving garbage with @c ok() == @c true.
+ *
+ * The value is a few epsilons of the scalar type — loose enough not to reject
+ * merely ill-conditioned-but-usable systems, tight enough to catch a pivot
+ * that has been annihilated by cancellation. It is multiplied by a magnitude
+ * scale drawn from the matrix at the call site, making the test relative
+ * rather than absolute.
+ */
+template<typename DataType>
+SPARSEMAT_HD constexpr DataType singular_pivot_threshold() {
+  return DataType(8) * std::numeric_limits<DataType>::epsilon();
+}
 
 /**
  * @brief Non-throwing result wrapper for solvers that may hit a zero pivot.
@@ -582,36 +1182,41 @@ template<typename SparseMat>
 class Triangular {
   using Int = typename SparseMat::Int;
 
-  // Walks the index pack at compile time; returns false as soon as any
-  // above-diagonal position (J > I) is structurally non-zero.
-  template<Int I = 0, Int J = 1>
+  // Fold over the matrix's own stored non-zeros (rather than walking the full
+  // rows*cols grid) checking that none of them sits above the diagonal.
+  // A structurally-zero position trivially satisfies "is zero", so only
+  // stored positions need checking.
+  template<std::size_t Idx>
+  constexpr static bool structurally_lower_ok() {
+    constexpr auto flat = SparseMat::indices()[Idx];
+    constexpr Int row = flat / cols;
+    constexpr Int col = flat % cols;
+    return !(col > row);
+  }
+  template<std::size_t... Is>
+  constexpr static bool is_structurally_lower_fold(std::index_sequence<Is...> /*seq*/) {
+    return (structurally_lower_ok<Is>() && ...);
+  }
   constexpr static bool is_structurally_lower() {
-    if constexpr (I >= rows) {
-      return true;
-    } else if constexpr (J >= cols) {
-      return is_structurally_lower<I + 1, I + 2>();
-    } else if constexpr (J > I &&
-                         SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-      return false;
-    } else {
-      return is_structurally_lower<I, J + 1>();
-    }
+    return is_structurally_lower_fold(
+        std::make_index_sequence<static_cast<std::size_t>(SparseMat::nonZeroCount)>{});
   }
 
-  // Walks the index pack at compile time; returns false as soon as any
-  // below-diagonal position (I > J) is structurally non-zero.
-  template<Int I = 1, Int J = 0>
+  // Same idea for the below-diagonal check.
+  template<std::size_t Idx>
+  constexpr static bool structurally_upper_ok() {
+    constexpr auto flat = SparseMat::indices()[Idx];
+    constexpr Int row = flat / cols;
+    constexpr Int col = flat % cols;
+    return !(row > col);
+  }
+  template<std::size_t... Is>
+  constexpr static bool is_structurally_upper_fold(std::index_sequence<Is...> /*seq*/) {
+    return (structurally_upper_ok<Is>() && ...);
+  }
   constexpr static bool is_structurally_upper() {
-    if constexpr (I >= rows) {
-      return true;
-    } else if constexpr (J >= cols) {
-      return is_structurally_upper<I + 1, 0>();
-    } else if constexpr (I > J &&
-                         SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-      return false;
-    } else {
-      return is_structurally_upper<I, J + 1>();
-    }
+    return is_structurally_upper_fold(
+        std::make_index_sequence<static_cast<std::size_t>(SparseMat::nonZeroCount)>{});
   }
 
  public:
@@ -636,23 +1241,33 @@ class Triangular {
    * @param a         Matrix to test.
    * @param TOLERANCE Maximum absolute value allowed above the diagonal.
    */
-  template<Int I = 0, Int J = 1>
-  SPARSEMAT_HD static bool is_numerically_lower(const SparseMat& a, DataType TOLERANCE = 1e-6) {
-    if constexpr (I >= rows) {
-      return true;
-    } else if constexpr (J >= cols) {
-      return is_numerically_lower<I + 1, I + 2>(a, TOLERANCE);
-    } else if constexpr (J > I) {
-      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-      if constexpr (index >= 0) {
-        if (std::abs(a.values[index]) > TOLERANCE) {
-          return false;
-        }
-      }
-      return is_numerically_lower<I, J + 1>(a, TOLERANCE);
+  // Fold over the matrix's own stored non-zeros (rather than walking the
+  // full rows*cols grid): a structurally-zero position is trivially within
+  // any tolerance, so only stored positions above the diagonal need
+  // checking. Idx doubles as both the pack index and the storage index into
+  // a.values, since SparseMat::indices() and values are parallel arrays.
+  template<std::size_t Idx>
+  SPARSEMAT_HD static bool numerically_lower_ok(const SparseMat& a, DataType TOLERANCE) {
+    constexpr auto flat = SparseMat::indices()[Idx];
+    constexpr Int row = flat / cols;
+    constexpr Int col = flat % cols;
+    if constexpr (col > row) {
+      return std::abs(a.values[Idx]) <= TOLERANCE;
     } else {
-      return is_numerically_lower<I, J + 1>(a, TOLERANCE);
+      return true;
     }
+  }
+  template<std::size_t... Is>
+  SPARSEMAT_HD static bool is_numerically_lower_fold(const SparseMat& a,
+                                                     DataType TOLERANCE,
+                                                     std::index_sequence<Is...> /*seq*/) {
+    return (numerically_lower_ok<Is>(a, TOLERANCE) && ...);
+  }
+  SPARSEMAT_HD static bool is_numerically_lower(const SparseMat& a, DataType TOLERANCE = 1e-6) {
+    return is_numerically_lower_fold(
+        a,
+        TOLERANCE,
+        std::make_index_sequence<static_cast<std::size_t>(SparseMat::nonZeroCount)>{});
   }
 
   /**
@@ -665,69 +1280,115 @@ class Triangular {
    * @param a         Matrix to test.
    * @param TOLERANCE Maximum absolute value allowed below the diagonal.
    */
-  template<Int I = 1, Int J = 0>
-  SPARSEMAT_HD static bool is_numerically_upper(const SparseMat& a, DataType TOLERANCE = 1e-6) {
-    if constexpr (I >= rows) {
+  template<std::size_t Idx>
+  SPARSEMAT_HD static bool numerically_upper_ok(const SparseMat& a, DataType TOLERANCE) {
+    constexpr auto flat = SparseMat::indices()[Idx];
+    constexpr Int row = flat / cols;
+    constexpr Int col = flat % cols;
+    if constexpr (row > col) {
+      return std::abs(a.values[Idx]) <= TOLERANCE;
+    } else {
       return true;
-    } else if constexpr (J >= cols) {
-      return is_numerically_upper<I + 1, 0>(a, TOLERANCE);
-    } else if constexpr (I > J) {
-      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-      if constexpr (index >= 0) {
-        if (std::abs(a.values[index]) > TOLERANCE) {
-          return false;
-        }
-      }
-      return is_numerically_upper<I, J + 1>(a, TOLERANCE);
-    } else {
-      return is_numerically_upper<I, J + 1>(a, TOLERANCE);
     }
   }
+  template<std::size_t... Is>
+  SPARSEMAT_HD static bool is_numerically_upper_fold(const SparseMat& a,
+                                                     DataType TOLERANCE,
+                                                     std::index_sequence<Is...> /*seq*/) {
+    return (numerically_upper_ok<Is>(a, TOLERANCE) && ...);
+  }
+  SPARSEMAT_HD static bool is_numerically_upper(const SparseMat& a, DataType TOLERANCE = 1e-6) {
+    return is_numerically_upper_fold(
+        a,
+        TOLERANCE,
+        std::make_index_sequence<static_cast<std::size_t>(SparseMat::nonZeroCount)>{});
+  }
 
-  // Computes sum(A[I][J] * result[J][C]) for J < I — the already-solved lower
-  // entries for column C of the block RHS, used by forward_solve.
+  // Single term of sum(A[I][J] * result[J][C]) for J < I — the already-solved
+  // lower entries for column C of the block RHS, used by forward_solve. J
+  // ranges over a fold-generated pack sized to A::rows (an over-generous
+  // upper bound on I, since I < A::rows); terms with J >= I are filtered out
+  // here rather than by sizing the pack exactly, since the exact bound (I)
+  // isn't known until this template is instantiated anyway and the filtered
+  // terms cost nothing at runtime.
   template<SparseMatrixType A,
            SparseMatrixType B,
            typename A::Int I,
            typename B::Int C,
-           typename A::Int J = 0>
+           std::size_t J>
+  SPARSEMAT_HD static DataType lower_product_term(const A& a, const B& b) {
+    if constexpr (static_cast<typename A::Int>(J) >= I) {
+      return DataType(0);
+    } else {
+      constexpr auto sparse_a_index =
+          SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(I,
+                                                                  static_cast<typename A::Int>(J));
+      constexpr auto sparse_b_index =
+          SparseLinearAlgebra::MatrixUtilities<B>::getSparseIndex(static_cast<typename A::Int>(J),
+                                                                  C);
+      if constexpr (sparse_a_index < 0 || sparse_b_index < 0) {
+        return DataType(0);
+      } else {
+        return a.values[sparse_a_index] * b.values[sparse_b_index];
+      }
+    }
+  }
+  template<SparseMatrixType A,
+           SparseMatrixType B,
+           typename A::Int I,
+           typename B::Int C,
+           std::size_t... Js>
+  SPARSEMAT_HD static DataType do_lower_product_fold(const A& a,
+                                                     const B& b,
+                                                     std::index_sequence<Js...> /*seq*/) {
+    return (lower_product_term<A, B, I, C, Js>(a, b) + ...);
+  }
+  template<SparseMatrixType A, SparseMatrixType B, typename A::Int I, typename B::Int C>
   SPARSEMAT_HD static DataType do_lower_product(const A& a, const B& b) {
-    if constexpr (J >= I) {
-      return DataType(0);
-    } else {
-      constexpr auto sparse_a_index = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(I, J);
-      constexpr auto sparse_b_index = SparseLinearAlgebra::MatrixUtilities<B>::getSparseIndex(J, C);
-      if constexpr (sparse_a_index < 0 || sparse_b_index < 0) {
-        return do_lower_product<A, B, I, C, J + 1>(a, b);
-      } else {
-        return a.values[sparse_a_index] * b.values[sparse_b_index] +
-               do_lower_product<A, B, I, C, J + 1>(a, b);
-      }
-    }
+    return do_lower_product_fold<A, B, I, C>(
+        a, b, std::make_index_sequence<static_cast<std::size_t>(A::rows)>{});
   }
 
-  // Computes sum(A[I][J] * result[J][C]) for J > I — the already-solved upper
-  // entries for column C of the block RHS, used by backward_solve.
+  // Single term of sum(A[I][J] * result[J][C]) for J > I — the already-solved
+  // upper entries for column C of the block RHS, used by backward_solve.
+  // J ranges over the full [0, cols) pack, same "filter inside the term"
+  // approach as do_lower_product above.
   template<SparseMatrixType A,
            SparseMatrixType B,
            typename A::Int I,
            typename B::Int C,
-           typename A::Int J = 0>
-  SPARSEMAT_HD static DataType do_upper_product(const A& a, const B& b) {
-    if constexpr (J >= cols) {
+           std::size_t J>
+  SPARSEMAT_HD static DataType upper_product_term(const A& a, const B& b) {
+    if constexpr (static_cast<typename A::Int>(J) <= I) {
       return DataType(0);
-    } else if constexpr (J <= I) {
-      return do_upper_product<A, B, I, C, J + 1>(a, b);
     } else {
-      constexpr auto sparse_a_index = SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(I, J);
-      constexpr auto sparse_b_index = SparseLinearAlgebra::MatrixUtilities<B>::getSparseIndex(J, C);
+      constexpr auto sparse_a_index =
+          SparseLinearAlgebra::MatrixUtilities<A>::getSparseIndex(I,
+                                                                  static_cast<typename A::Int>(J));
+      constexpr auto sparse_b_index =
+          SparseLinearAlgebra::MatrixUtilities<B>::getSparseIndex(static_cast<typename A::Int>(J),
+                                                                  C);
       if constexpr (sparse_a_index < 0 || sparse_b_index < 0) {
-        return do_upper_product<A, B, I, C, J + 1>(a, b);
+        return DataType(0);
       } else {
-        return a.values[sparse_a_index] * b.values[sparse_b_index] +
-               do_upper_product<A, B, I, C, J + 1>(a, b);
+        return a.values[sparse_a_index] * b.values[sparse_b_index];
       }
     }
+  }
+  template<SparseMatrixType A,
+           SparseMatrixType B,
+           typename A::Int I,
+           typename B::Int C,
+           std::size_t... Js>
+  SPARSEMAT_HD static DataType do_upper_product_fold(const A& a,
+                                                     const B& b,
+                                                     std::index_sequence<Js...> /*seq*/) {
+    return (upper_product_term<A, B, I, C, Js>(a, b) + ...);
+  }
+  template<SparseMatrixType A, SparseMatrixType B, typename A::Int I, typename B::Int C>
+  SPARSEMAT_HD static DataType do_upper_product(const A& a, const B& b) {
+    return do_upper_product_fold<A, B, I, C>(
+        a, b, std::make_index_sequence<static_cast<std::size_t>(cols)>{});
   }
 
   /**
@@ -742,79 +1403,116 @@ class Triangular {
    * @param A       Lower triangular matrix.
    * @param b       Right-hand side vector.
    */
-  // Inner loop: fills all RHS columns for a fixed row I in forward substitution.
-  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, Int C = 0>
-  SPARSEMAT_HD void forward_solve_col(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
-    if constexpr (C < RHS::cols) {
-      constexpr auto diag_index =
-          SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, I);
-      constexpr auto result_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, C);
-      if constexpr (result_index >= 0) {
-        if constexpr (diag_index < 0) {
+  // Single RHS-column step for a fixed row I in forward substitution.
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, std::size_t COff>
+  SPARSEMAT_HD static void forward_solve_col_step(Result& result,
+                                                  const SparseMat& A,
+                                                  const RHS& b,
+                                                  bool& ok) {
+    constexpr Int C = static_cast<Int>(COff);
+    constexpr auto diag_index =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, I);
+    constexpr auto result_index =
+        SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, C);
+    if constexpr (result_index >= 0) {
+      if constexpr (diag_index < 0) {
+        result.values[result_index] = DataType(0);
+      } else {
+        if (A.values[diag_index] == DataType(0)) {
+          ok = false;
           result.values[result_index] = DataType(0);
+          return;
+        }
+        constexpr auto rhs_index = SparseLinearAlgebra::MatrixUtilities<RHS>::getSparseIndex(I, C);
+        DataType sum = do_lower_product<SparseMat, Result, I, C>(A, result);
+        if constexpr (rhs_index >= 0) {
+          result.values[result_index] = (b.values[rhs_index] - sum) / A.values[diag_index];
         } else {
-          if (A.values[diag_index] == DataType(0)) {
-            ok = false;
-            result.values[result_index] = DataType(0);
-            forward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
-            return;
-          }
-          constexpr auto rhs_index =
-              SparseLinearAlgebra::MatrixUtilities<RHS>::getSparseIndex(I, C);
-          DataType sum = do_lower_product<SparseMat, Result, I, C>(A, result);
-          if constexpr (rhs_index >= 0) {
-            result.values[result_index] = (b.values[rhs_index] - sum) / A.values[diag_index];
-          } else {
-            result.values[result_index] = -sum / A.values[diag_index];
-          }
+          result.values[result_index] = -sum / A.values[diag_index];
         }
       }
-      forward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
     }
   }
+  // Fills all RHS columns for a fixed row I in forward substitution. Column
+  // order doesn't matter (each writes an independent result cell), but a
+  // comma fold is used for consistency with the row-sequential fold below.
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, std::size_t... COffs>
+  SPARSEMAT_HD static void forward_solve_col(Result& result,
+                                             const SparseMat& A,
+                                             const RHS& b,
+                                             bool& ok,
+                                             std::index_sequence<COffs...> /*seq*/) {
+    (forward_solve_col_step<Result, RHS, I, COffs>(result, A, b, ok), ...);
+  }
 
-  template<SparseMatrixType Result, SparseMatrixType RHS, Int I = 0>
+  // Single row step: row I's forward_solve_col reads result cells from rows
+  // < I written by earlier steps, so row order is load-bearing.
+  template<SparseMatrixType Result, SparseMatrixType RHS, std::size_t IOff>
+  SPARSEMAT_HD static void forward_solve_row_step(Result& result,
+                                                  const SparseMat& A,
+                                                  const RHS& b,
+                                                  bool& ok) {
+    forward_solve_col<Result, RHS, static_cast<Int>(IOff)>(
+        result, A, b, ok, std::make_index_sequence<static_cast<std::size_t>(RHS::cols)>{});
+  }
+  // Comma fold over rows 0..rows-1, in order: the comma operator inside a
+  // fold expression is the built-in sequencing comma (left fully sequenced
+  // before right), which is what makes it safe to replace the original
+  // sequential recursion here — row I+1 is only ever evaluated after row I
+  // has finished writing its result cells.
+  template<SparseMatrixType Result, SparseMatrixType RHS, std::size_t... IOffs>
+  SPARSEMAT_HD static Result& forward_solve_rows(Result& result,
+                                                 const SparseMat& A,
+                                                 const RHS& b,
+                                                 bool& ok,
+                                                 std::index_sequence<IOffs...> /*seq*/) {
+    (forward_solve_row_step<Result, RHS, IOffs>(result, A, b, ok), ...);
+    return result;
+  }
+
+  template<SparseMatrixType Result, SparseMatrixType RHS>
   SPARSEMAT_HD auto forward_solve(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
     static_assert(structurally_lower, "Matrix is not structurally lower triangular.");
-    if constexpr (I < rows) {
-      forward_solve_col<Result, RHS, I>(result, A, b, ok);
-      return forward_solve<Result, RHS, I + 1>(result, A, b, ok);
-    } else {
-      return result;
-    }
+    return forward_solve_rows<Result, RHS>(result, A, b, ok, std::make_index_sequence<rows>{});
   }
 
-  // Inner loop: fills all RHS columns for a fixed row I in back substitution.
-  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, Int C = 0>
-  SPARSEMAT_HD void backward_solve_col(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
-    if constexpr (C < RHS::cols) {
-      constexpr auto diag_index =
-          SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, I);
-      constexpr auto result_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, C);
-      if constexpr (result_index >= 0) {
-        if constexpr (diag_index < 0) {
+  // Single RHS-column step for a fixed row I in back substitution.
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, std::size_t COff>
+  SPARSEMAT_HD static void backward_solve_col_step(Result& result,
+                                                   const SparseMat& A,
+                                                   const RHS& b,
+                                                   bool& ok) {
+    constexpr Int C = static_cast<Int>(COff);
+    constexpr auto diag_index =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, I);
+    constexpr auto result_index =
+        SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, C);
+    if constexpr (result_index >= 0) {
+      if constexpr (diag_index < 0) {
+        result.values[result_index] = DataType(0);
+      } else {
+        if (A.values[diag_index] == DataType(0)) {
+          ok = false;
           result.values[result_index] = DataType(0);
+          return;
+        }
+        constexpr auto rhs_index = SparseLinearAlgebra::MatrixUtilities<RHS>::getSparseIndex(I, C);
+        DataType sum = do_upper_product<SparseMat, Result, I, C>(A, result);
+        if constexpr (rhs_index >= 0) {
+          result.values[result_index] = (b.values[rhs_index] - sum) / A.values[diag_index];
         } else {
-          if (A.values[diag_index] == DataType(0)) {
-            ok = false;
-            result.values[result_index] = DataType(0);
-            backward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
-            return;
-          }
-          constexpr auto rhs_index =
-              SparseLinearAlgebra::MatrixUtilities<RHS>::getSparseIndex(I, C);
-          DataType sum = do_upper_product<SparseMat, Result, I, C>(A, result);
-          if constexpr (rhs_index >= 0) {
-            result.values[result_index] = (b.values[rhs_index] - sum) / A.values[diag_index];
-          } else {
-            result.values[result_index] = -sum / A.values[diag_index];
-          }
+          result.values[result_index] = -sum / A.values[diag_index];
         }
       }
-      backward_solve_col<Result, RHS, I, C + 1>(result, A, b, ok);
     }
+  }
+  template<SparseMatrixType Result, SparseMatrixType RHS, Int I, std::size_t... COffs>
+  SPARSEMAT_HD static void backward_solve_col(Result& result,
+                                              const SparseMat& A,
+                                              const RHS& b,
+                                              bool& ok,
+                                              std::index_sequence<COffs...> /*seq*/) {
+    (backward_solve_col_step<Result, RHS, I, COffs>(result, A, b, ok), ...);
   }
 
   /**
@@ -830,15 +1528,32 @@ class Triangular {
    * @param A       Upper triangular matrix.
    * @param b       Right-hand side.
    */
-  template<SparseMatrixType Result, SparseMatrixType RHS, int I = rows - 1>
+  // Single row step, descending: IOff=0,1,2,... maps to I=rows-1,rows-2,...,0
+  // so the ascending fold below still visits rows in the original
+  // descending order without needing a genuinely-reversed index_sequence.
+  template<SparseMatrixType Result, SparseMatrixType RHS, std::size_t IOff>
+  SPARSEMAT_HD static void backward_solve_row_step(Result& result,
+                                                   const SparseMat& A,
+                                                   const RHS& b,
+                                                   bool& ok) {
+    constexpr Int I = static_cast<Int>(rows) - 1 - static_cast<Int>(IOff);
+    backward_solve_col<Result, RHS, I>(
+        result, A, b, ok, std::make_index_sequence<static_cast<std::size_t>(RHS::cols)>{});
+  }
+  template<SparseMatrixType Result, SparseMatrixType RHS, std::size_t... IOffs>
+  SPARSEMAT_HD static Result& backward_solve_rows(Result& result,
+                                                  const SparseMat& A,
+                                                  const RHS& b,
+                                                  bool& ok,
+                                                  std::index_sequence<IOffs...> /*seq*/) {
+    (backward_solve_row_step<Result, RHS, IOffs>(result, A, b, ok), ...);
+    return result;
+  }
+
+  template<SparseMatrixType Result, SparseMatrixType RHS>
   SPARSEMAT_HD auto backward_solve(Result& result, const SparseMat& A, const RHS& b, bool& ok) {
     static_assert(structurally_upper, "Matrix is not structurally upper triangular.");
-    if constexpr (I >= 0) {
-      backward_solve_col<Result, RHS, I>(result, A, b, ok);
-      return backward_solve<Result, RHS, I - 1>(result, A, b, ok);
-    } else {
-      return result;
-    }
+    return backward_solve_rows<Result, RHS>(result, A, b, ok, std::make_index_sequence<rows>{});
   }
 };
 
@@ -863,11 +1578,18 @@ class LowerTriangular {
   // any already-determined non-zero x[j] (j < i) connects through L[i][j].
   // Row i is potentially non-zero if any column of RHS has a non-zero at row i,
   // or if any earlier non-zero row j connects to i through L[i][j].
+  //
+  // Both operands are memoized as dense bool grids first (see
+  // MatrixUtilities::to_dense_bool()): the inner connectivity test below runs
+  // inside a triple-nested loop, and a raw indices() scan there would make
+  // this O(rows^2 * nonZeroCount) constexpr work rather than O(rows^2).
   static constexpr std::array<bool, SparseMat::rows> compute_nonzero_rows() {
+    constexpr auto l_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+    constexpr auto rhs_grid = SparseLinearAlgebra::MatrixUtilities<RHS>::to_dense_bool();
     std::array<bool, SparseMat::rows> nz{};
     for (Int i = 0; i < SparseMat::rows; ++i) {
-      for (auto idx : RHS::indices()) {
-        if (idx / RHS::cols == i) {
+      for (Int c = 0; c < RHS::cols; ++c) {
+        if (rhs_grid[i][c]) {
           nz[i] = true;
           break;
         }
@@ -876,17 +1598,8 @@ class LowerTriangular {
         continue;
       }
       for (Int j = 0; j < i; ++j) {
-        if (!nz[j]) {
-          continue;
-        }
-        Int flat = i * SparseMat::cols + j;
-        for (auto idx : SparseMat::indices()) {
-          if (idx == flat) {
-            nz[i] = true;
-            break;
-          }
-        }
-        if (nz[i]) {
+        if (nz[j] && l_grid[i][j]) {
+          nz[i] = true;
           break;
         }
       }
@@ -906,7 +1619,7 @@ class LowerTriangular {
 
   static constexpr auto get_nonzero_rows_lower() {
     auto nz = compute_nonzero_rows();
-    std::array<Int, count_nonzero_rows_lower()> result{};
+    std::array<Int, static_cast<std::size_t>(count_nonzero_rows_lower())> result{};
     Int k = 0;
     for (Int i = 0; i < SparseMat::rows; ++i) {
       if (nz[i]) {
@@ -920,7 +1633,8 @@ class LowerTriangular {
   using DataType = typename SparseMat::DataType;
   static constexpr auto rows = SparseMat::rows;
   static constexpr auto cols = RHS::cols;  // block: result has same column count as RHS
-  static constexpr std::array<Int, count_nonzero_rows_lower()> nonZeros = get_nonzero_rows_lower();
+  static constexpr std::array<Int, static_cast<std::size_t>(count_nonzero_rows_lower())> nonZeros =
+      get_nonzero_rows_lower();
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
   SPARSEMAT_HD constexpr static bool is_result_index_nonzero(Int row, Int /*col*/) {
@@ -939,7 +1653,7 @@ class LowerTriangular {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -1006,7 +1720,7 @@ class UpperTriangular {
 
   static constexpr auto get_nonzero_rows_upper() {
     auto nz = compute_nonzero_rows();
-    std::array<Int, count_nonzero_rows_upper()> result{};
+    std::array<Int, static_cast<std::size_t>(count_nonzero_rows_upper())> result{};
     Int k = 0;
     for (Int i = 0; i < SparseMat::rows; ++i) {
       if (nz[i]) {
@@ -1020,7 +1734,8 @@ class UpperTriangular {
   using DataType = typename SparseMat::DataType;
   static constexpr auto rows = SparseMat::rows;
   static constexpr auto cols = RHS::cols;  // block: result has same column count as RHS
-  static constexpr std::array<Int, count_nonzero_rows_upper()> nonZeros = get_nonzero_rows_upper();
+  static constexpr std::array<Int, static_cast<std::size_t>(count_nonzero_rows_upper())> nonZeros =
+      get_nonzero_rows_upper();
 
   // (row, col) is non-zero for every column of a potentially non-zero row.
   SPARSEMAT_HD constexpr static bool is_result_index_nonzero(Int row, Int /*col*/) {
@@ -1038,7 +1753,7 @@ class UpperTriangular {
       SparseLinearAlgebra::OperationUtilities<UpperTriangular>::calculate_sparsity();
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -1089,6 +1804,10 @@ SPARSEMAT_HD auto forward_solve(const SparseMat& A, const RHS& b) {
   static_assert(SparseMat::rows == SparseMat::cols,
                 "forward_solve requires a square coefficient matrix.");
   static_assert(SparseMat::rows == RHS::rows, "forward_solve requires RHS::rows == A.rows.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, RHS>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
   auto result = detail::LowerTriangular<SparseMat, RHS>::make_result();
   bool ok = true;
   detail::Triangular<SparseMat>().forward_solve(result, A, b, ok);
@@ -1113,6 +1832,10 @@ SPARSEMAT_HD auto backward_solve(const SparseMat& A, const RHS& b) {
   static_assert(SparseMat::rows == SparseMat::cols,
                 "backward_solve requires a square coefficient matrix.");
   static_assert(SparseMat::rows == RHS::rows, "backward_solve requires RHS::rows == A.rows.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, RHS>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
   auto result = detail::UpperTriangular<SparseMat, RHS>::make_result();
   bool ok = true;
   detail::Triangular<SparseMat>().backward_solve(result, A, b, ok);
@@ -1221,7 +1944,7 @@ class LCholeskyMatrix {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -1251,76 +1974,117 @@ class CholeskyFactorization {
   using Int = typename SparseMat::Int;
   using MU = SparseLinearAlgebra::MatrixUtilities<SparseMat>;
 
-  /**
-   * Computes sum_{m=0}^{J-1} L[I][m] * L[J][m].
-   * Used for both diagonal (I==J) and sub-diagonal (I>J) entries.
-   */
-  template<typename L, Int I, Int J, Int M = 0>
-  SPARSEMAT_HD static DataType inner_sum(const L& l) {
-    if constexpr (M < J) {
-      constexpr auto lim = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, M);
-      constexpr auto ljm = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, M);
-      auto term = DataType(0);
-      if constexpr (lim >= 0 && ljm >= 0) {
-        term = l.values[lim] * l.values[ljm];
-      }
-      return term + inner_sum<L, I, J, M + 1>(l);
+  /// Single term of sum_{m=0}^{J-1} L[I][m] * L[J][m].
+  template<typename L, Int I, Int J, std::size_t M>
+  SPARSEMAT_HD static DataType inner_sum_term(const L& l) {
+    constexpr auto lim =
+        SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, static_cast<Int>(M));
+    constexpr auto ljm =
+        SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, static_cast<Int>(M));
+    if constexpr (lim >= 0 && ljm >= 0) {
+      return l.values[lim] * l.values[ljm];
     } else {
       return DataType(0);
     }
   }
-
+  template<typename L, Int I, Int J, std::size_t... Ms>
+  SPARSEMAT_HD static DataType inner_sum_fold(const L& l, std::index_sequence<Ms...> /*seq*/) {
+    return (inner_sum_term<L, I, J, Ms>(l) + ...);
+  }
   /**
-   * Fills column J of L: diagonal first (I==J), then sub-diagonal rows (I>J).
+   * Computes sum_{m=0}^{J-1} L[I][m] * L[J][m], used for both diagonal
+   * (I==J) and sub-diagonal (I>J) entries. (pack + ...) is ill-formed for an
+   * empty pack, so J==0 (the first column, nothing yet to sum) needs an
+   * explicit early-out.
    */
-  template<typename L, Int J, Int I = J>
-  SPARSEMAT_HD static void compute_column(const SparseMat& a, L& l, bool& ok) {
-    if constexpr (I >= N) {
-      return;
-    } else if constexpr (I == J) {
-      // Diagonal: L[J][J] = sqrt(A[J][J] - sum_{m<J} L[J][m]^2)
-      constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
-      static_assert(l_jj >= 0, "Cholesky: diagonal of L must be structurally non-zero.");
-      DataType sum = inner_sum<L, J, J>(l);
-      constexpr auto a_jj = MU::getSparseIndex(J, J);
-      DataType a_val = (a_jj >= 0) ? a.values[a_jj] : DataType(0);
-      DataType diag = a_val - sum;
-      if (diag <= DataType(0)) {
-        // Non-positive diag: A is not (numerically) positive definite,
-        // so the diagonal pivot is zero or the factorization is undefined.
-        ok = false;
-        l.values[l_jj] = DataType(0);
-        compute_column<L, J, J + 1>(a, l, ok);
-        return;
-      }
-      l.values[l_jj] = std::sqrt(diag);
-      compute_column<L, J, J + 1>(a, l, ok);
+  template<typename L, Int I, Int J>
+  SPARSEMAT_HD static DataType inner_sum(const L& l) {
+    if constexpr (J == 0) {
+      return DataType(0);
     } else {
-      // Sub-diagonal: L[I][J] = (A[I][J] - sum_{m<J} L[I][m]*L[J][m]) / L[J][J]
-      constexpr auto l_ij = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, J);
-      if constexpr (l_ij >= 0) {
-        DataType sum = inner_sum<L, I, J>(l);
-        constexpr auto a_ij = MU::getSparseIndex(I, J);
-        DataType a_val = (a_ij >= 0) ? a.values[a_ij] : DataType(0);
-        constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
-        if (l.values[l_jj] == DataType(0)) {
-          ok = false;
-          l.values[l_ij] = DataType(0);
-          compute_column<L, J, I + 1>(a, l, ok);
-          return;
-        }
-        l.values[l_ij] = (a_val - sum) / l.values[l_jj];
-      }
-      compute_column<L, J, I + 1>(a, l, ok);
+      return inner_sum_fold<L, I, J>(l, std::make_index_sequence<static_cast<std::size_t>(J)>{});
     }
   }
 
-  template<typename L, Int J = 0>
-  SPARSEMAT_HD static void outer_loop(const SparseMat& a, L& l, bool& ok) {
-    if constexpr (J < N) {
-      compute_column<L, J>(a, l, ok);
-      outer_loop<L, Int(J + 1)>(a, l, ok);
+  /// Diagonal entry of column J: L[J][J] = sqrt(A[J][J] - sum_{m<J} L[J][m]^2).
+  /// Must run before any sub-diagonal entry in the same column, since those
+  /// divide by L[J][J].
+  template<typename L, Int J>
+  SPARSEMAT_HD static void diag_step(const SparseMat& a, L& l, bool& ok) {
+    constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+    static_assert(l_jj >= 0, "Cholesky: diagonal of L must be structurally non-zero.");
+    DataType sum = inner_sum<L, J, J>(l);
+    constexpr auto a_jj = MU::getSparseIndex(J, J);
+    DataType a_val = (a_jj >= 0) ? a.values[a_jj] : DataType(0);
+    DataType diag = a_val - sum;
+    // Non-positive diag means A is not (numerically) positive definite. The
+    // threshold also rejects a diag that is positive but negligible relative
+    // to the A[J][J] it came from: sqrt() of it produces a pivot the
+    // sub-diagonal entries then divide by, so accepting it yields garbage
+    // with ok() == true. See singular_pivot_threshold().
+    const DataType a_mag = a_val < DataType(0) ? -a_val : a_val;
+    if (diag <= singular_pivot_threshold<DataType>() * a_mag) {
+      ok = false;
+      l.values[l_jj] = DataType(0);
+      return;
     }
+    l.values[l_jj] = std::sqrt(diag);
+  }
+
+  /// Sub-diagonal entry (I,J): L[I][J] = (A[I][J] - sum_{m<J} L[I][m]*L[J][m]) / L[J][J].
+  template<typename L, Int J, std::size_t IOff>
+  SPARSEMAT_HD static void subdiag_step(const SparseMat& a, L& l, bool& ok) {
+    constexpr Int I = J + 1 + static_cast<Int>(IOff);
+    constexpr auto l_ij = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, J);
+    if constexpr (l_ij >= 0) {
+      DataType sum = inner_sum<L, I, J>(l);
+      constexpr auto a_ij = MU::getSparseIndex(I, J);
+      DataType a_val = (a_ij >= 0) ? a.values[a_ij] : DataType(0);
+      constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+      if (l.values[l_jj] == DataType(0)) {
+        ok = false;
+        l.values[l_ij] = DataType(0);
+        return;
+      }
+      l.values[l_ij] = (a_val - sum) / l.values[l_jj];
+    }
+  }
+  // Fills all sub-diagonal rows I in [J+1, N) via a comma fold. Row order
+  // doesn't matter here (each I writes an independent L cell) — only the
+  // diagonal-before-subdiagonal ordering above is load-bearing.
+  template<typename L, Int J, std::size_t... IOffs>
+  SPARSEMAT_HD static void compute_subdiag(const SparseMat& a,
+                                           L& l,
+                                           bool& ok,
+                                           std::index_sequence<IOffs...> /*seq*/) {
+    (subdiag_step<L, J, IOffs>(a, l, ok), ...);
+  }
+
+  /// Fills column J of L: diagonal first, then sub-diagonal rows.
+  template<typename L, Int J>
+  SPARSEMAT_HD static void compute_column(const SparseMat& a, L& l, bool& ok) {
+    diag_step<L, J>(a, l, ok);
+    compute_subdiag<L, J>(a,
+                          l,
+                          ok,
+                          std::make_index_sequence<static_cast<std::size_t>(N - J - 1)>{});
+  }
+
+  // Comma fold over columns J=0..N-1, in order: the comma operator inside a
+  // fold expression is the built-in sequencing comma (left fully sequenced
+  // before right), which is what makes it safe to replace the original
+  // sequential recursion here — column J+1's inner_sum reads L values
+  // written by column J (and earlier), so column order is load-bearing.
+  template<typename L, std::size_t... Js>
+  SPARSEMAT_HD static void outer_loop_fold(const SparseMat& a,
+                                           L& l,
+                                           bool& ok,
+                                           std::index_sequence<Js...> /*seq*/) {
+    (compute_column<L, static_cast<Int>(Js)>(a, l, ok), ...);
+  }
+  template<typename L>
+  SPARSEMAT_HD static void outer_loop(const SparseMat& a, L& l, bool& ok) {
+    outer_loop_fold<L>(a, l, ok, std::make_index_sequence<static_cast<std::size_t>(N)>{});
   }
 
  public:
@@ -1425,32 +2189,221 @@ SPARSEMAT_HD auto cholesky_solve(const SparseMat& A, const RHS& b) {
   return Result(std::move(x.value()), x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
 }
 
-template<SparseMatrixType SparseMat>
-struct Cholesky {
-  using LType = decltype(cholesky_factorize(std::declval<SparseMat>()).value());
-  Result<LType> factor;
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/compare.h ----
 
-  SPARSEMAT_HD Cholesky(const SparseMat& a) : factor(cholesky_factorize(a)) {}
 
-  [[nodiscard]] SPARSEMAT_HD bool ok() const { return factor.ok(); }
 
-  template<SparseMatrixType RHS>
-  SPARSEMAT_HD auto solve(const RHS& b) const {
-    if (!factor.ok()) {
-      using YType = decltype(detail::LowerTriangular<LType, RHS>::make_result());
-      return Result(YType{}, SolveStatus::SingularMatrix);
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for comparing two sparse matrices.
+ *
+ * Comparison is *mathematical*, not structural: two matrices are equal when
+ * every element of one equals the corresponding element of the other,
+ * regardless of whether the two sparsity patterns agree. A diagonal matrix
+ * and a full matrix holding the same numbers therefore compare equal, which
+ * is what makes @c == usable on operation results (whose patterns are derived,
+ * and often wider than the values actually warrant — @c add() unions both
+ * operands' patterns, so @c a.add(b) can carry an explicitly-stored 0.0 where
+ * a hand-written literal would carry a structural zero).
+ *
+ * Only positions stored in one matrix or the other are visited: positions
+ * structurally zero in both are 0 == 0 and need no check. That keeps the work
+ * at O(nnzA + nnzB) rather than O(rows*cols).
+ *
+ * @tparam A Left-hand matrix type.
+ * @tparam B Right-hand matrix type; must have the same shape as @c A.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+class Compare {
+ public:
+  static_assert(A::rows == B::rows && A::cols == B::cols,
+                "Incompatible matrix dimensions for comparison.");
+  static_assert(SparseLinearAlgebra::SameDataType<A, B>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  using DataType = typename A::DataType;
+  using Int = typename A::Int;
+
+  // Held as functions rather than `static constexpr` data members, and copied
+  // into locals at each use. These lookups happen at *runtime*, so static
+  // members would be ODR-used and would need device storage they do not get,
+  // giving "identifier ... is undefined in device code" under nvcc. Same
+  // reasoning as SparseMat::indices().
+  //
+  // Comparison is pure value reading — there is no structurally-zero term to
+  // eliminate at compile time — so the loops below are ordinary runtime loops
+  // with O(1) lookups rather than folds. A fold would cost one instantiation
+  // per stored value and cap out at clang's 256-term nesting limit, which a
+  // densified 32x32 operand (1024 values) exceeds immediately.
+  SPARSEMAT_HD constexpr static auto a_offsets() {
+    return SparseLinearAlgebra::MatrixUtilities<A>::storage_index_grid();
+  }
+  SPARSEMAT_HD constexpr static auto b_offsets() {
+    return SparseLinearAlgebra::MatrixUtilities<B>::storage_index_grid();
+  }
+
+  SPARSEMAT_HD static bool equal(const A& a, const B& b, DataType tolerance) {
+    constexpr auto a_inds = A::indices();
+    constexpr auto b_inds = B::indices();
+    constexpr auto a_grid = a_offsets();
+    constexpr auto b_grid = b_offsets();
+
+    // Every position stored by A must match B there (B contributing 0 when it
+    // does not store that position).
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (A::nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(A::nonZeroCount); ++i) {
+        const auto b_offset = b_grid[static_cast<std::size_t>(a_inds[i])];
+        const DataType b_value =
+            (b_offset >= 0) ? b.values[static_cast<std::size_t>(b_offset)] : DataType(0);
+        const DataType diff = a.values[i] - b_value;
+        if ((diff < DataType(0) ? -diff : diff) > tolerance) {
+          return false;
+        }
+      }
     }
 
-    const auto& lower = factor.value();
-    auto y = forward_solve(lower, b);
-    if (!y.ok()) {
-      return Result(std::move(y.value()), SolveStatus::SingularMatrix);
+    // And the mirror direction, to catch positions B stores that A does not.
+    // Positions stored by both get checked twice, which is harmless and
+    // cheaper than computing the union of the two patterns to deduplicate.
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (B::nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(B::nonZeroCount); ++i) {
+        const auto a_offset = a_grid[static_cast<std::size_t>(b_inds[i])];
+        const DataType a_value =
+            (a_offset >= 0) ? a.values[static_cast<std::size_t>(a_offset)] : DataType(0);
+        const DataType diff = a_value - b.values[i];
+        if ((diff < DataType(0) ? -diff : diff) > tolerance) {
+          return false;
+        }
+      }
     }
-    auto x = backward_solve(lower.transpose(), y.value());
-    return Result(std::move(x.value()),
-                  x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
-  };
+    return true;
+  }
 };
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Exact element-wise equality of two sparse matrices.
+ *
+ * Compares mathematical values, not sparsity patterns: a matrix that stores a
+ * numeric zero equals one where that position is structurally zero. Both
+ * operands must have the same dimensions and the same @c DataType.
+ *
+ * This is an exact floating-point comparison; use @c approx_equal() with an
+ * explicit tolerance for anything that has been through a factorization or a
+ * long chain of arithmetic.
+ *
+ * @tparam A Left-hand matrix type.
+ * @tparam B Right-hand matrix type.
+ * @return   @c true if every element of @p a equals the corresponding element of @p b.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+[[nodiscard]] SPARSEMAT_HD bool operator==(const A& a, const B& b) {
+  return detail::Compare<A, B>::equal(a, b, typename A::DataType(0));
+}
+
+/// Negation of @c operator==. (C++20 synthesizes this, but spelling it out
+/// keeps the intent obvious and costs nothing.)
+template<SparseMatrixType A, SparseMatrixType B>
+[[nodiscard]] SPARSEMAT_HD bool operator!=(const A& a, const B& b) {
+  return !(a == b);
+}
+
+/**
+ * @brief Element-wise equality within @p tolerance.
+ *
+ * Same value-not-pattern semantics as @c operator==, but every element
+ * comparison allows an absolute difference of up to @p tolerance. This is the
+ * form to use on anything that has been through a solve or factorization.
+ *
+ * @param a         Left-hand operand.
+ * @param b         Right-hand operand.
+ * @param tolerance Maximum absolute difference allowed per element.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+[[nodiscard]] SPARSEMAT_HD bool approx_equal(const A& a,
+                                             const B& b,
+                                             typename A::DataType tolerance = 1e-6) {
+  return detail::Compare<A, B>::equal(a, b, tolerance);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/convert.h ----
+
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for changing a matrix's scalar type.
+ *
+ * The sparsity pattern is carried over unchanged — converting the scalar type
+ * cannot create or destroy structural non-zeros — so this is a straight
+ * element-wise @c static_cast over the stored values, with no sparsity
+ * computation to do at all.
+ *
+ * @tparam NewDType  Target scalar type.
+ * @tparam SparseMat Source matrix type.
+ */
+template<typename NewDType, SparseMatrixType SparseMat>
+class Convert {
+ public:
+  using ResultType = typename SparseMat::template RebindData<NewDType>;
+
+  template<std::size_t... Is>
+  SPARSEMAT_HD static auto convert(const SparseMat& a, std::index_sequence<Is...> /*seq*/) {
+    return ResultType(std::array<NewDType, sizeof...(Is)>{static_cast<NewDType>(a.values[Is])...});
+  }
+
+  SPARSEMAT_HD static auto convert(const SparseMat& a) {
+    return convert(a,
+                   std::make_index_sequence<static_cast<std::size_t>(SparseMat::nonZeroCount)>{});
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Returns a copy of @p a with its scalar type changed to @p NewDType.
+ *
+ * Binary operations in this library reject mixed scalar types outright (see
+ * the @c SameDataType concept) rather than silently promoting or truncating
+ * one operand. This is the explicit opt-in: convert first, then operate.
+ *
+ * @code
+ * SparseMat<float, int, 3, 3, 0, 4, 8>  f(1, 2, 3);
+ * SparseMat<double, int, 3, 3, 0, 4, 8> d(1, 2, 3);
+ * // auto bad = f.add(d);                  // static_assert: mixed DataType
+ * auto good = SparseLinearAlgebra::convert<double>(f).add(d);
+ * @endcode
+ *
+ * Each stored value is @c static_cast individually, so narrowing conversions
+ * (@c double to @c float) round exactly as a plain cast would; the sparsity
+ * pattern, dimensions, and index type are all preserved.
+ *
+ * @tparam NewDType Target scalar element type.
+ * @tparam A        Source matrix type.
+ * @param  a        Matrix to convert.
+ * @return          The same matrix with @c DataType == @p NewDType.
+ */
+template<typename NewDType, SparseMatrixType A>
+SPARSEMAT_HD auto convert(const A& a) {
+  static_assert(MatrixDataType<NewDType>,
+                "convert<T>() target must be a floating point scalar type.");
+  return detail::Convert<NewDType, A>::convert(a);
+}
 
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/dense.h ----
@@ -1478,7 +2431,7 @@ class Dense {
   static constexpr auto num_zeros = 0;
   static constexpr auto total_elements = rows * cols;
 
-  /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
+  /// Every position of a dense result is stored, so this is unconditionally true.
   SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int /*unused*/, Int /*unused*/) {
     return true;
   }
@@ -1493,27 +2446,34 @@ class Dense {
     return SparseLinearAlgebra::OperationUtilities<Dense>::calculate_sparsity();
   }
 
-  template<typename Result, Int index = 0>
-  SPARSEMAT_HD static auto dense(const SparseMat& a, Result& r) {
-    if constexpr (index < total_elements) {
-      constexpr auto flat =
-          SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(index / cols,
-                                                                          index % cols);
-      if constexpr (flat >= 0) {
-        r.values[index] = a.values[flat];
-      } else {
-        r.values[index] = static_cast<DataType>(0);
-      }
-      dense<Result, index + 1>(a, r);
-    }
-  }
-
+  /**
+   * @brief Scatters @p a's stored values into a fully-dense result.
+   *
+   * A plain runtime loop rather than a compile-time fold or recursion, because
+   * densifying is pure data movement: every stored value is copied to the slot
+   * its flat index names, and there is no structurally-zero term to eliminate
+   * at compile time. Unrolling therefore buys nothing here while costing one
+   * instantiation per element — and imposing a hard size ceiling on top
+   * (linear recursion blew the 900-deep instantiation budget at 32x32; a fold
+   * over the same 1024 values exceeds clang's 256-argument nesting limit).
+   *
+   * The result's storage index equals its flat row-major index, since its
+   * sparsity array is 0, 1, ..., rows*cols-1 in order. It is value-initialized,
+   * so positions this loop never touches are already zero.
+   */
   SPARSEMAT_HD static auto dense(const SparseMat& a) {
     constexpr auto sparsity = calculate_sparsity();
     auto result =
         SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    dense(a, result);
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    constexpr auto inds = SparseMat::indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (SparseMat::nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(SparseMat::nonZeroCount); ++i) {
+        result.values[static_cast<std::size_t>(inds[i])] = a.values[i];
+      }
+    }
     return result;
   }
 };
@@ -1524,6 +2484,229 @@ namespace SparseLinearAlgebra {
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD auto dense(const SparseMat& a) {
   return detail::Dense<SparseMat>::dense(a);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/fuse.h ----
+
+#include <tuple>
+
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Which result positions a fused element-wise operation stores.
+ *
+ * The result pattern cannot be inferred from an arbitrary callable, so it is
+ * chosen explicitly. @c Union is the safe default: it stores every position
+ * that is non-zero in *any* operand, which is a correct superset for any
+ * function satisfying @c f(0, 0, ..., 0) == 0 — true of every arithmetic
+ * combination worth fusing.
+ */
+enum class FusePattern : std::uint8_t {
+  /// Store a position if any operand stores it. Correct for any f with
+  /// f(0,...,0) == 0; the pattern of a sum, difference, or scaled combination.
+  Union,
+  /// Store a position only if *every* operand stores it. The pattern of a
+  /// product: if any factor is structurally zero the result is too. Tighter
+  /// than @c Union, but wrong for anything sum-like, so it is opt-in.
+  Intersection,
+};
+
+}  // namespace SparseLinearAlgebra
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for a fused element-wise operation over N
+ *        operands.
+ *
+ * Applies a caller-supplied function to the corresponding elements of every
+ * operand in a single traversal, writing straight into the result — so a
+ * combination like @c 2*A + 3*B - C materializes one matrix instead of three.
+ *
+ * This generalizes the fusions the library already hand-rolls one case at a
+ * time: @c add(a, b, alpha, beta) folds scaling into the addition traversal,
+ * @c hadamard(a, b, multiplier) does the same for the product, and @c axpy
+ * avoids materializing @c A*x. Each exists to skip an intermediate; this is
+ * the same idea with the combining function left to the caller.
+ *
+ * **Element-wise only.** Every operand is read at the *same* (row, col) as the
+ * result. That restriction is what makes fusion unconditionally profitable
+ * here: each operand element is touched exactly once per result element, so
+ * there is nothing to recompute. Fusing across a matrix product would not be —
+ * there each result element reads a whole row and column, so a lazily-evaluated
+ * operand would be recomputed O(n) times per result element. (Note that
+ * @c axpy fuses the scaling and addition *around* its product while leaving
+ * @c A and @c x as stored matrices, which is exactly this boundary.)
+ *
+ * @tparam Pattern Which positions the result stores.
+ * @tparam Fn      Callable taking one @c DataType per operand.
+ * @tparam Mats    Operand matrix types; all must share shape and @c DataType.
+ */
+template<FusePattern Pattern, typename Fn, SparseMatrixType... Mats>
+class Fuse {
+  using First = std::tuple_element_t<0, std::tuple<Mats...>>;
+
+ public:
+  static_assert(sizeof...(Mats) > 0, "fuse requires at least one operand.");
+  static_assert(((Mats::rows == First::rows) && ...) && ((Mats::cols == First::cols) && ...),
+                "Incompatible matrix dimensions for a fused element-wise operation: every "
+                "operand must have the same shape.");
+  static_assert((SparseLinearAlgebra::SameDataType<Mats, First> && ...),
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  using DataType = typename First::DataType;
+  using Int = typename First::Int;
+  static constexpr auto rows = First::rows;
+  static constexpr auto cols = First::cols;
+
+  /// Storage offsets for every operand, memoized once per instantiation.
+  /// See MatrixUtilities::storage_index_grid(): this answers "where is
+  /// (row, col) stored?" in O(1), rather than re-scanning indices() per lookup.
+  template<typename M>
+  static constexpr auto grid_for = SparseLinearAlgebra::MatrixUtilities<M>::storage_index_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    const auto flat = static_cast<std::size_t>((row * cols) + col);
+    if constexpr (Pattern == FusePattern::Intersection) {
+      return ((grid_for<Mats>[flat] >= 0) && ...);
+    } else {
+      return ((grid_for<Mats>[flat] >= 0) || ...);
+    }
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Fuse>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Fuse>::calculate_sparsity();
+  }
+
+  /// Reads one operand at the position held by result slot @p Idx, yielding a
+  /// structural zero without touching storage when it is not stored there.
+  template<typename Result, std::size_t Idx, typename M>
+  SPARSEMAT_HD static DataType operand_at(const M& m) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr auto offset = grid_for<M>[static_cast<std::size_t>(flat)];
+    if constexpr (offset >= 0) {
+      return m.values[static_cast<std::size_t>(offset)];
+    } else {
+      return DataType(0);
+    }
+  }
+
+  /// Fills result slot @p Idx with @c fn applied to every operand's element
+  /// at that position.
+  template<typename Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const Fn& fn, const Mats&... mats) {
+    r.values[Idx] = fn(operand_at<Result, Idx, Mats>(mats)...);
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const Fn& fn,
+                                      const Mats&... mats,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, fn, mats...), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const Fn& fn, const Mats&... mats) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, fn, mats..., std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, fn, mats...);
+      fill_range<Result, Begin + half, Count - half>(r, fn, mats...);
+    }
+  }
+
+  /// Constructs the result SparseMat and fills it in a single pass.
+  SPARSEMAT_HD static auto fuse(const Fn& fn, const Mats&... mats) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result = SparseLinearAlgebra::MatrixUtilities<First>::template make<rows, cols, sparsity>(
+        std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, fn, mats...);
+    return result;
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Applies @p fn element-wise across several matrices in a single pass.
+ *
+ * Each stored position of the result is computed as
+ * @c fn(a(i,j), b(i,j), ...), reading every operand once, so a combination
+ * that would otherwise materialize an intermediate per operator materializes
+ * only the final result:
+ *
+ * @code
+ * // Three temporaries: A*2, B*3, and the sum.
+ * auto eager = a.scale(2.0).add(b.scale(3.0)).subtract(c);
+ *
+ * // None.
+ * auto fused = SparseLinearAlgebra::fuse(
+ *     [](double x, double y, double z) { return (2 * x) + (3 * y) - z; }, a, b, c);
+ * @endcode
+ *
+ * All operands must have the same shape and the same @c DataType. Operands
+ * that are structurally zero at a position contribute @c DataType(0) there,
+ * so @p fn always receives one value per operand.
+ *
+ * **Evaluation is complete when this returns.** Nothing lazy escapes: there is
+ * no expression object holding references to the operands, so the usual
+ * expression-template hazard — an expression captured with @c auto outliving
+ * the matrices it refers to — cannot arise.
+ *
+ * **Element-wise only.** Every operand is read at the same (row, col) as the
+ * result, so this cannot express a matrix product; use @c multiply for that.
+ * The restriction is what makes fusing unconditionally worthwhile here — see
+ * the note on @c detail::Fuse.
+ *
+ * @note **Result pattern.** By default the result stores the union of the
+ * operands' patterns, which is correct for any @p fn with
+ * @c fn(0, ..., 0) == 0 but not always minimal: a position stored by only one
+ * operand is stored in the result even if @p fn maps it to zero. Pass
+ * @c FusePattern::Intersection for product-like functions, where a
+ * structurally zero operand forces a zero result:
+ * @code
+ * auto weighted = SparseLinearAlgebra::fuse<SparseLinearAlgebra::FusePattern::Intersection>(
+ *     [](double x, double y) { return x * y * 0.5; }, a, b);
+ * @endcode
+ *
+ * @note **Device use.** @p fn is called from wherever @c fuse is called, so on
+ * the GPU it must be callable from device code. A function object with a
+ * @c SPARSEMAT_HD @c operator() works everywhere; so does a lambda written
+ * inside a kernel. A lambda defined in host code and passed to a kernel needs
+ * nvcc's @c --extended-lambda, which this library does not require of its
+ * consumers.
+ *
+ * @tparam Pattern Which positions the result stores (default @c Union).
+ * @tparam Fn      Callable taking one @c DataType per operand.
+ * @tparam Mats    Operand matrix types; all must share shape and @c DataType.
+ * @param  fn      Combining function.
+ * @param  mats    Operands, in the order @p fn expects them.
+ * @return         Result matrix, fully evaluated.
+ */
+template<FusePattern Pattern = FusePattern::Union, typename Fn, SparseMatrixType... Mats>
+SPARSEMAT_HD auto fuse(const Fn& fn, const Mats&... mats) {
+  return detail::Fuse<Pattern, Fn, Mats...>::fuse(fn, mats...);
 }
 
 }  // namespace SparseLinearAlgebra
@@ -1548,16 +2731,23 @@ class Hadamard {
  public:
   static_assert(SparseMat::rows == SparseMat1::rows && SparseMat::cols == SparseMat1::cols,
                 "Incompatible matrix dimensions for Hadamard operation.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, SparseMat1>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
 
   using DataType = typename SparseMat::DataType;
   using Int = typename SparseMat::Int;
   static constexpr auto rows = SparseMat::rows;
-  static constexpr auto cols = SparseMat1::cols;
+  static constexpr auto cols = SparseMat::cols;
+
+  // Precomputed once — see Add::a_grid/b_grid for why (identical reasoning).
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::to_dense_bool();
 
   /// Returns true only when (row, col) is non-zero in both input matrices.
   SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
-    return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, col) &&
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(row, col));
+    return a_grid[row][col] && b_grid[row][col];
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
@@ -1570,41 +2760,67 @@ class Hadamard {
     return SparseLinearAlgebra::OperationUtilities<Hadamard>::calculate_sparsity();
   }
 
-  /// Recursively fills result positions with a[I,J] * b[I,J] * multiplier.
-  template<SparseMatrixType Result, Int I, Int J>
-  SPARSEMAT_HD static void recursive_hadamard(Result& r,
-                                              const SparseMat& a,
-                                              const SparseMat1& b,
-                                              const DataType multiplier) {
-    if constexpr (I >= SparseMat::rows) {
+  /// Fills result storage slot @p Idx (flat row-major index
+  /// @c Result::indices()[Idx]) with a[I,J] * b[I,J] * multiplier. Iterating
+  /// the result's own sparsity array (rather than the full rows*cols grid)
+  /// keeps instantiation count and compile-time work proportional to the
+  /// result's non-zero count instead of its dimensions.
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r,
+                                     const SparseMat& a,
+                                     const SparseMat1& b,
+                                     const DataType multiplier) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    constexpr auto a_index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+    constexpr auto b_index = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
+    static_assert(a_index >= 0 && b_index >= 0, "Invalid sparse indices for Hadamard operation.");
+    r.values[Idx] = a.values[a_index] * b.values[b_index] * multiplier;
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      const DataType multiplier,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b, multiplier), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      const DataType multiplier) {
+    if constexpr (Count == 0) {
       return;
-    } else if constexpr (J >= SparseMat1::cols) {
-      return recursive_hadamard<Result, I + 1, 0>(r, a, b, multiplier);
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, multiplier, std::make_index_sequence<Count>{});
     } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-        constexpr auto b_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
-        static_assert(a_index >= 0 && b_index >= 0,
-                      "Invalid sparse indices for Hadamard operation.");
-        r.values[sparse_index] = a.values[a_index] * b.values[b_index] * multiplier;
-      }
-      recursive_hadamard<Result, I, J + 1>(r, a, b, multiplier);
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b, multiplier);
+      fill_range<Result, Begin + half, Count - half>(r, a, b, multiplier);
     }
   }
 
-  /// Constructs the result SparseMat and fills it via recursive_hadamard.
+  /// Constructs the result SparseMat and fills it via fill_all.
   SPARSEMAT_HD static auto hadamard(const SparseMat& a,
                                     const SparseMat1& b,
                                     const DataType multiplier) {
     constexpr auto sparsity = calculate_sparsity();
     auto result =
         SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    recursive_hadamard<decltype(result), 0, 0>(result, a, b, multiplier);
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result,
+                                                                              a,
+                                                                              b,
+                                                                              multiplier);
     return result;
   }
 };
@@ -1651,108 +2867,9 @@ SPARSEMAT_HD auto hadamard(const A& a, const B& b, const DataType multiplier) {
 }
 
 }  // namespace SparseLinearAlgebra
-// ---- sparsemat/operations/kronecker.h ----
+// ---- sparsemat/operations/invert.h ----
 
 
-namespace SparseLinearAlgebra::detail {
-
-/**
- * @brief Implementation policy for the Kronecker (tensor) product.
- *
- * The result is an (A.rows*B.rows) × (A.cols*B.cols) matrix where each
- * element of A is replaced by a scaled copy of B.  Result position (i,j) is
- * non-zero iff A[i/B.rows, j/B.cols] and B[i%B.rows, j%B.cols] are both
- * non-zero.
- *
- * @tparam SparseMat  Left-hand matrix type.
- * @tparam SparseMat1 Right-hand matrix type.
- */
-template<SparseMatrixType SparseMat, SparseMatrixType SparseMat1>
-class Kronecker {
- public:
-  using DataType = typename SparseMat::DataType;
-  using Int = typename SparseMat::Int;
-  static constexpr auto rows = SparseMat::rows * SparseMat1::rows;
-  static constexpr auto cols = SparseMat::cols * SparseMat1::cols;
-
-  /// Returns true when (row, col) in the result is non-zero.
-  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
-    return SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(row / SparseMat1::rows,
-                                                                      col / SparseMat1::cols) &&
-           SparseLinearAlgebra::MatrixUtilities<SparseMat1>::isNonZero(row % SparseMat1::rows,
-                                                                       col % SparseMat1::cols);
-  }
-
-  /// Delegates to OperationUtilities to count result non-zeros.
-  SPARSEMAT_HD constexpr static auto num_nonzeros() {
-    return SparseLinearAlgebra::OperationUtilities<Kronecker>::num_nonzeros();
-  }
-
-  /// Delegates to OperationUtilities to compute result sparsity indices.
-  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
-    return SparseLinearAlgebra::OperationUtilities<Kronecker>::calculate_sparsity();
-  }
-
-  /// Recursively fills result positions with a[I/B.rows, J/B.cols] * b[I%B.rows, J%B.cols].
-  template<SparseMatrixType Result, Int I, Int J>
-  SPARSEMAT_HD static void recursive_kronecker(Result& r, const SparseMat& a, const SparseMat1& b) {
-    if constexpr (I >= SparseMat::rows * SparseMat1::rows) {
-      return;
-    } else if constexpr (J >= SparseMat::cols * SparseMat1::cols) {
-      return recursive_kronecker<Result, I + 1, 0>(r, a, b);
-    } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I / SparseMat1::rows,
-                                                                            J / SparseMat1::cols);
-        constexpr auto b_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I % SparseMat1::rows,
-                                                                             J % SparseMat1::cols);
-        static_assert(a_index >= 0 && b_index >= 0,
-                      "Invalid sparse indices for Kronecker operation.");
-        r.values[sparse_index] = a.values[a_index] * b.values[b_index];
-      }
-      recursive_kronecker<Result, I, J + 1>(r, a, b);
-    }
-  }
-
-  /// Constructs the result SparseMat and fills it via recursive_kronecker.
-  SPARSEMAT_HD static auto kronecker(const SparseMat& a, const SparseMat1& b) {
-    constexpr auto sparsity = calculate_sparsity();
-    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<
-        SparseMat::rows * SparseMat1::rows,
-        SparseMat::cols * SparseMat1::cols,
-        sparsity>(std::make_index_sequence<num_nonzeros()>{});
-    recursive_kronecker<decltype(result), 0, 0>(result, a, b);
-    return result;
-  }
-};
-
-}  // namespace SparseLinearAlgebra::detail
-
-namespace SparseLinearAlgebra {
-
-/**
- * @brief Kronecker (tensor) product of two sparse matrices: @p a ⊗ @p b.
- *
- * Produces an (a.rows*b.rows) × (a.cols*b.cols) matrix where each non-zero
- * element of @p a is replaced by a scaled copy of @p b.  Result sparsity is
- * computed at compile time as the outer product of both sparsity patterns.
- *
- * @tparam A Left-hand matrix type.
- * @tparam B Right-hand matrix type.
- * @param  a Left-hand operand.
- * @param  b Right-hand operand.
- * @return   Kronecker product matrix.
- */
-template<SparseMatrixType A, SparseMatrixType B>
-SPARSEMAT_HD auto kronecker(const A& a, const B& b) {
-  return detail::Kronecker<A, B>::kronecker(a, b);
-}
-
-}  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/lu.h ----
 
 
@@ -1851,7 +2968,7 @@ class LMatrix {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -1879,7 +2996,7 @@ class UMatrix {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -1905,87 +3022,162 @@ class LUFactorization {
   using Int = typename SparseMat::Int;
   using MU = SparseLinearAlgebra::MatrixUtilities<SparseMat>;
 
-  template<typename L, typename U, Int I, Int Bound, Int Col, Int M = 0>
-  SPARSEMAT_HD static auto inner_loop_inner(const SparseMat& a, L& l, U& u) {
-    if constexpr (M < Bound) {
-      constexpr auto lim = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, M);
-      constexpr auto umk = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(M, Col);
-      DataType sum = DataType(0);
-      if constexpr (lim >= 0 && umk >= 0) {
-        sum += l.values[lim] * u.values[umk];
-      }
-      return sum + inner_loop_inner<L, U, I, Bound, Col, M + 1>(a, l, u);
+  // Single term of sum(L[I][m]*U[m][Col], m < Bound).
+  template<typename L, typename U, Int I, Int Col, std::size_t M>
+  SPARSEMAT_HD static DataType inner_sum_term(const L& l, const U& u) {
+    constexpr auto lim =
+        SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, static_cast<Int>(M));
+    constexpr auto umk =
+        SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(static_cast<Int>(M), Col);
+    if constexpr (lim >= 0 && umk >= 0) {
+      return l.values[lim] * u.values[umk];
     } else {
       return DataType(0);
     }
   }
 
-  template<typename L, typename U, Int K, Int J = K>
-  SPARSEMAT_HD static void inner_loop_1(const SparseMat& a, L& l, U& u) {
-    if constexpr (J < N) {
-      constexpr auto u_idx = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(K, J);
-      if constexpr (u_idx >= 0) {
-        DataType sum = inner_loop_inner<L, U, K, K, J, 0>(a, l, u);
-        constexpr auto a_idx = MU::getSparseIndex(K, J);
-        if constexpr (a_idx >= 0) {
-          u.values[u_idx] = a.values[a_idx] - sum;
-        } else {
-          u.values[u_idx] = -sum;
-        }
-      }
-      inner_loop_1<L, U, K, J + 1>(a, l, u);
+  // Fold over m in [0, Bound) computing sum(L[I][m]*U[m][Col]). Bound is
+  // passed as the pack size directly (an exact bound, unlike the
+  // over-generate-and-filter approach used elsewhere in this codebase) since
+  // it's always available as a compile-time constant at every call site
+  // below.
+  template<typename L, typename U, Int I, Int Col, std::size_t... Ms>
+  SPARSEMAT_HD static DataType inner_loop_inner_fold(const L& l,
+                                                     const U& u,
+                                                     std::index_sequence<Ms...> /*seq*/) {
+    return (inner_sum_term<L, U, I, Col, Ms>(l, u) + ...);
+  }
+  template<typename L, typename U, Int I, Int Bound, Int Col>
+  SPARSEMAT_HD static auto inner_loop_inner(const SparseMat& /*a*/, L& l, U& u) {
+    // (pack + ...) is ill-formed for an empty pack (unlike &&/||, + has no
+    // built-in empty-fold identity in C++17), so Bound==0 — the first
+    // column/row, with nothing yet to sum — needs an explicit early-out.
+    if constexpr (Bound == 0) {
+      return DataType(0);
+    } else {
+      return inner_loop_inner_fold<L, U, I, Col>(
+          l, u, std::make_index_sequence<static_cast<std::size_t>(Bound)>{});
     }
   }
 
-  template<typename L, typename U, Int K, Int I = K + 1>
-  SPARSEMAT_HD static void inner_loop_2(const SparseMat& a, L& l, U& u, DataType pivot) {
-    if constexpr (I < N) {
-      constexpr auto l_idx = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, K);
-      if constexpr (l_idx >= 0) {
-        if (pivot == DataType(0)) {
-          l.values[l_idx] = DataType(0);
-          inner_loop_2<L, U, K, I + 1>(a, l, u, pivot);
-          return;
-        }
-        DataType sum = inner_loop_inner<L, U, I, K, K, 0>(a, l, u);
-        constexpr auto a_idx = MU::getSparseIndex(I, K);
-        if constexpr (a_idx < 0) {
-          l.values[l_idx] = -sum / pivot;
-        } else {
-          l.values[l_idx] = (a.values[a_idx] - sum) / pivot;
-        }
+  // Single column step for U's row K: U[K][J] = A[K][J] - sum(L[K][m]*U[m][J], m<K).
+  template<typename L, typename U, Int K, std::size_t JOff>
+  SPARSEMAT_HD static void u_col_step(const SparseMat& a, L& l, U& u) {
+    constexpr Int J = K + static_cast<Int>(JOff);
+    constexpr auto u_idx = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(K, J);
+    if constexpr (u_idx >= 0) {
+      DataType sum = inner_loop_inner<L, U, K, K, J>(a, l, u);
+      constexpr auto a_idx = MU::getSparseIndex(K, J);
+      if constexpr (a_idx >= 0) {
+        u.values[u_idx] = a.values[a_idx] - sum;
+      } else {
+        u.values[u_idx] = -sum;
       }
-      inner_loop_2<L, U, K, I + 1>(a, l, u, pivot);
     }
   }
+  // Fills U's entire row K via a fold over J in [K, N). Column order doesn't
+  // matter here (each J writes an independent U cell), but a comma fold is
+  // used for consistency with the K-sequential fold in outer_loop_over_rows.
+  template<typename L, typename U, Int K, std::size_t... JOffs>
+  SPARSEMAT_HD static void inner_loop_1(const SparseMat& a,
+                                        L& l,
+                                        U& u,
+                                        std::index_sequence<JOffs...> /*seq*/) {
+    (u_col_step<L, U, K, JOffs>(a, l, u), ...);
+  }
 
-  template<typename L, typename U, Int K>
-  SPARSEMAT_HD static void outer_loop_over_rows(const SparseMat& a, L& l, U& u, bool& ok) {
-    if constexpr (K < N) {
-      inner_loop_1<L, U, K>(a, l, u);
-
-      // Structurally zero pivot is a user error (caught elsewhere); a
-      // structurally-present but numerically zero pivot is a runtime
-      // singular-matrix condition reported back via `ok`.
-      constexpr auto u_kk = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(K, K);
-      DataType pivot = DataType(0);
-      if constexpr (u_kk >= 0) {
-        pivot = u.values[u_kk];
-      }
+  // Single row step for L's column K: L[I][K] = (A[I][K] - sum(L[I][m]*U[m][K], m<K)) / pivot.
+  template<typename L, typename U, Int K, std::size_t IOff>
+  SPARSEMAT_HD static void l_col_step(const SparseMat& a, L& l, U& u, DataType pivot) {
+    constexpr Int I = K + 1 + static_cast<Int>(IOff);
+    constexpr auto l_idx = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, K);
+    if constexpr (l_idx >= 0) {
       if (pivot == DataType(0)) {
-        ok = false;
+        l.values[l_idx] = DataType(0);
+        return;
       }
-
-      inner_loop_2<L, U, K>(a, l, u, pivot);
-      outer_loop_over_rows<L, U, K + 1>(a, l, u, ok);
+      DataType sum = inner_loop_inner<L, U, I, K, K>(a, l, u);
+      constexpr auto a_idx = MU::getSparseIndex(I, K);
+      if constexpr (a_idx < 0) {
+        l.values[l_idx] = -sum / pivot;
+      } else {
+        l.values[l_idx] = (a.values[a_idx] - sum) / pivot;
+      }
     }
+  }
+  // Fills L's entire column K via a fold over I in [K+1, N). Row order
+  // doesn't matter here (each I writes an independent L cell).
+  template<typename L, typename U, Int K, std::size_t... IOffs>
+  SPARSEMAT_HD static void inner_loop_2(const SparseMat& a,
+                                        L& l,
+                                        U& u,
+                                        [[maybe_unused]] DataType pivot,
+                                        std::index_sequence<IOffs...> /*seq*/) {
+    // pivot is unused when IOffs is empty (K == N-1, the last row has no
+    // sub-diagonal entries to fill).
+    (l_col_step<L, U, K, IOffs>(a, l, u, pivot), ...);
+  }
+
+  // Single pivot step K: fills U's row K, reads the pivot, then fills L's
+  // column K using it.
+  template<typename L, typename U, std::size_t K>
+  SPARSEMAT_HD static void outer_step(const SparseMat& a, L& l, U& u, bool& ok) {
+    inner_loop_1<L, U, static_cast<Int>(K)>(
+        a, l, u, std::make_index_sequence<static_cast<std::size_t>(N) - K>{});
+
+    // Structurally zero pivot is a user error (caught elsewhere); a
+    // structurally-present but numerically negligible pivot is a runtime
+    // singular-matrix condition reported back via `ok`.
+    //
+    // The test is a magnitude threshold rather than `== 0` because this
+    // factorization does no pivoting: without row swaps a merely *tiny*
+    // pivot is just as fatal as an exactly-zero one — it divides through and
+    // produces enormous, meaningless multipliers — but an exact-equality test
+    // waves it through with ok() == true. Scaling the threshold by the
+    // largest magnitude seen in U so far makes it a relative test, so it
+    // behaves the same for a matrix expressed in metres and one in
+    // micrometres.
+    constexpr auto u_kk =
+        SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(static_cast<Int>(K),
+                                                                static_cast<Int>(K));
+    DataType pivot = DataType(0);
+    if constexpr (u_kk >= 0) {
+      pivot = u.values[u_kk];
+    }
+    DataType scale = DataType(0);
+    for (const auto& v : u.values) {
+      const DataType mag = v < DataType(0) ? -v : v;
+      if (mag > scale) {
+        scale = mag;
+      }
+    }
+    const DataType pivot_mag = pivot < DataType(0) ? -pivot : pivot;
+    if (pivot_mag <= singular_pivot_threshold<DataType>() * scale) {
+      ok = false;
+    }
+
+    inner_loop_2<L, U, static_cast<Int>(K)>(
+        a, l, u, pivot, std::make_index_sequence<static_cast<std::size_t>(N) - K - 1>{});
+  }
+
+  // Comma fold over pivot steps K=0..N-1, in order: the comma operator
+  // inside a fold expression is the built-in sequencing comma (left fully
+  // sequenced before right), which is what makes it safe to replace the
+  // original sequential recursion here — step K+1's inner_loop_inner reads
+  // L/U values written by step K (and earlier), so step order is
+  // load-bearing.
+  template<typename L, typename U, std::size_t... Ks>
+  SPARSEMAT_HD static void outer_loop_over_rows(
+      const SparseMat& a, L& l, U& u, bool& ok, std::index_sequence<Ks...> /*seq*/) {
+    (outer_step<L, U, Ks>(a, l, u, ok), ...);
   }
 
  public:
-  template<typename L, typename U, Int K = 0>
+  template<typename L, typename U>
   SPARSEMAT_HD static void factorize(const SparseMat& a, L& l, U& u, bool& ok) {
     SparseLinearAlgebra::set_diagonal<L>(l, DataType(1));
-    outer_loop_over_rows<L, U, 0>(a, l, u, ok);
+    outer_loop_over_rows<L, U>(
+        a, l, u, ok, std::make_index_sequence<static_cast<std::size_t>(N)>{});
   }
 };
 
@@ -2072,6 +3264,287 @@ SPARSEMAT_HD auto lu_solve(const SparseMat& A, const RHS& b) {
 }
 
 }  // namespace SparseLinearAlgebra
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Builds the N x N identity as a right-hand side for an inverse solve.
+ *
+ * Kept separate from @c SparseMat::identity() because the result type has to be
+ * rebound from whichever matrix is being inverted, and because the inverse
+ * solves want it as an explicit block RHS.
+ */
+template<typename SparseMat, std::size_t... Is>
+SPARSEMAT_HD static auto make_identity_rhs(std::index_sequence<Is...> /*seq*/) {
+  using Int = typename SparseMat::Int;
+  constexpr Int n = SparseMat::rows;
+  typename SparseMat::template Rebind<n, n, (static_cast<Int>(Is) * (n + 1))...> result{};
+  result.values.fill(typename SparseMat::DataType(1));
+  return result;
+}
+
+template<typename SparseMat>
+SPARSEMAT_HD static auto identity_rhs() {
+  return make_identity_rhs<SparseMat>(
+      std::make_index_sequence<static_cast<std::size_t>(SparseMat::rows)>{});
+}
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Computes the determinant via the existing LU factorization.
+ *
+ * With Doolittle LU (unit diagonal on L) the determinant is just the product
+ * of U's diagonal. There is no sign to track because this factorization does
+ * no row swaps — the same reason it is only valid for pivot-free matrices in
+ * the first place.
+ *
+ * A structurally triangular matrix skips the factorization entirely and
+ * multiplies its own diagonal.
+ *
+ * @warning @c ok() is @c false when the factorization hit a negligible pivot.
+ * The accompanying value is then the product of whatever diagonal entries were
+ * computed, which is near zero but not otherwise meaningful — treat a failed
+ * result as "singular, determinant is numerically zero" rather than reading the
+ * number. A determinant of exactly 0 with @c ok() == @c true is possible too,
+ * for a matrix that is singular in a way elimination reached cleanly.
+ *
+ * @tparam SparseMat Square input matrix type.
+ * @param  a         Matrix whose determinant is wanted.
+ * @return           @c Result wrapping the determinant.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto determinant(const SparseMat& a) {
+  static_assert(SparseMat::rows == SparseMat::cols, "determinant requires a square matrix.");
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  constexpr Int n = SparseMat::rows;
+
+  // A triangular matrix is already factorized: its determinant is the product
+  // of its diagonal, so there is no reason to run elimination over it.
+  if constexpr (detail::Triangular<SparseMat>::structurally_lower ||
+                detail::Triangular<SparseMat>::structurally_upper) {
+    constexpr auto offsets = MatrixUtilities<SparseMat>::storage_index_grid();
+    DataType product = 1;
+    for (Int i = 0; i < n; ++i) {
+      const auto offset = offsets[static_cast<std::size_t>((i * n) + i)];
+      // A structurally zero diagonal entry means a zero pivot, hence a zero
+      // determinant — and it is an exact, trustworthy zero, so this is a
+      // success rather than a failure.
+      if (offset < 0) {
+        return Result<DataType>(DataType(0), SolveStatus::Success);
+      }
+      product *= a.values[static_cast<std::size_t>(offset)];
+    }
+    return Result<DataType>(product, SolveStatus::Success);
+  } else {
+    auto lu = lu_factorize(a);
+    const auto& u = lu.value().second;
+    using UType = typename std::remove_cvref_t<decltype(u)>;
+    constexpr auto u_offsets = MatrixUtilities<UType>::storage_index_grid();
+    DataType product = 1;
+    for (Int i = 0; i < n; ++i) {
+      const auto offset = u_offsets[static_cast<std::size_t>((i * n) + i)];
+      if (offset < 0) {
+        return Result<DataType>(DataType(0), SolveStatus::Success);
+      }
+      product *= u.values[static_cast<std::size_t>(offset)];
+    }
+    return Result<DataType>(product, lu.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
+  }
+}
+
+/**
+ * @brief Computes the matrix inverse by solving A * X = I.
+ *
+ * Reuses the existing block-RHS triangular solves: one LU factorization, then a
+ * forward and a back substitution against the identity as a multi-column
+ * right-hand side. That is the same work as N separate single-column solves but
+ * with the factorization paid for once.
+ *
+ * @note The inverse of a sparse matrix is generally *dense*, so the result type
+ * usually has far more stored values than the input — this is the one operation
+ * where compile-time sparsity works against you. Prefer @c solve() when you
+ * only need @c A⁻¹b for particular right-hand sides, which is most of the time;
+ * forming the inverse explicitly is both slower and less accurate.
+ *
+ * @warning No pivoting, exactly as for @c lu_solve(). Check @c ok().
+ *
+ * @tparam SparseMat Square input matrix type.
+ * @param  a         Matrix to invert.
+ * @return           @c Result wrapping @c A⁻¹.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto inverse(const SparseMat& a) {
+  static_assert(SparseMat::rows == SparseMat::cols, "inverse requires a square matrix.");
+  const auto rhs = detail::identity_rhs<SparseMat>();
+  return lu_solve(a, rhs);
+}
+
+/**
+ * @brief Computes the inverse of a symmetric positive definite matrix via
+ *        Cholesky.
+ *
+ * Half the factorization work of @c inverse(), and it will report a matrix that
+ * is not (numerically) positive definite rather than quietly producing a wrong
+ * answer — so prefer this whenever the matrix is known to be SPD.
+ *
+ * @note As with @c inverse(), the result is generally dense.
+ *
+ * @tparam SparseMat Square SPD input matrix type.
+ * @param  a         Matrix to invert.
+ * @return           @c Result wrapping @c A⁻¹; @c ok() is @c false if @p a is
+ *                   not numerically SPD.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto cholesky_inverse(const SparseMat& a) {
+  static_assert(SparseMat::rows == SparseMat::cols, "cholesky_inverse requires a square matrix.");
+  const auto rhs = detail::identity_rhs<SparseMat>();
+  return cholesky_solve(a, rhs);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/kronecker.h ----
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for the Kronecker (tensor) product.
+ *
+ * The result is an (A.rows*B.rows) × (A.cols*B.cols) matrix where each
+ * element of A is replaced by a scaled copy of B.  Result position (i,j) is
+ * non-zero iff A[i/B.rows, j/B.cols] and B[i%B.rows, j%B.cols] are both
+ * non-zero.
+ *
+ * @tparam SparseMat  Left-hand matrix type.
+ * @tparam SparseMat1 Right-hand matrix type.
+ */
+template<SparseMatrixType SparseMat, SparseMatrixType SparseMat1>
+class Kronecker {
+ public:
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, SparseMat1>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::rows * SparseMat1::rows;
+  static constexpr auto cols = SparseMat::cols * SparseMat1::cols;
+
+  // Precomputed once — see Add::a_grid/b_grid for why (identical reasoning).
+  // Kronecker's result grid is the PRODUCT of both operands' dimensions,
+  // making its O(rows*cols) sparsity-computation calls the most numerous of
+  // any operation in this library — so this matters here more than anywhere
+  // else.
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::to_dense_bool();
+
+  /// Returns true when (row, col) in the result is non-zero.
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return a_grid[row / SparseMat1::rows][col / SparseMat1::cols] &&
+           b_grid[row % SparseMat1::rows][col % SparseMat1::cols];
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Kronecker>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Kronecker>::calculate_sparsity();
+  }
+
+  /// Fills result storage slot @p Idx (flat row-major index
+  /// @c Result::indices()[Idx]) with a[I/B.rows, J/B.cols] * b[I%B.rows,
+  /// J%B.cols]. Kronecker's result grid grows as the PRODUCT of both
+  /// operands' dimensions, making it the fastest-growing operation in the
+  /// library — iterating the result's own sparsity array (rather than the
+  /// full result_rows*result_cols grid) is what keeps both instantiation
+  /// count and compile-time work proportional to the result's non-zero
+  /// count instead of that product.
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const SparseMat& a, const SparseMat1& b) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    constexpr auto a_index =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I / SparseMat1::rows,
+                                                                        J / SparseMat1::cols);
+    constexpr auto b_index =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I % SparseMat1::rows,
+                                                                         J % SparseMat1::cols);
+    static_assert(a_index >= 0 && b_index >= 0, "Invalid sparse indices for Kronecker operation.");
+    r.values[Idx] = a.values[a_index] * b.values[b_index];
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const SparseMat& a, const SparseMat1& b) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b);
+      fill_range<Result, Begin + half, Count - half>(r, a, b);
+    }
+  }
+
+  /// Constructs the result SparseMat and fills it via fill_all.
+  SPARSEMAT_HD static auto kronecker(const SparseMat& a, const SparseMat1& b) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<
+        SparseMat::rows * SparseMat1::rows,
+        SparseMat::cols * SparseMat1::cols,
+        sparsity>(std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a, b);
+    return result;
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Kronecker (tensor) product of two sparse matrices: @p a ⊗ @p b.
+ *
+ * Produces an (a.rows*b.rows) × (a.cols*b.cols) matrix where each non-zero
+ * element of @p a is replaced by a scaled copy of @p b.  Result sparsity is
+ * computed at compile time as the outer product of both sparsity patterns.
+ *
+ * @tparam A Left-hand matrix type.
+ * @tparam B Right-hand matrix type.
+ * @param  a Left-hand operand.
+ * @param  b Right-hand operand.
+ * @return   Kronecker product matrix.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto kronecker(const A& a, const B& b) {
+  return detail::Kronecker<A, B>::kronecker(a, b);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/least_squares.h ----
+
 // ---- sparsemat/operations/multiply.h ----
 
 
@@ -2093,21 +3566,66 @@ class Multiply {
  public:
   static_assert(SparseMat::cols == SparseMat1::rows,
                 "Incompatible matrix dimensions for multiplication.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, SparseMat1>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
 
   using DataType = typename SparseMat::DataType;
   using Int = typename SparseMat::Int;
   static constexpr auto rows = SparseMat::rows;
   static constexpr auto cols = SparseMat1::cols;
 
-  /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
-  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
-    for (Int i = 0; i < SparseMat::cols; i++) {
-      if (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, i) &&
-          SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(i, col)) {
-        return true;
+  // Precomputed once per (SparseMat, SparseMat1) instantiation — not per
+  // is_result_index_nonzero call. This one matters most of all the
+  // operations using this pattern: without it, every one of the O(rows*cols)
+  // calls OperationUtilities makes below does its own O(SparseMat::cols)
+  // loop, each iteration paying two O(nonZeroCount) linear scans — an
+  // O(rows*cols*cols*nonZeroCount) total that's what actually exhausted a
+  // compiler's constexpr-evaluation budget at a mere 40x40. With the grids,
+  // each iteration of the k-loop below is an O(1) lookup, cutting the total
+  // to O(rows*cols*cols) (plus O(rows*cols) once, to build the grids).
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::to_dense_bool();
+
+  /**
+   * @brief The result's structural non-zero pattern, computed once.
+   *
+   * Derived by walking A's *stored* entries rather than the result grid: for
+   * each stored A[i,k], every non-zero B[k,j] contributes a term to result
+   * position (i,j). That makes this O(nonZeroCount(A) * cols) once — versus
+   * the O(rows*cols*cols) it costs to answer the same question by testing
+   * every (row, col) against every shared index k, which is what the
+   * per-position loop this replaced did (and OperationUtilities calls that
+   * predicate rows*cols times, twice over).
+   *
+   * The difference is not academic. On the 60x60 tridiagonal case in the test
+   * suite the old form ran ~216,000 constexpr iterations per walk, which sits
+   * right at clang's default -fconstexpr-steps ceiling of 1048576 — close
+   * enough that unrelated changes elsewhere would tip it over into "non-type
+   * template argument is not a constant expression", a diagnostic that gives
+   * no hint of the real cause. This form runs ~10,700, restoring a wide
+   * margin.
+   */
+  SPARSEMAT_HD constexpr static auto compute_result_grid() {
+    std::array<std::array<bool, static_cast<std::size_t>(cols)>, static_cast<std::size_t>(rows)>
+        grid{};
+    for (auto flat : SparseMat::indices()) {
+      const Int i = flat / SparseMat::cols;
+      const Int k = flat % SparseMat::cols;
+      for (Int j = 0; j < cols; ++j) {
+        if (b_grid[k][j]) {
+          grid[i][j] = true;
+        }
       }
     }
-    return false;
+    return grid;
+  }
+  static constexpr auto result_grid = compute_result_grid();
+
+  /// Returns true if at least one shared k makes both A[row,k] and B[k,col] non-zero.
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return result_grid[row][col];
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
@@ -2120,49 +3638,86 @@ class Multiply {
     return SparseLinearAlgebra::OperationUtilities<Multiply>::calculate_sparsity();
   }
 
-  /// Compile-time accumulation of A[I,*] · B[*,J] over non-zero pairs at column k=i.
-  template<Int I, Int J, Int i = 0>
+  /// Single term of the A[I,*] · B[*,J] inner product at shared index k:
+  /// A[I,k]*B[k,J] if both are structurally non-zero, else 0.
+  template<Int I, Int J, Int k>
+  SPARSEMAT_HD static DataType inner_product_term(const SparseMat& a, const SparseMat1& b) {
+    if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(I, k) &&
+                  SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(k, J)) {
+      constexpr auto a_index =
+          SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, k);
+      constexpr auto b_index =
+          SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(k, J);
+      return a.values[a_index] * b.values[b_index];
+    } else {
+      return DataType(0);
+    }
+  }
+
+  /// Compile-time accumulation of A[I,*] · B[*,J] via a fold over all shared
+  /// indices k. The right-fold form (pack + ...) matches the original
+  /// recursion's right-associated summation order (term(0) + (term(1) +
+  /// (term(2) + ...))) exactly, so this is not just numerically equivalent
+  /// but bit-for-bit identical.
+  template<Int I, Int J, std::size_t... Ks>
+  SPARSEMAT_HD static DataType inner_product_fold(const SparseMat& a,
+                                                  const SparseMat1& b,
+                                                  std::index_sequence<Ks...> /*seq*/) {
+    return (inner_product_term<I, J, Ks>(a, b) + ...);
+  }
+
+  template<Int I, Int J>
   SPARSEMAT_HD static DataType do_inner_product(const SparseMat& a, const SparseMat1& b) {
-    if constexpr (i >= SparseMat::cols) {
-      return 0;
-    } else {
-      if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(I, i) &&
-                    SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(i, J)) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, i);
-        constexpr auto b_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(i, J);
-        return (a.values[a_index] * b.values[b_index]) + do_inner_product<I, J, i + 1>(a, b);
-      } else {
-        return do_inner_product<I, J, i + 1>(a, b);
-      }
-    }
+    return inner_product_fold<I, J>(
+        a, b, std::make_index_sequence<static_cast<std::size_t>(SparseMat::cols)>{});
   }
 
-  /// Recursively fills result positions (I,J) in row-major order.
-  template<typename Result, Int I, Int J>
-  SPARSEMAT_HD static void recursive_multiply(Result& r, const SparseMat& a, const SparseMat1& b) {
-    if constexpr (I >= SparseMat::rows) {
+  /// Fills result storage slot @p Idx (whose flat row-major index is
+  /// @c Result::indices()[Idx]) with the corresponding inner product. See
+  /// add.h's fill_cell for why iterating the result's own sparsity array
+  /// (rather than the full rows*cols grid) is both correct and preferable
+  /// here: multiply only ever writes to result cells this array enumerates.
+  template<typename Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const SparseMat& a, const SparseMat1& b) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    r.values[Idx] = do_inner_product<I, J>(a, b);
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const SparseMat& a, const SparseMat1& b) {
+    if constexpr (Count == 0) {
       return;
-    } else if constexpr (J >= SparseMat1::cols) {
-      return recursive_multiply<Result, I + 1, 0>(r, a, b);
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, std::make_index_sequence<Count>{});
     } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        r.values[sparse_index] = do_inner_product<I, J>(a, b);
-      }
-      recursive_multiply<Result, I, J + 1>(r, a, b);
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b);
+      fill_range<Result, Begin + half, Count - half>(r, a, b);
     }
   }
 
-  /// Constructs the result SparseMat and fills it via recursive_multiply.
+  /// Constructs the result SparseMat and fills it via fill_all.
   SPARSEMAT_HD static auto multiply(const SparseMat& a, const SparseMat1& b) {
     constexpr auto sparsity = calculate_sparsity();
     auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
         template make<SparseMat::rows, SparseMat1::cols, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    recursive_multiply<decltype(result), 0, 0>(result, a, b);
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a, b);
     return result;
   }
 };
@@ -2209,6 +3764,202 @@ SPARSEMAT_HD auto power(const A& a) {
   } else {
     return multiply(a, power<A, N - 1>(a));
   }
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/transpose.h ----
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for sparse matrix transposition.
+ *
+ * Swaps the row and column dimensions and remaps every non-zero flat index
+ * from @c row*cols+col to @c col*rows+row.  The non-zero count is unchanged.
+ *
+ * @tparam SparseMat The matrix type to transpose.
+ */
+template<SparseMatrixType SparseMat>
+class Transpose {
+ public:
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  static constexpr auto rows = SparseMat::cols;
+  static constexpr auto cols = SparseMat::rows;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+
+  // Precomputed once — see Add::a_grid/b_grid for why (identical reasoning).
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+
+  /// Returns true if (row, col) in the result corresponds to a non-zero at (col, row) in the input.
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return a_grid[col][row];
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Transpose>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Transpose>::calculate_sparsity();
+  }
+
+  /// Copies a.values[J,I] into result storage slot @p Idx (flat row-major
+  /// index @c Result::indices()[Idx] == I*Result::cols+J). Iterating the
+  /// result's own sparsity array (rather than the full rows*cols grid) keeps
+  /// instantiation count and compile-time work proportional to the result's
+  /// non-zero count instead of its dimensions.
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const SparseMat& a) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    constexpr auto a_index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
+    static_assert(a_index >= 0,
+                  "Transpose index mismatch: expected non-zero element in the original matrix.");
+    r.values[Idx] = a.values[a_index];
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const SparseMat& a) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a);
+      fill_range<Result, Begin + half, Count - half>(r, a);
+    }
+  }
+
+  /// Constructs the transposed SparseMat and fills it via fill_all.
+  SPARSEMAT_HD static auto transpose(const SparseMat& a) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
+        template make<SparseMat::cols, SparseMat::rows, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a);
+    return result;
+  }
+};
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Returns the transpose of a sparse matrix.
+ *
+ * Produces a new @c SparseMat with swapped dimensions and remapped non-zero
+ * indices.  The value at position (i, j) in the result equals the value at
+ * (j, i) in @p a.
+ *
+ * @tparam SparseMat Input matrix type.
+ * @param  a         Matrix to transpose.
+ * @return           Transposed matrix of type @c SparseMat<DType, IType, Cols, Rows, ...>.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto transpose(const SparseMat& a) {
+  return detail::Transpose<SparseMat>::transpose(a);
+}
+
+}  // namespace SparseLinearAlgebra
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Solves a non-square system @c A*x = b in the least-squares sense.
+ *
+ * @c solve() requires a square coefficient matrix. This handles both
+ * rectangular cases, dispatching at compile time on the shape:
+ *
+ * - **Overdetermined** (@c rows > @c cols — more equations than unknowns, the
+ *   usual fitting problem): returns the @c x minimising @c ||A*x - b||₂, via
+ *   the normal equations @c AᵀA*x = Aᵀb. @c AᵀA is symmetric positive
+ *   semi-definite, so it is solved with Cholesky.
+ * - **Underdetermined** (@c rows < @c cols — infinitely many exact solutions):
+ *   returns the minimum-norm one, the @c x with smallest @c ||x||₂ among those
+ *   satisfying @c A*x = b, via @c x = Aᵀ*(A*Aᵀ)⁻¹*b.
+ * - **Square**: the normal-equations path still applies, but you almost
+ *   certainly want @c solve() instead — see the warning below.
+ *
+ * @warning **This squares the condition number.** Forming @c AᵀA doubles the
+ * number of digits lost to conditioning, so a matrix that is merely
+ * ill-conditioned for a direct solve can be numerically hopeless here, and one
+ * that is rank-deficient will fail outright (@c AᵀA is then singular, reported
+ * via @c ok()). A QR-based least-squares solve avoids this and is the right
+ * answer for anything demanding; it is not implemented here because a
+ * compile-time-sparsity Householder QR is a substantially larger piece of work
+ * than reusing the existing Cholesky. For the small, well-conditioned,
+ * full-rank problems this library targets, the normal equations are usually
+ * fine — but check @c ok(), and do not reach for this when accuracy is the
+ * point.
+ *
+ * @note @c AᵀA (or @c AAᵀ) is generally much denser than @c A, so this costs
+ * more compile time than a same-sized square solve.
+ *
+ * @tparam A   Coefficient matrix type (any shape).
+ * @tparam RHS Right-hand side type; @c RHS::rows must equal @c A::rows.
+ * @param  a   Coefficient matrix.
+ * @param  b   Right-hand side — one or more columns.
+ * @return     @c Result wrapping the solution; @c ok() is @c false if the
+ *             normal-equations matrix was singular, which for a full-rank
+ *             @p a means it is too ill-conditioned for this method.
+ */
+template<SparseMatrixType A, SparseMatrixType RHS>
+SPARSEMAT_HD auto least_squares_solve(const A& a, const RHS& b) {
+  static_assert(A::rows == RHS::rows, "least_squares_solve requires RHS::rows == A::rows.");
+  static_assert(SparseLinearAlgebra::SameDataType<A, RHS>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  const auto at = transpose(a);
+
+  if constexpr (A::rows >= A::cols) {
+    // Overdetermined (or square): AᵀA x = Aᵀb.
+    return cholesky_solve(multiply(at, a), multiply(at, b));
+  } else {
+    // Underdetermined: solve (A Aᵀ) y = b, then x = Aᵀ y, which is the
+    // minimum-norm solution.
+    auto y = cholesky_solve(multiply(a, at), b);
+    auto x = multiply(at, y.value());
+    return Result<decltype(x)>(std::move(x), y.status());
+  }
+}
+
+/**
+ * @brief Residual @c A*x - b, for checking a least-squares fit.
+ *
+ * A least-squares solution does not generally satisfy @c A*x == b — that is the
+ * point — so @c ok() alone says nothing about fit quality. This gives the
+ * residual to measure it with; @c frobenius() of it is the @c ||A*x - b||₂ that
+ * @c least_squares_solve() minimises.
+ *
+ * @param a Coefficient matrix.
+ * @param x Solution returned by @c least_squares_solve().
+ * @param b Original right-hand side.
+ * @return  @c A*x - b.
+ */
+template<SparseMatrixType A, SparseMatrixType X, SparseMatrixType RHS>
+SPARSEMAT_HD auto residual(const A& a, const X& x, const RHS& b) {
+  return subtract(multiply(a, x), b);
 }
 
 }  // namespace SparseLinearAlgebra
@@ -2357,12 +4108,15 @@ SPARSEMAT_HD auto normalize_inplace(SparseMat& a) {
 namespace SparseLinearAlgebra::detail {
 
 /**
- * @brief Implementation policy for scalar multiplication of a sparse matrix.
+ * @brief Implementation policy for adding a scalar to a sparse matrix's stored
+ *        values.
  *
- * The sparsity pattern is unchanged: multiplying by a scalar cannot introduce
- * new non-zeros or eliminate existing ones (structural zeros remain zero).
+ * The sparsity pattern is unchanged: only *stored* values are shifted, so a
+ * structurally zero position stays zero rather than becoming @c factor. (This
+ * is deliberately not the same as adding the scalar to every element of the
+ * full matrix, which would make a sparse matrix dense.)
  *
- * @tparam SparseMat The matrix type to scale.
+ * @tparam SparseMat The matrix type to shift.
  */
 template<SparseMatrixType SparseMat>
 class Shift {
@@ -2377,7 +4131,7 @@ class Shift {
   /// Returns the unchanged input sparsity as the result sparsity.
   SPARSEMAT_HD constexpr static auto calculate_sparsity() { return SparseMat::indices(); }
 
-  /// Returns a copy of @p a with every stored value multiplied by @p factor.
+  /// Returns a copy of @p a with @p factor added to every stored value.
   SPARSEMAT_HD static auto shift(const SparseMat& a, DataType factor) {
     SparseMat result;
     result.values = a.values;
@@ -2424,7 +4178,7 @@ SPARSEMAT_HD auto shift(const SparseMat& a, typename SparseMat::DataType factor)
  * @param  a         Matrix to modify.
  * @param  factor    Scalar to add.
  */
-template<typename SparseMat>
+template<SparseMatrixType SparseMat>
 SPARSEMAT_HD void shift_inplace(SparseMat& a, typename SparseMat::DataType factor) {
   detail::Shift<SparseMat>::shift_inplace(a, factor);
 }
@@ -2451,14 +4205,28 @@ class Symmetric {
   static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
   static constexpr auto total_elements = rows * cols;
 
+  // A function rather than a `static constexpr` data member for the same
+  // device-code reason as offsets() below: is_structurally_symmetric() is
+  // reachable at runtime through the free function of the same name, and a
+  // subscripted static member would need device storage it does not get.
+  //
+  // Memoizing the grid at all matters because the double loop below would
+  // otherwise call isNonZero twice per cell, each an O(nonZeroCount) linear
+  // scan, for O(rows*cols*nonZeroCount) constexpr work. Every other operation
+  // in this library already memoizes this way — see
+  // MatrixUtilities::to_dense_bool().
+  SPARSEMAT_HD constexpr static auto pattern() {
+    return SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  }
+
   SPARSEMAT_HD constexpr static bool is_structurally_symmetric() {
     if constexpr (rows != cols) {
       return false;
     } else {
+      constexpr auto grid = pattern();
       for (Int i = 0; i < rows; ++i) {
-        for (Int j = 0; j < cols; ++j) {
-          if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(i, j) !=
-              SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(j, i)) {
+        for (Int j = i + 1; j < cols; ++j) {
+          if (grid[i][j] != grid[j][i]) {
             return false;
           }
         }
@@ -2467,57 +4235,79 @@ class Symmetric {
     }
   }
 
-  template<Int I = 0, Int J = 0>
-  SPARSEMAT_HD constexpr static bool is_sparse_symmetric(const SparseMat& a,
-                                                         DataType TOLERANCE = 1e-6) {
+  // Held as a function rather than a `static constexpr` data member, and
+  // copied into a local at each use below. The lookups here happen at
+  // *runtime*, so a static member would be ODR-used and would need device
+  // storage — which it does not get, giving "identifier ... is undefined in
+  // device code" under nvcc. Same reasoning as SparseMat::indices(); contrast
+  // Multiply::a_grid, which is only ever read during constant evaluation and
+  // so is safe as a static member.
+  SPARSEMAT_HD constexpr static auto offsets() {
+    return SparseLinearAlgebra::MatrixUtilities<SparseMat>::storage_index_grid();
+  }
+
+  SPARSEMAT_HD static bool values_within(DataType lhs, DataType rhs, DataType TOLERANCE) {
+    const DataType diff = lhs - rhs;
+    return (diff < DataType(0) ? -diff : diff) <= TOLERANCE;
+  }
+
+  /**
+   * @brief Compares each stored value against its mirror position.
+   *
+   * Only positions stored in *both* (i, j) and (j, i) are compared, which is
+   * why the structural check above is a precondition: it guarantees every
+   * stored position has a stored mirror.
+   */
+  SPARSEMAT_HD static bool is_sparse_symmetric(const SparseMat& a, DataType TOLERANCE = 1e-6) {
     if constexpr (!is_structurally_symmetric()) {
       return false;
     } else {
-      if constexpr (I >= rows) {
-        return true;
-      } else if constexpr (J >= cols) {
-        return is_sparse_symmetric<I + 1, 0>(a, TOLERANCE);
-      } else {
-        if (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(I, J)) {
-          constexpr auto index_ij =
-              SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-          constexpr auto index_ji =
-              SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
-          static_assert(index_ij >= 0 && index_ji >= 0,
-                        "Non-zero positions must have valid indices.");
-          if (std::abs(a.values[index_ij] - a.values[index_ji]) > TOLERANCE) {
+      constexpr auto inds = SparseMat::indices();
+      constexpr auto grid = offsets();
+      // Guarded because the bound is a compile-time constant: when it is zero the
+      // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+      if constexpr (SparseMat::nonZeroCount != 0) {
+        for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+          const Int row = inds[k] / cols;
+          const Int col = inds[k] % cols;
+          const auto mirror = grid[static_cast<std::size_t>((col * cols) + row)];
+          if (!values_within(a.values[k], a.values[static_cast<std::size_t>(mirror)], TOLERANCE)) {
             return false;
           }
         }
-        return is_sparse_symmetric<I, J + 1>(a, TOLERANCE);
       }
       return true;
     }
   }
 
-  template<Int I = 0>
-  SPARSEMAT_HD constexpr static bool is_full_symmetric(const SparseMat& a,
-                                                       DataType TOLERANCE = 1e-6) {
-    if constexpr (I >= SparseMat::nonZeroCount) {
-      return true;
+  /**
+   * @brief Tests whether the matrix equals its own transpose.
+   *
+   * Unlike is_sparse_symmetric, a stored value whose mirror is *structurally*
+   * zero is not skipped: it must itself be numerically zero for the full
+   * matrix to equal its transpose.
+   */
+  SPARSEMAT_HD static bool is_full_symmetric(const SparseMat& a, DataType TOLERANCE = 1e-6) {
+    if constexpr (rows != cols) {
+      return false;
     } else {
-      constexpr auto index = SparseMat::indices()[I];
-      constexpr auto row = index / SparseMat::cols;
-      constexpr auto col = index % SparseMat::cols;
-
-      const auto& value = a.values[I];
-      if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>::isNonZero(col, row)) {
-        constexpr auto index_ji =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(col, row);
-        if (std::abs(value - a.values[index_ji]) > TOLERANCE) {
-          return false;  // Non-zero values are not symmetric within tolerance
-        }
-      } else {
-        if (std::abs(value) > TOLERANCE) {
-          return false;  // Non-zero position does not have a corresponding symmetric position
+      constexpr auto inds = SparseMat::indices();
+      constexpr auto grid = offsets();
+      // Guarded because the bound is a compile-time constant: when it is zero the
+      // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+      if constexpr (SparseMat::nonZeroCount != 0) {
+        for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+          const Int row = inds[k] / cols;
+          const Int col = inds[k] % cols;
+          const auto mirror = grid[static_cast<std::size_t>((col * cols) + row)];
+          const DataType mirror_value =
+              (mirror >= 0) ? a.values[static_cast<std::size_t>(mirror)] : DataType(0);
+          if (!values_within(a.values[k], mirror_value, TOLERANCE)) {
+            return false;
+          }
         }
       }
-      return is_full_symmetric<I + 1>(a, TOLERANCE);
+      return true;
     }
   }
 };
@@ -2540,27 +4330,43 @@ SPARSEMAT_HD auto is_structurally_symmetric([[maybe_unused]] const SparseMat& a)
 }
 
 /**
-* @brief Returns true if the matrix @p a is symmetric within a given tolerance.
+ * @brief Returns true if the matrix @p a is symmetric within a given tolerance.
  *
- * Checks both the sparsity pattern and the values of non-zero elements. Does not check
-   TRUE symmetry for non-zero elements that might be numerically zero. For true symmetry,.
+ * Checks both the sparsity pattern and the values of stored elements, but only
+ * compares positions that are stored in *both* (i, j) and (j, i). It therefore
+ * returns @c false for any structurally asymmetric pattern, even one whose
+ * unmatched values are all numerically zero — use @c is_full_symmetric() when
+ * you need to treat such a matrix as symmetric.
  *
  * @tparam SparseMat Matrix type.
  * @param  a         Input matrix.
  * @param  TOLERANCE Tolerance for comparing non-zero values (default 1e-6).
  * @return           True if the matrix is symmetric, false otherwise.
-*/
+ */
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD auto is_sparse_symmetric(const SparseMat& a,
                                       typename SparseMat::DataType TOLERANCE = 1e-6) {
   return detail::Symmetric<SparseMat>::is_sparse_symmetric(a, TOLERANCE);
 }
 
+/**
+ * @brief Returns true if @p a equals its own transpose within @p TOLERANCE.
+ *
+ * Unlike @c is_sparse_symmetric(), a stored value whose mirror position is
+ * structurally zero does not automatically fail — it only fails if that value
+ * is itself outside @p TOLERANCE of zero. A non-square matrix is never
+ * symmetric and returns @c false.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @param  TOLERANCE Tolerance for comparing values (default 1e-6).
+ * @return           True if the matrix equals its transpose, false otherwise.
+ */
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD auto is_full_symmetric(const SparseMat& a,
                                     typename SparseMat::DataType TOLERANCE = 1e-6) {
   return detail::Symmetric<SparseMat>::is_full_symmetric(a, TOLERANCE);
-}  // namespace SparseLinearAlgebra
+}
 
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/trace.h ----
@@ -2588,18 +4394,47 @@ class Trace {
   static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
   static constexpr auto total_elements = rows * cols;
 
-  /// Compile-time recursive accumulation of diagonal elements starting at (N, N).
-  template<int N>
-  SPARSEMAT_HD static DataType trace(const SparseMat& a) {
-    if constexpr (N >= rows || N >= cols) {
-      return 0;
-    } else if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(N, N)) {
-      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(N, N);
-      return a.values[index] + trace<N + 1>(a);
-    } else {
-      return trace<N + 1>(a);
+  using Int = typename SparseMat::Int;
+
+  /// Length of the diagonal that is actually summed.
+  static constexpr auto diag_length = (rows < cols) ? rows : cols;
+
+  /**
+   * @brief Storage offsets of every *stored* diagonal entry, in row order.
+   *
+   * Computed once at compile time, so the runtime sum below touches only the
+   * diagonal positions that actually exist — structurally zero ones are
+   * skipped here rather than contributing a zero term at runtime, which is
+   * the compile-time elimination that matters for trace.
+   */
+  SPARSEMAT_HD static constexpr auto diagonal_offsets() {
+    std::array<Int,
+               static_cast<std::size_t>(
+                   SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros())>
+        offsets{};
+    constexpr auto grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::storage_index_grid();
+    std::size_t k = 0;
+    for (Int i = 0; i < diag_length; ++i) {
+      const auto offset = grid[static_cast<std::size_t>((i * cols) + i)];
+      if (offset >= 0) {
+        offsets[k++] = offset;
+      }
     }
-  };
+    return offsets;
+  }
+
+  /// Sums the stored diagonal entries with a plain runtime loop. The
+  /// zero-skipping is already done (see diagonal_offsets), so there is nothing
+  /// left for a fold to eliminate — and a fold over the diagonal of a large
+  /// matrix would run into clang's 256-argument nesting limit for no benefit.
+  SPARSEMAT_HD static DataType trace(const SparseMat& a) {
+    constexpr auto offsets = diagonal_offsets();
+    DataType sum = 0;
+    for (auto offset : offsets) {
+      sum += a.values[static_cast<std::size_t>(offset)];
+    }
+    return sum;
+  }
 };
 
 }  // namespace SparseLinearAlgebra::detail
@@ -2619,101 +4454,38 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD auto trace(const SparseMat& a) {
-  return detail::Trace<SparseMat>::template trace<0>(a);
+  return detail::Trace<SparseMat>::trace(a);
 }
 
 }  // namespace SparseLinearAlgebra
-// ---- sparsemat/operations/transpose.h ----
+// ---- sparsemat/version.h ----
 
+/// @file
+/// Version macros for the sparsemat library. Kept in sync with the
+/// `project(sparsemat VERSION ...)` declaration in CMakeLists.txt — an
+/// installed header-only library has no other way to tell a consumer which
+/// version it is.
+///
+/// These are macros rather than `constexpr` constants or an enum (which is what
+/// clang-tidy's macro-to-enum and macro-usage checks would otherwise ask for)
+/// because their whole purpose is to be usable from the preprocessor: a
+/// consumer guarding a feature on the library version has to write
+/// `#if SPARSEMAT_VERSION >= SPARSEMAT_VERSION_CHECK(0, 2, 0)`, which no
+/// language-level constant can satisfy.
 
-namespace SparseLinearAlgebra::detail {
+// NOLINTBEGIN(cppcoreguidelines-macro-usage,cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
+#define SPARSEMAT_VERSION_MAJOR 0
+#define SPARSEMAT_VERSION_MINOR 1
+#define SPARSEMAT_VERSION_PATCH 0
 
-/**
- * @brief Implementation policy for sparse matrix transposition.
- *
- * Swaps the row and column dimensions and remaps every non-zero flat index
- * from @c row*cols+col to @c col*rows+row.  The non-zero count is unchanged.
- *
- * @tparam SparseMat The matrix type to transpose.
- */
-template<SparseMatrixType SparseMat>
-class Transpose {
- public:
-  using DataType = typename SparseMat::DataType;
-  using Int = typename SparseMat::Int;
-  static constexpr auto rows = SparseMat::cols;
-  static constexpr auto cols = SparseMat::rows;
-  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+/// Single comparable integer, e.g. `#if SPARSEMAT_VERSION >= SPARSEMAT_VERSION_CHECK(0, 2, 0)`.
+#define SPARSEMAT_VERSION_CHECK(major, minor, patch) (((major) * 10000) + ((minor) * 100) + (patch))
 
-  /// Returns true if (row, col) in the result corresponds to a non-zero at (col, row) in the input.
-  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(int row, int col) {
-    return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(col, row));
-  }
+#define SPARSEMAT_VERSION \
+  SPARSEMAT_VERSION_CHECK(SPARSEMAT_VERSION_MAJOR, SPARSEMAT_VERSION_MINOR, SPARSEMAT_VERSION_PATCH)
 
-  /// Delegates to OperationUtilities to count result non-zeros.
-  SPARSEMAT_HD constexpr static auto num_nonzeros() {
-    return SparseLinearAlgebra::OperationUtilities<Transpose>::num_nonzeros();
-  }
-
-  /// Delegates to OperationUtilities to compute result sparsity indices.
-  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
-    return SparseLinearAlgebra::OperationUtilities<Transpose>::calculate_sparsity();
-  }
-
-  /// Recursively copies a.values[J,I] into r.values[I,J] for every non-zero result position.
-  template<SparseMatrixType Result, Int I, Int J>
-  SPARSEMAT_HD static void transpose(Result& r, const SparseMat& a) {
-    if constexpr (I >= Result::rows) {
-      return;
-    } else if constexpr (J >= Result::cols) {
-      return transpose<Result, I + 1, 0>(r, a);
-    } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(J, I);
-        static_assert(
-            a_index >= 0,
-            "Transpose index mismatch: expected non-zero element in the original matrix.");
-        r.values[sparse_index] = a.values[a_index];
-      }
-      transpose<Result, I, J + 1>(r, a);
-    }
-  }
-
-  /// Constructs the transposed SparseMat and fills it via the recursive helper.
-  SPARSEMAT_HD static auto transpose(const SparseMat& a) {
-    constexpr auto sparsity = calculate_sparsity();
-    auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
-        template make<SparseMat::cols, SparseMat::rows, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    transpose<decltype(result), 0, 0>(result, a);
-    return result;
-  }
-};
-}  // namespace SparseLinearAlgebra::detail
-
-namespace SparseLinearAlgebra {
-
-/**
- * @brief Returns the transpose of a sparse matrix.
- *
- * Produces a new @c SparseMat with swapped dimensions and remapped non-zero
- * indices.  The value at position (i, j) in the result equals the value at
- * (j, i) in @p a.
- *
- * @tparam SparseMat Input matrix type.
- * @param  a         Matrix to transpose.
- * @return           Transposed matrix of type @c SparseMat<DType, IType, Cols, Rows, ...>.
- */
-template<SparseMatrixType SparseMat>
-SPARSEMAT_HD auto transpose(const SparseMat& a) {
-  return detail::Transpose<SparseMat>::transpose(a);
-}
-
-}  // namespace SparseLinearAlgebra
+#define SPARSEMAT_VERSION_STRING "0.1.0"
+// NOLINTEND(cppcoreguidelines-macro-usage,cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
 
 namespace SparseLinearAlgebra {
 
@@ -2740,6 +4512,18 @@ class SparseMat {
   static_assert(std::is_signed_v<IntType>, "SparseMat::Int must be a signed integer type.");
   static_assert(Rows > 0 && Cols > 0,
                 "SparseMat dimensions must be positive (Rows > 0 and Cols > 0).");
+  // Compile time and binary size scale with the stored-value count, so a
+  // runaway-density result is worth naming explicitly rather than letting it
+  // surface as a mysteriously slow build or an inscrutable compiler limit.
+  // See SPARSEMAT_MAX_NONZEROS in concepts/concepts.h to raise, lower, or
+  // disable this.
+  static_assert(SPARSEMAT_MAX_NONZEROS == 0 ||
+                    sizeof...(NonZeros) <= static_cast<std::size_t>(SPARSEMAT_MAX_NONZEROS),
+                "This SparseMat exceeds SPARSEMAT_MAX_NONZEROS stored values. Compile time "
+                "and binary size scale with that count, so this usually means an operation "
+                "chain produced a far denser result than intended (multiply and kronecker "
+                "both can). Check the density of the operands, or raise/disable the ceiling "
+                "by defining SPARSEMAT_MAX_NONZEROS before including sparsemat.");
 
   /// Helper that builds an N×M identity matrix from an index sequence.
   template<std::size_t... Is>
@@ -2758,6 +4542,18 @@ class SparseMat {
    */
   template<IntType R, IntType C, IntType... NZ>
   using Rebind = SparseMat<DType, IntType, R, C, NZ...>;
+
+  /**
+   * @brief Rebinds this template to a different scalar type, keeping the shape
+   *        and sparsity pattern.
+   *
+   * Used by @c convert() — the counterpart to @c Rebind, which varies the
+   * shape while holding the scalar type fixed.
+   *
+   * @tparam D New scalar element type.
+   */
+  template<typename D>
+  using RebindData = SparseMat<D, IntType, Rows, Cols, NonZeros...>;
 
   /// Scalar element type.
   using DataType = DType;
@@ -2780,15 +4576,27 @@ class SparseMat {
   }
 
   /**
-   * @brief Validates that the provided values array matches the sparsity pattern.
+   * @brief Validates the sparsity pattern given in the @c NonZeros pack.
    *
-   * Checks that indices provided for the sparsity pattern are within bounds and unique.
+   * Checks that every index is non-negative, within bounds (< Rows*Cols), and
+   * that no index is repeated. Evaluated by the @c static_assert immediately
+   * below, so an invalid pattern is a compile error at the point of
+   * declaration.
    *
-   * @param vals Array of values to validate.
-   * @return     @c true if the sparsity pattern is valid, @c false otherwise.
+   * Duplicate detection marks each index in a @c Rows*Cols bitmap rather than
+   * comparing every pair, making this O(Rows*Cols + nonZeroCount) instead of
+   * O(nonZeroCount²). That matters because this assert fires for *every*
+   * @c SparseMat instantiation, including the fully-dense results of
+   * @c dense(): at 32x32 the quadratic form was ~1M constexpr operations,
+   * which is enough to exhaust nvcc's constexpr-evaluation budget ("excessive
+   * constexpr function call complexity") even though g++ and clang accept it.
+   * This was the real remaining ceiling on matrix size.
+   *
+   * @return @c true if the sparsity pattern is valid, @c false otherwise.
    */
   [[nodiscard]] SPARSEMAT_HD static constexpr bool validate_indices() {
     constexpr auto inds = indices();
+    std::array<bool, static_cast<std::size_t>(Rows) * static_cast<std::size_t>(Cols)> seen{};
     for (IntType i = 0; i < nonZeroCount; ++i) {
       if (inds[i] < 0) {
         return false;
@@ -2796,11 +4604,11 @@ class SparseMat {
       if (inds[i] >= rows * cols) {
         return false;
       }
-      for (IntType j = i + 1; j < nonZeroCount; ++j) {
-        if (inds[i] == inds[j]) {
-          return false;
-        }
+      const auto slot = static_cast<std::size_t>(inds[i]);
+      if (seen[slot]) {
+        return false;  // duplicate index
       }
+      seen[slot] = true;
     }
     return true;
   }
@@ -2820,16 +4628,25 @@ class SparseMat {
   /**
    * @brief Variadic constructor; each argument initialises one non-zero slot.
    *
-   * The number of arguments must equal @c nonZeroCount; a static assertion
-   * enforces this at compile time.
+   * The number of arguments must equal @c nonZeroCount, and every argument
+   * must be convertible to @c DataType.
+   *
+   * Both requirements are constraints rather than a body @c static_assert so
+   * that this constructor drops out of overload resolution instead of hard-
+   * erroring when it doesn't apply. Unconstrained, it accepts any argument
+   * list at all as far as overload resolution can see: @c SparseMat would
+   * satisfy @c std::is_constructible_v with completely unrelated types, would
+   * act as a greedy converting constructor in any overload set it appears in,
+   * and a genuinely bad call would surface as a @c static_cast error deep
+   * inside the constructor body rather than as "no matching constructor".
    *
    * @tparam Vals Deduced value types (must be convertible to @c DataType).
    * @param  vals Values in the same order as the @c NonZeros index pack.
    */
   template<typename... Vals>
-  SPARSEMAT_HD SparseMat(Vals... vals) : values{static_cast<DataType>(vals)...} {
-    static_assert(sizeof...(Vals) == nonZeroCount, "Number of values must match non-zero count.");
-  }
+    requires(sizeof...(Vals) == static_cast<std::size_t>(nonZeroCount) &&
+             (std::is_convertible_v<Vals, DType> && ...))
+  SPARSEMAT_HD SparseMat(Vals... vals) : values{static_cast<DataType>(vals)...} {}
 
   // --- Static factories ---
 
@@ -2885,6 +4702,75 @@ class SparseMat {
       return values[index];
     }
     return static_cast<DataType>(0);
+  }
+
+  /**
+   * @brief Runtime element read at position (i, j); alias for @c get(i, j).
+   *
+   * Read-only by design: there is deliberately no reference-returning
+   * overload, because a structurally zero position has no storage to hand
+   * back a reference to, and returning a reference to a shared dummy zero
+   * would let `m(0, 1) = 5.0` silently do nothing. Use @c set(i, j, value),
+   * which reports whether the write landed.
+   *
+   * @param i Row index.
+   * @param j Column index.
+   * @return  Element value, or zero if the position is structurally zero.
+   */
+  [[nodiscard]] SPARSEMAT_HD DataType operator()(Int i, Int j) const { return get(i, j); }
+
+  // --- Iteration over stored values ---
+  //
+  // Iterates the packed storage, i.e. exactly the non-zero positions, in flat
+  // row-major index order. Pair with indices() (a parallel array) or use
+  // entries() below when the positions matter too.
+
+  /// Number of stored (non-zero) elements — the length of the iteration range.
+  [[nodiscard]] SPARSEMAT_HD constexpr std::size_t size() const {
+    return static_cast<std::size_t>(nonZeroCount);
+  }
+
+  /// @c true if this matrix stores no values at all (the structural zero matrix).
+  [[nodiscard]] SPARSEMAT_HD constexpr bool empty() const { return nonZeroCount == 0; }
+
+  [[nodiscard]] SPARSEMAT_HD auto begin() { return values.begin(); }
+  [[nodiscard]] SPARSEMAT_HD auto end() { return values.end(); }
+  [[nodiscard]] SPARSEMAT_HD auto begin() const { return values.begin(); }
+  [[nodiscard]] SPARSEMAT_HD auto end() const { return values.end(); }
+  [[nodiscard]] SPARSEMAT_HD auto cbegin() const { return values.cbegin(); }
+  [[nodiscard]] SPARSEMAT_HD auto cend() const { return values.cend(); }
+
+  /// One stored element, as returned by @c entries().
+  struct Entry {
+    Int row;         ///< Row index of the stored element.
+    Int col;         ///< Column index of the stored element.
+    DataType value;  ///< The stored value.
+  };
+
+  /**
+   * @brief Returns every stored element as a (row, col, value) triple.
+   *
+   * Saves callers from re-deriving positions out of @c indices() by hand,
+   * which previously was the only way to iterate structure and values
+   * together. Returned by value (like @c indices()) so the result is a local
+   * copy usable from both host and device code.
+   *
+   * @code
+   * for (auto [row, col, value] : m.entries()) { ... }
+   * @endcode
+   */
+  [[nodiscard]] SPARSEMAT_HD auto entries() const {
+    std::array<Entry, static_cast<std::size_t>(nonZeroCount)> result{};
+    constexpr auto inds = indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nonZeroCount); ++i) {
+        result[i] =
+            Entry{static_cast<Int>(inds[i] / cols), static_cast<Int>(inds[i] % cols), values[i]};
+      }
+    }
+    return result;
   }
 
   /// Returns the sum of the diagonal elements (tr(A)).
@@ -3065,10 +4951,17 @@ class SparseMat {
    * Dispatches at compile time based on the sparsity pattern:
    * - Lower triangular → forward substitution via @c forward_solve.
    * - Upper triangular → back substitution via @c backward_solve.
-   * - Neither → LU factorization via @c lu_solve (no pivoting; requires a non-singular,
-   * pivot-stable matrix).
+   * - Neither → LU factorization via @c lu_solve.
    *
    * A diagonal matrix satisfies both conditions; forward substitution is used.
+   *
+   * @warning The LU path does **no pivoting**. It is only valid for matrices
+   * that factorize stably without row swaps (diagonally dominant, or
+   * otherwise pivot-free). A matrix that merely *needs* a row swap is
+   * reported as singular via @c ok() rather than silently solved, but a
+   * matrix that is pivot-stable yet badly conditioned will still return a
+   * poor answer with @c ok() == @c true. Check @c ok() on the result, and
+   * prefer @c cholesky() when the matrix is symmetric positive definite.
    *
    * @tparam Matrix Right-hand side column vector type.
    * @param  b      Right-hand side vector.
@@ -3095,7 +4988,7 @@ class SparseMat {
    * @return        Sum matrix.
    */
   template<typename Matrix>
-  SPARSEMAT_HD auto add(const Matrix& other) const {
+  [[nodiscard]] SPARSEMAT_HD auto add(const Matrix& other) const {
     return SparseLinearAlgebra::add(*this, other);
   }
 
@@ -3128,6 +5021,32 @@ class SparseMat {
     static_assert(rows == 1 && Matrix::cols == 1 && cols == Matrix::rows,
                   "Dot product requires 1xN times Nx1 vectors with matching length.");
     return mult(b).template get<0, 0>();
+  }
+
+  /**
+   * @brief Fused multiply-add: @c alpha * (*this) * @p x + @p beta * @p y,
+   *        in a single pass.
+   *
+   * Computes @c alpha*A*x + beta*y without materializing the intermediate
+   * product @c A*x. @p x and @p y must be column vectors, with @p x's
+   * length matching @c cols and @p y's length matching @c rows. @p alpha
+   * and @p beta default to @c 1, so @c axpy(x, y) alone computes plain
+   * @c A*x + y.
+   *
+   * @tparam VecX Column-vector type multiplied by @c *this.
+   * @tparam VecY Column-vector type added to the product.
+   * @param  x     Vector multiplied by @c *this.
+   * @param  y     Vector added to the product.
+   * @param  alpha Scalar multiplier for @c (*this)*x.
+   * @param  beta  Scalar multiplier for @p y.
+   * @return       Result column vector @c alpha*(*this)*x + beta*y.
+   */
+  template<typename VecX, typename VecY>
+  [[nodiscard]] SPARSEMAT_HD auto axpy(const VecX& x,
+                                       const VecY& y,
+                                       DataType alpha = DataType(1),
+                                       DataType beta = DataType(1)) const {
+    return SparseLinearAlgebra::axpy(*this, x, y, alpha, beta);
   }
 
   /**
@@ -3164,7 +5083,7 @@ class SparseMat {
   /**
    * @brief Returns the transpose of this matrix.
    *
-   * Produces a @c SparseMat<DType, Cols, Rows, ...> with remapped indices.
+   * Produces a @c SparseMat<DType, IntType, Cols, Rows, ...> with remapped indices.
    *
    * @return Transposed matrix.
    */
@@ -3256,6 +5175,59 @@ class SparseMat {
   }
 
   /**
+   * @brief Computes the determinant.
+   *
+   * Uses the diagonal directly for a structurally triangular matrix, and the
+   * LU factorization otherwise (no pivoting, as everywhere else). Check
+   * @c ok() before trusting the value — see @c SparseLinearAlgebra::determinant.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto determinant() const
+    requires(rows == cols)
+  {
+    return SparseLinearAlgebra::determinant(*this);
+  }
+
+  /**
+   * @brief Returns @c A⁻¹, by solving @c A*X = I.
+   *
+   * @note The inverse of a sparse matrix is generally dense, so the result
+   * type carries many more stored values than this one. Prefer @c solve() when
+   * you only need @c A⁻¹b for specific right-hand sides — it is faster and
+   * more accurate. Use @c cholesky_inverse() when the matrix is SPD.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto inverse() const
+    requires(rows == cols)
+  {
+    return SparseLinearAlgebra::inverse(*this);
+  }
+
+  /**
+   * @brief Solves @c *this * x = @p b in the least-squares sense, for a
+   *        non-square matrix.
+   *
+   * @c solve() requires a square matrix; this handles the rectangular cases —
+   * minimising @c ||Ax-b||₂ when overdetermined, and returning the
+   * minimum-norm solution when underdetermined. It works via the normal
+   * equations, which squares the condition number; see
+   * @c SparseLinearAlgebra::least_squares_solve for when that matters.
+   */
+  template<typename Matrix>
+  [[nodiscard]] SPARSEMAT_HD auto least_squares_solve(const Matrix& b) const {
+    return SparseLinearAlgebra::least_squares_solve(*this, b);
+  }
+
+  /**
+   * @brief Composes block-diagonally with @p b: @c diag(*this, b).
+   *
+   * Result is (rows + b.rows) x (cols + b.cols), with this matrix top-left and
+   * @p b bottom-right. Stored-value count is exactly the sum of the two.
+   */
+  template<typename Matrix>
+  [[nodiscard]] SPARSEMAT_HD auto block_diagonal(const Matrix& b) const {
+    return SparseLinearAlgebra::block_diagonal(*this, b);
+  }
+
+  /**
    * @brief Computes the Frobenius norm: √(Σ aᵢⱼ²) over all non-zero elements.
    * @return Frobenius norm as the matrix's @c DataType.
    */
@@ -3264,13 +5236,57 @@ class SparseMat {
   }
 
   /**
-   * @brief Expands the sparse matrix into a fully dense row-major array.
+   * @brief Expands the sparse matrix into a fully dense @c SparseMat.
+   *
+   * The result is another @c SparseMat whose sparsity pattern covers every
+   * position, so structural zeros become explicitly stored @c DataType(0)
+   * values. It is *not* a bare array: keeping it a @c SparseMat is what lets
+   * a densified result feed straight back into any other operation (see the
+   * Kalman example, which chains @c .add(Q).dense() across filter steps).
+   *
+   * Use @c to_array() when a plain row-major buffer is what's wanted.
+   *
+   * @return A @c SparseMat<DataType, Int, Rows, Cols, 0, 1, ..., Rows*Cols-1>.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto dense() const { return SparseLinearAlgebra::dense(*this); }
+
+  /**
+   * @brief Expands the sparse matrix into a plain dense row-major array.
    *
    * Zero positions are explicitly written as @c DataType(0).
    *
    * @return @c std::array<DataType, Rows*Cols> in row-major order.
    */
-  [[nodiscard]] SPARSEMAT_HD auto dense() const { return SparseLinearAlgebra::dense(*this); }
+  [[nodiscard]] SPARSEMAT_HD auto to_array() const {
+    std::array<DataType, static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols)> result{};
+    constexpr auto inds = indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nonZeroCount); ++i) {
+        result[static_cast<std::size_t>(inds[i])] = values[i];
+      }
+    }
+    return result;
+  }
+
+  /**
+   * @brief Returns a copy of this matrix with its scalar type changed to @p D.
+   *
+   * Binary operations reject mixed scalar types rather than silently
+   * promoting or truncating one side; this is the explicit opt-in. The
+   * sparsity pattern, dimensions, and index type are all preserved.
+   *
+   * @code
+   * auto as_double = float_matrix.template convert<double>();
+   * @endcode
+   *
+   * @tparam D Target scalar element type.
+   */
+  template<typename D>
+  [[nodiscard]] SPARSEMAT_HD auto convert() const {
+    return SparseLinearAlgebra::convert<D>(*this);
+  }
 
   // --- Operator overloads ---
 
@@ -3292,12 +5308,59 @@ class SparseMat {
     return subtract(rhs);
   }
 
+  /** @brief Unary negation: returns a copy with every stored value negated. */
+  [[nodiscard]] SPARSEMAT_HD auto operator-() const { return scale(static_cast<DataType>(-1)); }
+
   /** @brief Scalar multiply (returns new matrix): @c *this * @p factor. */
   SPARSEMAT_HD auto operator*(DataType factor) const { return scale(factor); }
+
+  /** @brief Scalar divide (returns new matrix): @c *this / @p divisor. */
+  [[nodiscard]] SPARSEMAT_HD auto operator/(DataType divisor) const {
+    return scale(static_cast<DataType>(1) / divisor);
+  }
 
   /** @brief Scalar multiply in place: @c *this *= @p factor. */
   SPARSEMAT_HD SparseMat& operator*=(DataType factor) {
     scale_inplace(factor);
+    return *this;
+  }
+
+  /** @brief Scalar divide in place: @c *this /= @p divisor. */
+  SPARSEMAT_HD SparseMat& operator/=(DataType divisor) {
+    scale_inplace(static_cast<DataType>(1) / divisor);
+    return *this;
+  }
+
+  /**
+   * @brief Element-wise addition in place: @c *this += @p rhs.
+   *
+   * Unlike @c operator+, this cannot widen the sparsity pattern — the pattern
+   * is part of the type and @c *this has to keep its own. @p rhs's non-zeros
+   * must therefore be a subset of this matrix's, which is checked at compile
+   * time. Use @c a = a + b when the union pattern is what's wanted.
+   */
+  template<typename Matrix>
+  SPARSEMAT_HD SparseMat& operator+=(const Matrix& rhs) {
+    auto result = add(rhs);
+    static_assert(std::is_same_v<decltype(result), SparseMat>,
+                  "operator+= cannot change the sparsity pattern: the right-hand operand has "
+                  "non-zeros this matrix does not. Use 'a = a + b' to get the union pattern.");
+    values = result.values;
+    return *this;
+  }
+
+  /**
+   * @brief Element-wise subtraction in place: @c *this -= @p rhs.
+   *
+   * Same subset requirement as @c operator+=.
+   */
+  template<typename Matrix>
+  SPARSEMAT_HD SparseMat& operator-=(const Matrix& rhs) {
+    auto result = subtract(rhs);
+    static_assert(std::is_same_v<decltype(result), SparseMat>,
+                  "operator-= cannot change the sparsity pattern: the right-hand operand has "
+                  "non-zeros this matrix does not. Use 'a = a - b' to get the union pattern.");
+    values = result.values;
     return *this;
   }
 
@@ -3313,13 +5376,17 @@ class SparseMat {
    * signature, so there's no portable way to make this callable from a
    * kernel.
    *
-   * @tparam i Current compile-time index into @c values (default 0).
+   * Iterates the packed storage directly rather than recursing over it, so
+   * this no longer costs one template instantiation per stored value.
    */
-  template<IntType i = 0>
   void print() const {
-    if constexpr (i < nonZeroCount) {
-      std::cout << "Value at index " << indices()[i] << ": " << values[i] << '\n';
-      print<i + 1>();
+    constexpr auto inds = indices();
+    // Guarded because the bound is a compile-time constant: when it is zero the
+    // comparison is `unsigned < 0`, which nvcc reports as a pointless comparison.
+    if constexpr (nonZeroCount != 0) {
+      for (std::size_t i = 0; i < static_cast<std::size_t>(nonZeroCount); ++i) {
+        std::cout << "Value at index " << inds[i] << ": " << values[i] << '\n';
+      }
     }
   }
 
@@ -3329,15 +5396,29 @@ class SparseMat {
    * Each row is printed on its own line with space-separated values.
    */
   void printDense() const {
-    auto d = dense();
+    const auto d = to_array();
     for (IntType i = 0; i < rows; ++i) {
       for (IntType j = 0; j < cols; ++j) {
-        std::cout << d[(i * cols) + j] << " ";
+        std::cout << d[static_cast<std::size_t>((i * cols) + j)] << " ";
       }
       std::cout << '\n';
     }
   }
 };
+
+/**
+ * @brief Scalar multiply with the scalar on the left: @p factor * @p m.
+ *
+ * The member @c operator* only covers `matrix * scalar`; this free function
+ * completes the pair so both orderings work.
+ *
+ * @param factor Scalar multiplier.
+ * @param m      Matrix to scale.
+ */
+template<SparseMatrixType Matrix>
+[[nodiscard]] SPARSEMAT_HD auto operator*(typename Matrix::DataType factor, const Matrix& m) {
+  return m.scale(factor);
+}
 
 /**
  * @brief Aliases for commonly used sparse matrix types with specific data and index types.
@@ -3402,6 +5483,381 @@ SPARSEMAT_HD auto zero() {
 template<typename DType, typename IntType, int Rows, int Cols>
 SPARSEMAT_HD auto dense() {
   return SparseMat<DType, IntType, Rows, Cols>().dense();
+}
+
+}  // namespace SparseLinearAlgebra
+
+// ---- sparsemat/builders/patterns.h ----
+
+
+
+// Forward declaration only, for the same reason as builders/tuple_builder.h:
+// this header names the concrete SparseMat class template directly, and the
+// declaration is enough to parse standalone. The complete type is only needed
+// where these functions are actually instantiated, by which point a caller
+// will have included sparsemat/api/sparsemat.h.
+namespace SparseLinearAlgebra {
+template<typename DType, typename IntType, int Rows, int Cols, IntType... NonZeros>
+class SparseMat;
+}
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief One (row, col) position, for declaring a sparsity pattern without
+ *        also supplying a value.
+ *
+ * @c SparseEntry (builders/tuple_builder.h) pairs a position with a value,
+ * which is what you want when the numbers are known up front. This is the
+ * other common case — and the one the Kalman example needs — where the shape
+ * is fixed at compile time but the values are filled in later, or repeatedly,
+ * at runtime.
+ */
+struct SparsePosition {
+  long long row;
+  long long col;
+};
+
+namespace detail {
+
+/**
+ * @brief A sparsity pattern as flat row-major indices, plus its length.
+ *
+ * The array is sized to the worst case (a fully dense Rows x Cols) so that a
+ * generator can fill it without knowing the final count up front — the count
+ * travels alongside instead. Callers expand only the valid prefix, so the
+ * padding never reaches the resulting type.
+ *
+ * All members are public and of structural type, so this can be used directly
+ * as a non-type template argument — which it has to be, since the pattern
+ * determines the resulting @c SparseMat type.
+ */
+template<int Rows, int Cols>
+struct FlatPattern {
+  std::array<long long, static_cast<std::size_t>(Rows) * static_cast<std::size_t>(Cols)> flat{};
+  std::size_t count{};
+
+  /// Appends a position, ignoring exact duplicates so that generators which
+  /// may visit a position twice (@c symmetric_from_lower on a diagonal entry,
+  /// say) do not produce an invalid pattern.
+  SPARSEMAT_HD constexpr void add(long long row, long long col) {
+    const long long index = (row * Cols) + col;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (flat[i] == index) {
+        return;
+      }
+    }
+    flat[count++] = index;
+  }
+};
+
+/**
+ * @brief Sorts a pattern into ascending flat-index order.
+ *
+ * Hand-rolled insertion sort, for the same reason as
+ * @c sort_entries_by_flat_index in builders/tuple_builder.h: this has to run
+ * inside a @c constexpr non-type-template-argument initializer, and this
+ * library avoids depending on how well a given compiler's constexpr evaluator
+ * handles library algorithms. Sorting makes the resulting type canonical
+ * regardless of the order a generator happened to emit positions in.
+ */
+template<int Rows, int Cols>
+SPARSEMAT_HD constexpr auto sorted(FlatPattern<Rows, Cols> pattern) {
+  for (std::size_t i = 1; i < pattern.count; ++i) {
+    const long long key = pattern.flat[i];
+    std::size_t j = i;
+    while (j > 0 && pattern.flat[j - 1] > key) {
+      pattern.flat[j] = pattern.flat[j - 1];
+      --j;
+    }
+    pattern.flat[j] = key;
+  }
+  return pattern;
+}
+
+template<typename DType, typename IntType, int Rows, int Cols, auto Pattern, std::size_t... Is>
+SPARSEMAT_HD constexpr auto build_from_pattern(std::index_sequence<Is...> /*seq*/) {
+  return SparseMat<DType, IntType, Rows, Cols, static_cast<IntType>(Pattern.flat[Is])...>{};
+}
+
+// --- Pattern generators ---
+
+template<int Rows, int Cols, auto Positions>
+SPARSEMAT_HD constexpr auto positions_pattern() {
+  FlatPattern<Rows, Cols> pattern{};
+  for (const auto& position : Positions) {
+    pattern.add(position.row, position.col);
+  }
+  return sorted(pattern);
+}
+
+template<int N, auto Positions>
+SPARSEMAT_HD constexpr auto mirrored_pattern() {
+  FlatPattern<N, N> pattern{};
+  for (const auto& position : Positions) {
+    pattern.add(position.row, position.col);
+    pattern.add(position.col, position.row);
+  }
+  return sorted(pattern);
+}
+
+template<int Rows, int Cols, int Lower, int Upper>
+SPARSEMAT_HD constexpr auto banded_pattern() {
+  FlatPattern<Rows, Cols> pattern{};
+  for (int row = 0; row < Rows; ++row) {
+    for (int col = 0; col < Cols; ++col) {
+      const int offset = col - row;
+      if (offset >= -Lower && offset <= Upper) {
+        pattern.add(row, col);
+      }
+    }
+  }
+  return sorted(pattern);  // already ascending, but keep the invariant explicit
+}
+
+}  // namespace detail
+
+/**
+ * @brief Builds a zero-valued matrix with exactly the given sparsity pattern.
+ *
+ * The counterpart to @c make_sparse_matrix(): that one takes
+ * @c (row, col, value) triples, this one takes @c (row, col) positions and
+ * leaves every stored value at zero, for when the shape is fixed at compile
+ * time but the numbers arrive later.
+ *
+ * @c Positions must be a compile-time @c std::array<SparsePosition, N> passed
+ * as a named @c constexpr variable, since it determines the resulting type.
+ * Order does not matter — positions are sorted internally, so the type is
+ * canonical — and exact duplicates are collapsed rather than producing an
+ * invalid pattern. Out-of-bounds positions are still caught by @c SparseMat's
+ * own @c static_assert.
+ *
+ * @code
+ * constexpr auto shape = std::array{
+ *     SparseLinearAlgebra::SparsePosition{0, 0},
+ *     SparseLinearAlgebra::SparsePosition{1, 1},
+ *     SparseLinearAlgebra::SparsePosition{0, 1},
+ * };
+ * auto A = SparseLinearAlgebra::make_pattern<double, int, 2, 2, shape>();
+ * A.set(0, 0, 4.0);  // fill in later
+ * @endcode
+ *
+ * @tparam DType     Scalar element type.
+ * @tparam IntType   Signed integer type used for indices.
+ * @tparam Rows      Number of rows.
+ * @tparam Cols      Number of columns.
+ * @tparam Positions Compile-time list of (row, col) positions.
+ */
+template<typename DType, typename IntType, int Rows, int Cols, auto Positions>
+SPARSEMAT_HD constexpr auto make_pattern() {
+  constexpr auto pattern = detail::positions_pattern<Rows, Cols, Positions>();
+  return detail::build_from_pattern<DType, IntType, Rows, Cols, pattern>(
+      std::make_index_sequence<pattern.count>{});
+}
+
+/**
+ * @brief Builds a zero-valued square matrix whose pattern is @p Positions
+ *        mirrored across the diagonal.
+ *
+ * Give only the lower triangle (or only the upper — it is symmetric either
+ * way) and the mirror positions are added for you. A symmetric pattern is
+ * exactly what the factorizations want, and writing both halves by hand is
+ * both tedious and easy to get subtly wrong.
+ *
+ * Diagonal positions mirror onto themselves and are not duplicated.
+ *
+ * @code
+ * constexpr auto lower = std::array{
+ *     SparseLinearAlgebra::SparsePosition{0, 0},
+ *     SparseLinearAlgebra::SparsePosition{1, 0},
+ *     SparseLinearAlgebra::SparsePosition{1, 1},
+ * };
+ * // Pattern is {(0,0), (0,1), (1,0), (1,1)}.
+ * auto A = SparseLinearAlgebra::symmetric_from_lower<double, int, 2, lower>();
+ * @endcode
+ *
+ * @tparam N         Matrix dimension (square).
+ * @tparam Positions Compile-time list of (row, col) positions to mirror.
+ */
+template<typename DType, typename IntType, int N, auto Positions>
+SPARSEMAT_HD constexpr auto symmetric_from_lower() {
+  constexpr auto pattern = detail::mirrored_pattern<N, Positions>();
+  return detail::build_from_pattern<DType, IntType, N, N, pattern>(
+      std::make_index_sequence<pattern.count>{});
+}
+
+/**
+ * @brief Builds a zero-valued banded matrix.
+ *
+ * Position (row, col) is stored when @c -Lower <= col-row <= Upper, i.e.
+ * @p Lower sub-diagonals and @p Upper super-diagonals around the main
+ * diagonal. @c banded<..., 0, 0>() is diagonal; @c banded<..., 1, 1>() is
+ * tridiagonal.
+ *
+ * @tparam Rows  Number of rows.
+ * @tparam Cols  Number of columns.
+ * @tparam Lower Number of sub-diagonals to include.
+ * @tparam Upper Number of super-diagonals to include.
+ */
+template<typename DType, typename IntType, int Rows, int Cols, int Lower, int Upper>
+SPARSEMAT_HD constexpr auto banded() {
+  static_assert(Lower >= 0 && Upper >= 0, "Band widths must be non-negative.");
+  constexpr auto pattern = detail::banded_pattern<Rows, Cols, Lower, Upper>();
+  return detail::build_from_pattern<DType, IntType, Rows, Cols, pattern>(
+      std::make_index_sequence<pattern.count>{});
+}
+
+/**
+ * @brief Builds a zero-valued N x N tridiagonal matrix.
+ *
+ * Shorthand for @c banded<DType, IntType, N, N, 1, 1>() — the single most
+ * common pattern in practice, and the one the benchmarks use.
+ */
+template<typename DType, typename IntType, int N>
+SPARSEMAT_HD constexpr auto tridiagonal() {
+  return banded<DType, IntType, N, N, 1, 1>();
+}
+
+/**
+ * @brief Builds an N x N tridiagonal matrix with constant bands.
+ *
+ * @param sub   Value written to every sub-diagonal entry.
+ * @param diag  Value written to every diagonal entry.
+ * @param super Value written to every super-diagonal entry.
+ */
+template<typename DType, typename IntType, int N>
+SPARSEMAT_HD constexpr auto tridiagonal(DType sub, DType diag, DType super) {
+  auto result = tridiagonal<DType, IntType, N>();
+  constexpr auto indices = decltype(result)::indices();
+  for (std::size_t k = 0; k < indices.size(); ++k) {
+    const auto row = indices[k] / N;
+    const auto col = indices[k] % N;
+    if (col < row) {
+      result.values[k] = sub;
+    } else if (col > row) {
+      result.values[k] = super;
+    } else {
+      result.values[k] = diag;
+    }
+  }
+  return result;
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/builders/tuple_builder.h ----
+
+
+
+// Forward declaration only: this header names the concrete SparseMat class
+// template directly (unlike operations/*.h, which stay generic over any
+// SparseMatrixType-constrained template parameter and never need to spell
+// SparseMat itself). The forward declaration is enough to parse this file
+// standalone; make_sparse_matrix()'s body only needs the complete type at
+// the point it's actually instantiated, by which time a caller will have
+// included the full sparsemat/api/sparsemat.h.
+namespace SparseLinearAlgebra {
+template<typename DType, typename IntType, int Rows, int Cols, IntType... NonZeros>
+class SparseMat;
+}
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief One (row, col, value) entry used to build a matrix via
+ *        @c make_sparse_matrix(), instead of hand-computing flat row-major
+ *        indices and keeping a separate values list in sync with them.
+ *
+ * A plain aggregate (not a class template), so a list of these can be
+ * passed directly as a non-type template argument without repeating a type
+ * argument at every entry. @c row/@c col use a wide integer type and
+ * @c value uses @c double regardless of the target matrix's actual
+ * @c IntType/@c DataType — @c make_sparse_matrix() converts down to those at
+ * the point of construction, the same way @c SparseMat's own variadic
+ * constructor already does for its arguments.
+ */
+struct SparseEntry {
+  long long row;
+  long long col;
+  double value;
+};
+
+namespace detail {
+
+/**
+ * @brief Sorts a copy of @p arr into ascending flat row-major index order.
+ *
+ * A hand-rolled insertion sort rather than @c std::sort: this needs to run
+ * as part of a @c constexpr non-type-template-argument initializer, and
+ * this library hand-rolls its own constexpr loops throughout (rather than
+ * leaning on @c <algorithm>) partly to avoid ever needing to find out how
+ * well a given compiler's constexpr evaluator supports library-provided
+ * constexpr algorithms. Entry counts here are sparsity-pattern sizes, not
+ * matrix dimensions, so quadratic behavior is not a practical concern.
+ */
+template<long long Cols, std::size_t N>
+SPARSEMAT_HD constexpr auto sort_entries_by_flat_index(std::array<SparseEntry, N> arr) {
+  for (std::size_t i = 1; i < N; ++i) {
+    SparseEntry key = arr[i];
+    auto key_flat = (key.row * Cols) + key.col;
+    std::size_t j = i;
+    while (j > 0 && (((arr[j - 1].row * Cols) + arr[j - 1].col) > key_flat)) {
+      arr[j] = arr[j - 1];
+      --j;
+    }
+    arr[j] = key;
+  }
+  return arr;
+}
+
+template<typename DType, typename IntType, int Rows, int Cols, auto Sorted, std::size_t... Is>
+SPARSEMAT_HD constexpr auto build_sparse_matrix(std::index_sequence<Is...> /*seq*/) {
+  return SparseMat<DType,
+                   IntType,
+                   Rows,
+                   Cols,
+                   static_cast<IntType>((Sorted[Is].row * Cols) + Sorted[Is].col)...>(
+      std::array<DType, sizeof...(Is)>{static_cast<DType>(Sorted[Is].value)...});
+}
+
+}  // namespace detail
+
+/**
+ * @brief Builds a @c SparseMat from a list of (row, col, value) entries,
+ *        instead of hand-computing flat row-major indices and keeping a
+ *        separate values list in the same order as them.
+ *
+ * @c Entries must be a compile-time @c std::array<SparseEntry, N> — pass it
+ * as a named @c constexpr variable, since that's the readable way to supply
+ * a non-type template argument in C++20. Entries are sorted by flat
+ * row-major index internally, so listing order doesn't matter and the
+ * resulting type is canonical regardless of what order they're given in.
+ * Duplicate or out-of-bounds (row, col) pairs are caught by @c SparseMat's
+ * own @c static_assert — the same one that fires for the hand-written
+ * constructor form — since this ultimately constructs a perfectly ordinary
+ * @c SparseMat.
+ *
+ * @code
+ * constexpr auto entries = std::array{
+ *     SparseLinearAlgebra::SparseEntry{0, 0, 4.0},
+ *     SparseLinearAlgebra::SparseEntry{1, 1, 2.0},
+ *     SparseLinearAlgebra::SparseEntry{0, 1, 5.0},
+ * };
+ * auto A = SparseLinearAlgebra::make_sparse_matrix<double, int, 3, 3, entries>();
+ * @endcode
+ *
+ * @tparam DType   Scalar element type of the resulting matrix.
+ * @tparam IntType Signed integer type used for indices (see @c SparseMat).
+ * @tparam Rows    Number of rows.
+ * @tparam Cols    Number of columns.
+ * @tparam Entries Compile-time list of (row, col, value) entries.
+ * @return         A @c SparseMat<DType, IntType, Rows, Cols, ...> storing
+ *                 exactly the given entries, in row-major order.
+ */
+template<typename DType, typename IntType, int Rows, int Cols, auto Entries>
+SPARSEMAT_HD constexpr auto make_sparse_matrix() {
+  constexpr auto sorted = detail::sort_entries_by_flat_index<Cols>(Entries);
+  return detail::build_sparse_matrix<DType, IntType, Rows, Cols, sorted>(
+      std::make_index_sequence<Entries.size()>{});
 }
 
 }  // namespace SparseLinearAlgebra

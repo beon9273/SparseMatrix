@@ -1,0 +1,6 @@
+# These translation units are *supposed* to fail to compile — each one exists to
+# prove a static_assert fires. Analysing them is meaningless: clang-tidy reports
+# the intended static_assert as an error, and (since they are not in the build's
+# compile_commands.json) also cannot resolve the include path, producing a
+# spurious "file not found" on top.
+Checks: '-*'

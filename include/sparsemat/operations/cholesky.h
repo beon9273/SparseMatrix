@@ -7,6 +7,7 @@
 #include "sparsemat/operations/diagonal.h"
 #include "sparsemat/operations/result.h"
 #include "sparsemat/operations/triangular.h"
+#include "sparsemat/operations/utils.h"
 
 namespace SparseLinearAlgebra::detail {
 
@@ -107,7 +108,7 @@ class LCholeskyMatrix {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -137,76 +138,117 @@ class CholeskyFactorization {
   using Int = typename SparseMat::Int;
   using MU = SparseLinearAlgebra::MatrixUtilities<SparseMat>;
 
-  /**
-   * Computes sum_{m=0}^{J-1} L[I][m] * L[J][m].
-   * Used for both diagonal (I==J) and sub-diagonal (I>J) entries.
-   */
-  template<typename L, Int I, Int J, Int M = 0>
-  SPARSEMAT_HD static DataType inner_sum(const L& l) {
-    if constexpr (M < J) {
-      constexpr auto lim = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, M);
-      constexpr auto ljm = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, M);
-      auto term = DataType(0);
-      if constexpr (lim >= 0 && ljm >= 0) {
-        term = l.values[lim] * l.values[ljm];
-      }
-      return term + inner_sum<L, I, J, M + 1>(l);
+  /// Single term of sum_{m=0}^{J-1} L[I][m] * L[J][m].
+  template<typename L, Int I, Int J, std::size_t M>
+  SPARSEMAT_HD static DataType inner_sum_term(const L& l) {
+    constexpr auto lim =
+        SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, static_cast<Int>(M));
+    constexpr auto ljm =
+        SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, static_cast<Int>(M));
+    if constexpr (lim >= 0 && ljm >= 0) {
+      return l.values[lim] * l.values[ljm];
     } else {
       return DataType(0);
     }
   }
-
+  template<typename L, Int I, Int J, std::size_t... Ms>
+  SPARSEMAT_HD static DataType inner_sum_fold(const L& l, std::index_sequence<Ms...> /*seq*/) {
+    return (inner_sum_term<L, I, J, Ms>(l) + ...);
+  }
   /**
-   * Fills column J of L: diagonal first (I==J), then sub-diagonal rows (I>J).
+   * Computes sum_{m=0}^{J-1} L[I][m] * L[J][m], used for both diagonal
+   * (I==J) and sub-diagonal (I>J) entries. (pack + ...) is ill-formed for an
+   * empty pack, so J==0 (the first column, nothing yet to sum) needs an
+   * explicit early-out.
    */
-  template<typename L, Int J, Int I = J>
-  SPARSEMAT_HD static void compute_column(const SparseMat& a, L& l, bool& ok) {
-    if constexpr (I >= N) {
-      return;
-    } else if constexpr (I == J) {
-      // Diagonal: L[J][J] = sqrt(A[J][J] - sum_{m<J} L[J][m]^2)
-      constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
-      static_assert(l_jj >= 0, "Cholesky: diagonal of L must be structurally non-zero.");
-      DataType sum = inner_sum<L, J, J>(l);
-      constexpr auto a_jj = MU::getSparseIndex(J, J);
-      DataType a_val = (a_jj >= 0) ? a.values[a_jj] : DataType(0);
-      DataType diag = a_val - sum;
-      if (diag <= DataType(0)) {
-        // Non-positive diag: A is not (numerically) positive definite,
-        // so the diagonal pivot is zero or the factorization is undefined.
-        ok = false;
-        l.values[l_jj] = DataType(0);
-        compute_column<L, J, J + 1>(a, l, ok);
-        return;
-      }
-      l.values[l_jj] = std::sqrt(diag);
-      compute_column<L, J, J + 1>(a, l, ok);
+  template<typename L, Int I, Int J>
+  SPARSEMAT_HD static DataType inner_sum(const L& l) {
+    if constexpr (J == 0) {
+      return DataType(0);
     } else {
-      // Sub-diagonal: L[I][J] = (A[I][J] - sum_{m<J} L[I][m]*L[J][m]) / L[J][J]
-      constexpr auto l_ij = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, J);
-      if constexpr (l_ij >= 0) {
-        DataType sum = inner_sum<L, I, J>(l);
-        constexpr auto a_ij = MU::getSparseIndex(I, J);
-        DataType a_val = (a_ij >= 0) ? a.values[a_ij] : DataType(0);
-        constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
-        if (l.values[l_jj] == DataType(0)) {
-          ok = false;
-          l.values[l_ij] = DataType(0);
-          compute_column<L, J, I + 1>(a, l, ok);
-          return;
-        }
-        l.values[l_ij] = (a_val - sum) / l.values[l_jj];
-      }
-      compute_column<L, J, I + 1>(a, l, ok);
+      return inner_sum_fold<L, I, J>(l, std::make_index_sequence<static_cast<std::size_t>(J)>{});
     }
   }
 
-  template<typename L, Int J = 0>
-  SPARSEMAT_HD static void outer_loop(const SparseMat& a, L& l, bool& ok) {
-    if constexpr (J < N) {
-      compute_column<L, J>(a, l, ok);
-      outer_loop<L, Int(J + 1)>(a, l, ok);
+  /// Diagonal entry of column J: L[J][J] = sqrt(A[J][J] - sum_{m<J} L[J][m]^2).
+  /// Must run before any sub-diagonal entry in the same column, since those
+  /// divide by L[J][J].
+  template<typename L, Int J>
+  SPARSEMAT_HD static void diag_step(const SparseMat& a, L& l, bool& ok) {
+    constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+    static_assert(l_jj >= 0, "Cholesky: diagonal of L must be structurally non-zero.");
+    DataType sum = inner_sum<L, J, J>(l);
+    constexpr auto a_jj = MU::getSparseIndex(J, J);
+    DataType a_val = (a_jj >= 0) ? a.values[a_jj] : DataType(0);
+    DataType diag = a_val - sum;
+    // Non-positive diag means A is not (numerically) positive definite. The
+    // threshold also rejects a diag that is positive but negligible relative
+    // to the A[J][J] it came from: sqrt() of it produces a pivot the
+    // sub-diagonal entries then divide by, so accepting it yields garbage
+    // with ok() == true. See singular_pivot_threshold().
+    const DataType a_mag = a_val < DataType(0) ? -a_val : a_val;
+    if (diag <= singular_pivot_threshold<DataType>() * a_mag) {
+      ok = false;
+      l.values[l_jj] = DataType(0);
+      return;
     }
+    l.values[l_jj] = std::sqrt(diag);
+  }
+
+  /// Sub-diagonal entry (I,J): L[I][J] = (A[I][J] - sum_{m<J} L[I][m]*L[J][m]) / L[J][J].
+  template<typename L, Int J, std::size_t IOff>
+  SPARSEMAT_HD static void subdiag_step(const SparseMat& a, L& l, bool& ok) {
+    constexpr Int I = J + 1 + static_cast<Int>(IOff);
+    constexpr auto l_ij = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, J);
+    if constexpr (l_ij >= 0) {
+      DataType sum = inner_sum<L, I, J>(l);
+      constexpr auto a_ij = MU::getSparseIndex(I, J);
+      DataType a_val = (a_ij >= 0) ? a.values[a_ij] : DataType(0);
+      constexpr auto l_jj = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(J, J);
+      if (l.values[l_jj] == DataType(0)) {
+        ok = false;
+        l.values[l_ij] = DataType(0);
+        return;
+      }
+      l.values[l_ij] = (a_val - sum) / l.values[l_jj];
+    }
+  }
+  // Fills all sub-diagonal rows I in [J+1, N) via a comma fold. Row order
+  // doesn't matter here (each I writes an independent L cell) — only the
+  // diagonal-before-subdiagonal ordering above is load-bearing.
+  template<typename L, Int J, std::size_t... IOffs>
+  SPARSEMAT_HD static void compute_subdiag(const SparseMat& a,
+                                           L& l,
+                                           bool& ok,
+                                           std::index_sequence<IOffs...> /*seq*/) {
+    (subdiag_step<L, J, IOffs>(a, l, ok), ...);
+  }
+
+  /// Fills column J of L: diagonal first, then sub-diagonal rows.
+  template<typename L, Int J>
+  SPARSEMAT_HD static void compute_column(const SparseMat& a, L& l, bool& ok) {
+    diag_step<L, J>(a, l, ok);
+    compute_subdiag<L, J>(a,
+                          l,
+                          ok,
+                          std::make_index_sequence<static_cast<std::size_t>(N - J - 1)>{});
+  }
+
+  // Comma fold over columns J=0..N-1, in order: the comma operator inside a
+  // fold expression is the built-in sequencing comma (left fully sequenced
+  // before right), which is what makes it safe to replace the original
+  // sequential recursion here — column J+1's inner_sum reads L values
+  // written by column J (and earlier), so column order is load-bearing.
+  template<typename L, std::size_t... Js>
+  SPARSEMAT_HD static void outer_loop_fold(const SparseMat& a,
+                                           L& l,
+                                           bool& ok,
+                                           std::index_sequence<Js...> /*seq*/) {
+    (compute_column<L, static_cast<Int>(Js)>(a, l, ok), ...);
+  }
+  template<typename L>
+  SPARSEMAT_HD static void outer_loop(const SparseMat& a, L& l, bool& ok) {
+    outer_loop_fold<L>(a, l, ok, std::make_index_sequence<static_cast<std::size_t>(N)>{});
   }
 
  public:
@@ -310,32 +352,5 @@ SPARSEMAT_HD auto cholesky_solve(const SparseMat& A, const RHS& b) {
   auto x = backward_solve(l.value().transpose(), y.value());
   return Result(std::move(x.value()), x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
 }
-
-template<SparseMatrixType SparseMat>
-struct Cholesky {
-  using LType = decltype(cholesky_factorize(std::declval<SparseMat>()).value());
-  Result<LType> factor;
-
-  SPARSEMAT_HD Cholesky(const SparseMat& a) : factor(cholesky_factorize(a)) {}
-
-  [[nodiscard]] SPARSEMAT_HD bool ok() const { return factor.ok(); }
-
-  template<SparseMatrixType RHS>
-  SPARSEMAT_HD auto solve(const RHS& b) const {
-    if (!factor.ok()) {
-      using YType = decltype(detail::LowerTriangular<LType, RHS>::make_result());
-      return Result(YType{}, SolveStatus::SingularMatrix);
-    }
-
-    const auto& lower = factor.value();
-    auto y = forward_solve(lower, b);
-    if (!y.ok()) {
-      return Result(std::move(y.value()), SolveStatus::SingularMatrix);
-    }
-    auto x = backward_solve(lower.transpose(), y.value());
-    return Result(std::move(x.value()),
-                  x.ok() ? SolveStatus::Success : SolveStatus::SingularMatrix);
-  };
-};
 
 }  // namespace SparseLinearAlgebra

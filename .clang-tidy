@@ -1,0 +1,52 @@
+# bugprone-easily-swappable-parameters is disabled: scaling coefficients are
+# conventionally positional in linear algebra, and the (alpha, beta) pair in
+# add()/axpy() mirrors the BLAS signatures callers already know. Wrapping them
+# in a struct to satisfy the check would make the API less familiar, not safer.
+Checks: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  bugprone-*,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-vararg,
+  -readability-identifier-length,
+  -readability-suspicious-call-argument,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -readability-identifier-naming,
+  -bugprone-easily-swappable-parameters
+
+WarningsAsErrors: >
+  clang-diagnostic-*,
+  bugprone-*
+
+HeaderFilterRegex: '.*'
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.MemberCase
+    value: lower_case
+  - key: readability-identifier-naming.ConstantCase
+    value: lower_case
+  - key: readability-identifier-naming.TemplateParameterCase
+    value: CamelCase
+  - key: modernize-use-default-member-init.UseAssignment
+    value: true
+  - key: performance-move-const-arg.CheckTriviallyCopyableMove
+    value: true
+  - key: cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor
+    value: true

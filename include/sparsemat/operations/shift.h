@@ -6,12 +6,15 @@
 namespace SparseLinearAlgebra::detail {
 
 /**
- * @brief Implementation policy for scalar multiplication of a sparse matrix.
+ * @brief Implementation policy for adding a scalar to a sparse matrix's stored
+ *        values.
  *
- * The sparsity pattern is unchanged: multiplying by a scalar cannot introduce
- * new non-zeros or eliminate existing ones (structural zeros remain zero).
+ * The sparsity pattern is unchanged: only *stored* values are shifted, so a
+ * structurally zero position stays zero rather than becoming @c factor. (This
+ * is deliberately not the same as adding the scalar to every element of the
+ * full matrix, which would make a sparse matrix dense.)
  *
- * @tparam SparseMat The matrix type to scale.
+ * @tparam SparseMat The matrix type to shift.
  */
 template<SparseMatrixType SparseMat>
 class Shift {
@@ -26,7 +29,7 @@ class Shift {
   /// Returns the unchanged input sparsity as the result sparsity.
   SPARSEMAT_HD constexpr static auto calculate_sparsity() { return SparseMat::indices(); }
 
-  /// Returns a copy of @p a with every stored value multiplied by @p factor.
+  /// Returns a copy of @p a with @p factor added to every stored value.
   SPARSEMAT_HD static auto shift(const SparseMat& a, DataType factor) {
     SparseMat result;
     result.values = a.values;
@@ -73,7 +76,7 @@ SPARSEMAT_HD auto shift(const SparseMat& a, typename SparseMat::DataType factor)
  * @param  a         Matrix to modify.
  * @param  factor    Scalar to add.
  */
-template<typename SparseMat>
+template<SparseMatrixType SparseMat>
 SPARSEMAT_HD void shift_inplace(SparseMat& a, typename SparseMat::DataType factor) {
   detail::Shift<SparseMat>::shift_inplace(a, factor);
 }

@@ -6,6 +6,7 @@
 #include "sparsemat/operations/diagonal.h"
 #include "sparsemat/operations/result.h"
 #include "sparsemat/operations/triangular.h"
+#include "sparsemat/operations/utils.h"
 namespace SparseLinearAlgebra::detail {
 
 /**
@@ -101,7 +102,7 @@ class LMatrix {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -129,7 +130,7 @@ class UMatrix {
 
   SPARSEMAT_HD static auto make_result() {
     return SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
-        std::make_index_sequence<numNonzeros>{});
+        std::make_index_sequence<static_cast<std::size_t>(numNonzeros)>{});
   }
 };
 
@@ -155,87 +156,162 @@ class LUFactorization {
   using Int = typename SparseMat::Int;
   using MU = SparseLinearAlgebra::MatrixUtilities<SparseMat>;
 
-  template<typename L, typename U, Int I, Int Bound, Int Col, Int M = 0>
-  SPARSEMAT_HD static auto inner_loop_inner(const SparseMat& a, L& l, U& u) {
-    if constexpr (M < Bound) {
-      constexpr auto lim = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, M);
-      constexpr auto umk = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(M, Col);
-      DataType sum = DataType(0);
-      if constexpr (lim >= 0 && umk >= 0) {
-        sum += l.values[lim] * u.values[umk];
-      }
-      return sum + inner_loop_inner<L, U, I, Bound, Col, M + 1>(a, l, u);
+  // Single term of sum(L[I][m]*U[m][Col], m < Bound).
+  template<typename L, typename U, Int I, Int Col, std::size_t M>
+  SPARSEMAT_HD static DataType inner_sum_term(const L& l, const U& u) {
+    constexpr auto lim =
+        SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, static_cast<Int>(M));
+    constexpr auto umk =
+        SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(static_cast<Int>(M), Col);
+    if constexpr (lim >= 0 && umk >= 0) {
+      return l.values[lim] * u.values[umk];
     } else {
       return DataType(0);
     }
   }
 
-  template<typename L, typename U, Int K, Int J = K>
-  SPARSEMAT_HD static void inner_loop_1(const SparseMat& a, L& l, U& u) {
-    if constexpr (J < N) {
-      constexpr auto u_idx = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(K, J);
-      if constexpr (u_idx >= 0) {
-        DataType sum = inner_loop_inner<L, U, K, K, J, 0>(a, l, u);
-        constexpr auto a_idx = MU::getSparseIndex(K, J);
-        if constexpr (a_idx >= 0) {
-          u.values[u_idx] = a.values[a_idx] - sum;
-        } else {
-          u.values[u_idx] = -sum;
-        }
-      }
-      inner_loop_1<L, U, K, J + 1>(a, l, u);
+  // Fold over m in [0, Bound) computing sum(L[I][m]*U[m][Col]). Bound is
+  // passed as the pack size directly (an exact bound, unlike the
+  // over-generate-and-filter approach used elsewhere in this codebase) since
+  // it's always available as a compile-time constant at every call site
+  // below.
+  template<typename L, typename U, Int I, Int Col, std::size_t... Ms>
+  SPARSEMAT_HD static DataType inner_loop_inner_fold(const L& l,
+                                                     const U& u,
+                                                     std::index_sequence<Ms...> /*seq*/) {
+    return (inner_sum_term<L, U, I, Col, Ms>(l, u) + ...);
+  }
+  template<typename L, typename U, Int I, Int Bound, Int Col>
+  SPARSEMAT_HD static auto inner_loop_inner(const SparseMat& /*a*/, L& l, U& u) {
+    // (pack + ...) is ill-formed for an empty pack (unlike &&/||, + has no
+    // built-in empty-fold identity in C++17), so Bound==0 — the first
+    // column/row, with nothing yet to sum — needs an explicit early-out.
+    if constexpr (Bound == 0) {
+      return DataType(0);
+    } else {
+      return inner_loop_inner_fold<L, U, I, Col>(
+          l, u, std::make_index_sequence<static_cast<std::size_t>(Bound)>{});
     }
   }
 
-  template<typename L, typename U, Int K, Int I = K + 1>
-  SPARSEMAT_HD static void inner_loop_2(const SparseMat& a, L& l, U& u, DataType pivot) {
-    if constexpr (I < N) {
-      constexpr auto l_idx = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, K);
-      if constexpr (l_idx >= 0) {
-        if (pivot == DataType(0)) {
-          l.values[l_idx] = DataType(0);
-          inner_loop_2<L, U, K, I + 1>(a, l, u, pivot);
-          return;
-        }
-        DataType sum = inner_loop_inner<L, U, I, K, K, 0>(a, l, u);
-        constexpr auto a_idx = MU::getSparseIndex(I, K);
-        if constexpr (a_idx < 0) {
-          l.values[l_idx] = -sum / pivot;
-        } else {
-          l.values[l_idx] = (a.values[a_idx] - sum) / pivot;
-        }
+  // Single column step for U's row K: U[K][J] = A[K][J] - sum(L[K][m]*U[m][J], m<K).
+  template<typename L, typename U, Int K, std::size_t JOff>
+  SPARSEMAT_HD static void u_col_step(const SparseMat& a, L& l, U& u) {
+    constexpr Int J = K + static_cast<Int>(JOff);
+    constexpr auto u_idx = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(K, J);
+    if constexpr (u_idx >= 0) {
+      DataType sum = inner_loop_inner<L, U, K, K, J>(a, l, u);
+      constexpr auto a_idx = MU::getSparseIndex(K, J);
+      if constexpr (a_idx >= 0) {
+        u.values[u_idx] = a.values[a_idx] - sum;
+      } else {
+        u.values[u_idx] = -sum;
       }
-      inner_loop_2<L, U, K, I + 1>(a, l, u, pivot);
     }
   }
+  // Fills U's entire row K via a fold over J in [K, N). Column order doesn't
+  // matter here (each J writes an independent U cell), but a comma fold is
+  // used for consistency with the K-sequential fold in outer_loop_over_rows.
+  template<typename L, typename U, Int K, std::size_t... JOffs>
+  SPARSEMAT_HD static void inner_loop_1(const SparseMat& a,
+                                        L& l,
+                                        U& u,
+                                        std::index_sequence<JOffs...> /*seq*/) {
+    (u_col_step<L, U, K, JOffs>(a, l, u), ...);
+  }
 
-  template<typename L, typename U, Int K>
-  SPARSEMAT_HD static void outer_loop_over_rows(const SparseMat& a, L& l, U& u, bool& ok) {
-    if constexpr (K < N) {
-      inner_loop_1<L, U, K>(a, l, u);
-
-      // Structurally zero pivot is a user error (caught elsewhere); a
-      // structurally-present but numerically zero pivot is a runtime
-      // singular-matrix condition reported back via `ok`.
-      constexpr auto u_kk = SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(K, K);
-      DataType pivot = DataType(0);
-      if constexpr (u_kk >= 0) {
-        pivot = u.values[u_kk];
-      }
+  // Single row step for L's column K: L[I][K] = (A[I][K] - sum(L[I][m]*U[m][K], m<K)) / pivot.
+  template<typename L, typename U, Int K, std::size_t IOff>
+  SPARSEMAT_HD static void l_col_step(const SparseMat& a, L& l, U& u, DataType pivot) {
+    constexpr Int I = K + 1 + static_cast<Int>(IOff);
+    constexpr auto l_idx = SparseLinearAlgebra::MatrixUtilities<L>::getSparseIndex(I, K);
+    if constexpr (l_idx >= 0) {
       if (pivot == DataType(0)) {
-        ok = false;
+        l.values[l_idx] = DataType(0);
+        return;
       }
-
-      inner_loop_2<L, U, K>(a, l, u, pivot);
-      outer_loop_over_rows<L, U, K + 1>(a, l, u, ok);
+      DataType sum = inner_loop_inner<L, U, I, K, K>(a, l, u);
+      constexpr auto a_idx = MU::getSparseIndex(I, K);
+      if constexpr (a_idx < 0) {
+        l.values[l_idx] = -sum / pivot;
+      } else {
+        l.values[l_idx] = (a.values[a_idx] - sum) / pivot;
+      }
     }
+  }
+  // Fills L's entire column K via a fold over I in [K+1, N). Row order
+  // doesn't matter here (each I writes an independent L cell).
+  template<typename L, typename U, Int K, std::size_t... IOffs>
+  SPARSEMAT_HD static void inner_loop_2(const SparseMat& a,
+                                        L& l,
+                                        U& u,
+                                        [[maybe_unused]] DataType pivot,
+                                        std::index_sequence<IOffs...> /*seq*/) {
+    // pivot is unused when IOffs is empty (K == N-1, the last row has no
+    // sub-diagonal entries to fill).
+    (l_col_step<L, U, K, IOffs>(a, l, u, pivot), ...);
+  }
+
+  // Single pivot step K: fills U's row K, reads the pivot, then fills L's
+  // column K using it.
+  template<typename L, typename U, std::size_t K>
+  SPARSEMAT_HD static void outer_step(const SparseMat& a, L& l, U& u, bool& ok) {
+    inner_loop_1<L, U, static_cast<Int>(K)>(
+        a, l, u, std::make_index_sequence<static_cast<std::size_t>(N) - K>{});
+
+    // Structurally zero pivot is a user error (caught elsewhere); a
+    // structurally-present but numerically negligible pivot is a runtime
+    // singular-matrix condition reported back via `ok`.
+    //
+    // The test is a magnitude threshold rather than `== 0` because this
+    // factorization does no pivoting: without row swaps a merely *tiny*
+    // pivot is just as fatal as an exactly-zero one — it divides through and
+    // produces enormous, meaningless multipliers — but an exact-equality test
+    // waves it through with ok() == true. Scaling the threshold by the
+    // largest magnitude seen in U so far makes it a relative test, so it
+    // behaves the same for a matrix expressed in metres and one in
+    // micrometres.
+    constexpr auto u_kk =
+        SparseLinearAlgebra::MatrixUtilities<U>::getSparseIndex(static_cast<Int>(K),
+                                                                static_cast<Int>(K));
+    DataType pivot = DataType(0);
+    if constexpr (u_kk >= 0) {
+      pivot = u.values[u_kk];
+    }
+    DataType scale = DataType(0);
+    for (const auto& v : u.values) {
+      const DataType mag = v < DataType(0) ? -v : v;
+      if (mag > scale) {
+        scale = mag;
+      }
+    }
+    const DataType pivot_mag = pivot < DataType(0) ? -pivot : pivot;
+    if (pivot_mag <= singular_pivot_threshold<DataType>() * scale) {
+      ok = false;
+    }
+
+    inner_loop_2<L, U, static_cast<Int>(K)>(
+        a, l, u, pivot, std::make_index_sequence<static_cast<std::size_t>(N) - K - 1>{});
+  }
+
+  // Comma fold over pivot steps K=0..N-1, in order: the comma operator
+  // inside a fold expression is the built-in sequencing comma (left fully
+  // sequenced before right), which is what makes it safe to replace the
+  // original sequential recursion here — step K+1's inner_loop_inner reads
+  // L/U values written by step K (and earlier), so step order is
+  // load-bearing.
+  template<typename L, typename U, std::size_t... Ks>
+  SPARSEMAT_HD static void outer_loop_over_rows(
+      const SparseMat& a, L& l, U& u, bool& ok, std::index_sequence<Ks...> /*seq*/) {
+    (outer_step<L, U, Ks>(a, l, u, ok), ...);
   }
 
  public:
-  template<typename L, typename U, Int K = 0>
+  template<typename L, typename U>
   SPARSEMAT_HD static void factorize(const SparseMat& a, L& l, U& u, bool& ok) {
     SparseLinearAlgebra::set_diagonal<L>(l, DataType(1));
-    outer_loop_over_rows<L, U, 0>(a, l, u, ok);
+    outer_loop_over_rows<L, U>(
+        a, l, u, ok, std::make_index_sequence<static_cast<std::size_t>(N)>{});
   }
 };
 
