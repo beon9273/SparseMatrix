@@ -2835,7 +2835,6 @@ SPARSEMAT_HD auto dense(const SparseMat& a) {
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/fuse.h ----
 
-#include <tuple>
 
 
 namespace SparseLinearAlgebra {
