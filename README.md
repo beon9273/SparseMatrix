@@ -13,15 +13,15 @@ independent Kalman filters, all of which require many linear algebra operations 
 
 Idea: if the non-zero structure of your matrices is fixed and known at compile time, the compiler can eliminate a whole bunch of operations.
 
-Solution: user provides sparsity pattern as template parameters. Sparsity patterns of operations (e.g. `C = A × B`) are computed at compile time. Recursive templates are used to unroll operation loops at runtime. Zero operations (i.e, multiplications/additions where one of the terms is zero) are skipped 
+Solution: user provides sparsity pattern as template parameters. Sparsity patterns of operations (e.g. `C = A × B`) are computed at compile time. `std::index_sequence`/fold expressions unroll operation loops at compile time. Zero operations (i.e, multiplications/additions where one of the terms is zero) are skipped
 using compile-time constructs( e.g. constexpr if).  
 
 
 Limitations: 
   - entering sparsity patterns is awkward and bug-prone.
   - every distinct sparsity pattern is a distinct type, which makes compile times long for large configurations and binary size could explode pretty easily. 
-  - matrix operations are unrolled at compile time via `std::index_sequence`/fold expressions (not, as in earlier versions, linear template recursion — that had a hard ceiling around the compiler's default ~900-deep template-instantiation budget, capping matrices at roughly O(10x10)). Every operation is now O(1) in instantiation depth regardless of matrix size. What remains is the compile-time/binary-size cost above — that scales with how many non-zeros an operation actually touches (density), not with recursion depth, so a genuinely sparse 40x40+ matrix is practical, while a dense-ish one of the same size can still be slow to compile.
-  - the practical size limit is now the compiler's *constexpr evaluation* budget rather than its instantiation depth, and nvcc's is markedly tighter than g++'s or clang's. Sparsity computation is memoized into dense boolean grids to stay within it (see `MatrixUtilities::to_dense_bool`).
+  - matrix operations are unrolled at compile time via `std::index_sequence`/fold expressions, which is O(1) in instantiation depth regardless of matrix size. What remains is the compile-time/binary-size cost above — that scales with how many non-zeros an operation actually touches (density), so a genuinely sparse 40x40+ matrix is practical, while a dense-ish one of the same size can still be slow to compile.
+  - the practical size limit is the compiler's *constexpr evaluation* budget, and nvcc's is markedly tighter than g++'s or clang's. Sparsity computation is memoized into dense boolean grids to stay within it (see `MatrixUtilities::to_dense_bool`).
   - a certain level of sparsity is required.  Whether the performance gain is worth that cost depends heavily on how sparse your matrices are and how many operations you're doing.
 
 
@@ -366,63 +366,63 @@ will run the benchmarks, update the table, and update the conclusions. Make sure
 ------------------------------------------------------------------------------------------------------
 Configuration                 Operation                sparsemat  Eigen sparse   Eigen dense
 ------------------------------------------------------------------------------------------------------
-3x3 diagonal (33%)            multiply                      1.82 ns        264.10 ns          1.80 ns
-3x3 diagonal (33%)            add                           1.85 ns         55.75 ns          1.80 ns
-3x3 diagonal (33%)            transpose                     1.99 ns         59.65 ns          1.84 ns
-3x3 diagonal (33%)            scale                         1.82 ns         51.62 ns          2.31 ns
-3x3 diagonal (33%)            frobenius                     1.81 ns          3.95 ns          1.74 ns
+3x3 diagonal (33%)            multiply                      1.76 ns        266.03 ns          1.78 ns
+3x3 diagonal (33%)            add                           1.78 ns         54.43 ns          1.73 ns
+3x3 diagonal (33%)            transpose                     1.77 ns         57.63 ns          1.72 ns
+3x3 diagonal (33%)            scale                         1.79 ns         48.45 ns          1.72 ns
+3x3 diagonal (33%)            frobenius                     1.74 ns          5.62 ns          1.71 ns
 
-3x3 first-row (33%)           multiply                      1.82 ns        270.93 ns          1.78 ns
-3x3 first-row (33%)           add                           1.81 ns         57.18 ns          1.79 ns
-3x3 first-row (33%)           scale                         1.82 ns         52.45 ns          1.76 ns
-3x3 first-row (33%)           frobenius                     1.82 ns          3.90 ns          1.76 ns
+3x3 first-row (33%)           multiply                      1.78 ns        263.76 ns          1.70 ns
+3x3 first-row (33%)           add                           1.78 ns         55.31 ns          1.71 ns
+3x3 first-row (33%)           scale                         1.78 ns         49.76 ns          1.72 ns
+3x3 first-row (33%)           frobenius                     1.74 ns          5.37 ns          1.71 ns
 
-3x3 full (100%)               multiply                      1.84 ns        346.50 ns          1.87 ns
-3x3 full (100%)               add                           1.78 ns         96.72 ns          1.79 ns
-3x3 full (100%)               scale                         1.81 ns         93.47 ns          1.75 ns
-3x3 full (100%)               frobenius                     1.80 ns          4.53 ns          1.76 ns
+3x3 full (100%)               multiply                      1.71 ns        333.84 ns          1.70 ns
+3x3 full (100%)               add                           1.79 ns         92.18 ns          1.71 ns
+3x3 full (100%)               scale                         1.97 ns         99.44 ns          1.70 ns
+3x3 full (100%)               frobenius                     1.78 ns          7.00 ns          2.16 ns
 
-5x5 diagonal (20%)            multiply                      3.05 ns        310.29 ns          2.46 ns
-5x5 diagonal (20%)            add                           1.74 ns         66.36 ns          3.60 ns
-5x5 diagonal (20%)            transpose                     1.81 ns         66.89 ns          1.76 ns
-5x5 diagonal (20%)            scale                         1.93 ns         57.94 ns          1.74 ns
-5x5 diagonal (20%)            frobenius                     1.83 ns          9.08 ns          1.83 ns
+5x5 diagonal (20%)            multiply                      1.78 ns        293.61 ns          1.92 ns
+5x5 diagonal (20%)            add                           1.71 ns         65.59 ns          1.71 ns
+5x5 diagonal (20%)            transpose                     1.76 ns         64.04 ns          1.72 ns
+5x5 diagonal (20%)            scale                         1.77 ns         63.84 ns          1.70 ns
+5x5 diagonal (20%)            frobenius                     1.72 ns          8.98 ns          1.70 ns
 
-5x5 tridiagonal (52%)         multiply                      1.80 ns        463.56 ns          2.54 ns
-5x5 tridiagonal (52%)         add                           2.27 ns        114.39 ns          1.85 ns
-5x5 tridiagonal (52%)         scale                         1.81 ns         94.47 ns          1.83 ns
-5x5 tridiagonal (52%)         frobenius                     1.82 ns         10.53 ns          1.82 ns
+5x5 tridiagonal (52%)         multiply                      1.73 ns        446.65 ns          1.94 ns
+5x5 tridiagonal (52%)         add                           1.78 ns        104.85 ns          1.70 ns
+5x5 tridiagonal (52%)         scale                         1.78 ns         96.34 ns          1.74 ns
+5x5 tridiagonal (52%)         frobenius                     1.77 ns          8.54 ns          1.73 ns
 
-5x5 random sparse (24%)       multiply                      1.81 ns        325.41 ns          2.50 ns
-5x5 random sparse (24%)       add                           1.83 ns         69.42 ns          1.74 ns
-5x5 random sparse (24%)       scale                         1.82 ns         74.32 ns          1.76 ns
-5x5 random sparse (24%)       frobenius                     1.82 ns          9.07 ns          1.78 ns
+5x5 random sparse (24%)       multiply                      1.85 ns        306.76 ns          2.03 ns
+5x5 random sparse (24%)       add                           1.80 ns         69.79 ns          2.19 ns
+5x5 random sparse (24%)       scale                         1.84 ns         59.62 ns          1.77 ns
+5x5 random sparse (24%)       frobenius                     1.81 ns          9.27 ns          1.90 ns
 
-5x5 dense-ish (76%)           multiply                      1.81 ns        547.79 ns          2.52 ns
-5x5 dense-ish (76%)           add                           1.83 ns        127.85 ns          1.82 ns
-5x5 dense-ish (76%)           scale                         1.92 ns        112.48 ns          1.80 ns
-5x5 dense-ish (76%)           frobenius                     1.84 ns          9.43 ns          1.92 ns
+5x5 dense-ish (76%)           multiply                      1.73 ns        521.67 ns          2.03 ns
+5x5 dense-ish (76%)           add                           1.77 ns        118.32 ns          1.71 ns
+5x5 dense-ish (76%)           scale                         1.80 ns        103.89 ns          1.71 ns
+5x5 dense-ish (76%)           frobenius                     1.77 ns         10.82 ns          1.75 ns
 
-8x8 diagonal (12%)            multiply                      1.81 ns        346.81 ns         56.94 ns
-8x8 diagonal (12%)            add                           1.83 ns         77.77 ns          1.80 ns
-8x8 diagonal (12%)            transpose                     1.79 ns         72.83 ns          1.76 ns
-8x8 diagonal (12%)            scale                         1.82 ns         74.33 ns          1.73 ns
-8x8 diagonal (12%)            frobenius                     1.91 ns          9.88 ns          1.75 ns
+8x8 diagonal (12%)            multiply                      1.78 ns        328.02 ns         53.78 ns
+8x8 diagonal (12%)            add                           1.78 ns         74.95 ns          1.69 ns
+8x8 diagonal (12%)            transpose                     2.45 ns         70.80 ns          1.71 ns
+8x8 diagonal (12%)            scale                         1.77 ns         72.58 ns          1.71 ns
+8x8 diagonal (12%)            frobenius                     1.74 ns         11.81 ns          1.73 ns
 
-8x8 tridiagonal (34%)         multiply                      1.82 ns        627.27 ns         51.04 ns
-8x8 tridiagonal (34%)         add                           1.84 ns        134.71 ns          1.81 ns
-8x8 tridiagonal (34%)         scale                         1.86 ns        113.86 ns          1.75 ns
-8x8 tridiagonal (34%)         frobenius                     1.83 ns         11.25 ns          1.82 ns
+8x8 tridiagonal (34%)         multiply                      1.78 ns        568.40 ns         49.61 ns
+8x8 tridiagonal (34%)         add                           1.78 ns        130.45 ns          1.74 ns
+8x8 tridiagonal (34%)         scale                         1.90 ns        117.19 ns          1.69 ns
+8x8 tridiagonal (34%)         frobenius                     1.75 ns         12.73 ns          1.76 ns
 
-8x8 random sparse (25%)       multiply                      1.80 ns        517.06 ns         53.80 ns
-8x8 random sparse (25%)       add                           1.81 ns        104.40 ns          1.77 ns
-8x8 random sparse (25%)       scale                         1.83 ns         81.13 ns          4.07 ns
-8x8 random sparse (25%)       frobenius                     1.82 ns         12.49 ns          1.77 ns
+8x8 random sparse (25%)       multiply                      1.78 ns        482.89 ns         49.74 ns
+8x8 random sparse (25%)       add                           1.78 ns        101.04 ns          1.70 ns
+8x8 random sparse (25%)       scale                         1.79 ns         77.66 ns          1.73 ns
+8x8 random sparse (25%)       frobenius                     1.77 ns         14.73 ns          1.71 ns
 
-5x5 SPD tridiagonal           cholesky (1 rhs)             29.06 ns        878.88 ns        127.96 ns
-5x5 SPD tridiagonal           lu (1 rhs)                   70.37 ns       1520.21 ns        107.10 ns
-5x5 SPD tridiagonal           cholesky (3 rhs)             46.03 ns        918.02 ns        162.46 ns
-5x5 SPD tridiagonal           lu (3 rhs)                   78.45 ns       1720.51 ns        173.24 ns
+5x5 SPD tridiagonal           cholesky (1 rhs)             27.84 ns        836.63 ns        121.00 ns
+5x5 SPD tridiagonal           lu (1 rhs)                   52.79 ns       1436.15 ns        103.72 ns
+5x5 SPD tridiagonal           cholesky (3 rhs)             43.51 ns        873.45 ns        150.99 ns
+5x5 SPD tridiagonal           lu (3 rhs)                   62.75 ns       1624.00 ns        165.44 ns
 ------------------------------------------------------------------------------------------------------
 ```
 <!-- BENCHMARK_TABLE:END -->
@@ -485,23 +485,52 @@ This builds `benchmark_gpu`, runs it, and splices its output into the table belo
 <!-- BENCHMARK_TABLE_GPU:START -->
 ```
 ----------------------------------------------------------------------------------------------------
-Configuration           Batch N            sparsemat GPU     Eigen dense GPU       sparsemat CPU
+Configuration             Batch N            sparsemat GPU     Eigen dense GPUsparsemat CPU (1 core)
 ----------------------------------------------------------------------------------------------------
-3x3 diagonal multiply   100000                   0.67 ns             0.18 ns            47.13 ns
+3x3 diagonal multiply     100000                   0.16 ns             0.72 ns              42.57 ns
 
-5x5 tridiagonal multiply100000                   0.18 ns             0.88 ns           416.40 ns
+5x5 tridiagonal multiply  100000                   1.34 ns             4.28 ns             326.48 ns
 
-8x8 random sparse multiply100000                   0.23 ns             1.86 ns           986.70 ns
+8x8 random sparse multiply100000                   1.44 ns            15.66 ns             511.32 ns
 
-5x5 SPD cholesky solve  100000                   3.24 ns                 n/a           544.69 ns
+5x5 chol factorize+solve  100000                   4.12 ns                 n/a             397.89 ns
 
-3x3 diagonal multiply   1000000                  0.27 ns             0.61 ns            49.30 ns
+5x5 chol presolved        100000                   1.97 ns                 n/a             276.61 ns
 
-5x5 tridiagonal multiply1000000                  0.46 ns             1.11 ns           421.23 ns
+3x3 diagonal multiply     1000000                  0.27 ns             0.73 ns              43.55 ns
 
-8x8 random sparse multiply1000000                  0.51 ns             1.95 ns           994.04 ns
+5x5 tridiagonal multiply  1000000                  1.39 ns             3.37 ns             300.52 ns
 
-5x5 SPD cholesky solve  1000000                  2.13 ns                 n/a           510.26 ns
+8x8 random sparse multiply1000000                  1.60 ns            11.41 ns             529.58 ns
+
+5x5 chol factorize+solve  1000000                  2.29 ns                 n/a             407.97 ns
+
+5x5 chol presolved        1000000                  1.18 ns                 n/a             273.29 ns
+----------------------------------------------------------------------------------------------------
+
+Achieved global-memory bandwidth (operand reads + result write per instance)
+----------------------------------------------------------------------------------------------------
+Configuration             Batch N            sparsemat GPU     Eigen dense GPU
+----------------------------------------------------------------------------------------------------
+3x3 diagonal multiply     100000         341.8 GB/s (56 B)  212.1 GB/s (152 B)
+
+5x5 tridiagonal multiply  100000        161.0 GB/s (216 B)   95.3 GB/s (408 B)
+
+8x8 random sparse multiply100000        182.8 GB/s (264 B)  65.9 GB/s (1032 B)
+
+5x5 chol factorize+solve  100000          11.7 GB/s (48 B)                 n/a
+
+5x5 chol presolved        100000          24.4 GB/s (48 B)                 n/a
+
+3x3 diagonal multiply     1000000        205.6 GB/s (56 B)  207.3 GB/s (152 B)
+
+5x5 tridiagonal multiply  1000000       155.1 GB/s (216 B)  121.1 GB/s (408 B)
+
+8x8 random sparse multiply1000000       164.8 GB/s (264 B)  90.5 GB/s (1032 B)
+
+5x5 chol factorize+solve  1000000         20.9 GB/s (48 B)                 n/a
+
+5x5 chol presolved        1000000         40.6 GB/s (48 B)                 n/a
 ----------------------------------------------------------------------------------------------------
 ```
 <!-- BENCHMARK_TABLE_GPU:END -->

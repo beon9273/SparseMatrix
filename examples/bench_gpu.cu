@@ -622,11 +622,9 @@ int main() {
   // Peak theoretical bandwidth = bus width (bits -> bytes) * double-data-rate
   // memory clock (kHz -> Hz), in GB/s. Gives the second table a ceiling to
   // read the achieved numbers against.
-  double peak_gbs = 2.0 * static_cast<double>(prop.memoryClockRate) * 1e3 *
-                    (static_cast<double>(prop.memoryBusWidth) / 8.0) / 1e9;
+  
 
   std::printf("sparsemat GPU throughput benchmark\n");
-  std::printf("Device: %s (peak memory bandwidth ~%.0f GB/s)\n", prop.name, peak_gbs);
   std::printf("Batch sizes: ");
   for (long long n : BATCH_SIZES) {
     std::printf("%lld ", n);
