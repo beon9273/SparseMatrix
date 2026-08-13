@@ -7,6 +7,7 @@
 #include "sparsemat/operations/cholesky.h"
 #include "sparsemat/operations/lu.h"
 #include "sparsemat/operations/result.h"
+#include "sparsemat/operations/scale.h"
 #include "sparsemat/operations/triangular.h"
 #include "sparsemat/operations/utils.h"
 
@@ -148,6 +149,38 @@ SPARSEMAT_HD auto cholesky_inverse(const SparseMat& a) {
   static_assert(SparseMat::rows == SparseMat::cols, "cholesky_inverse requires a square matrix.");
   const auto rhs = detail::identity_rhs<SparseMat>();
   return cholesky_solve(a, rhs);
+}
+
+/**
+ * @brief Estimates the 1-norm condition number @c ‖A‖₁·‖A⁻¹‖₁.
+ *
+ * Roughly how many digits a solve can lose: a condition number near @c 10ᵏ
+ * costs about @c k digits of the @c ~16 a double carries. Worth checking
+ * alongside @c ok(), which only catches the outright singular case — a matrix
+ * can factorize "successfully" and still return a solution with no correct
+ * digits, and without pivoting (see @c lu_solve) that happens sooner here than
+ * in a pivoting solver.
+ *
+ * @note This forms the inverse explicitly, so it is expensive and — since the
+ * inverse of a sparse matrix is generally dense — costs real compile time and
+ * binary size. It is a diagnostic to reach for while validating a pattern, not
+ * something to call on a hot path. It is also an exact computation of the
+ * 1-norm condition number rather than a cheap estimate in the LAPACK sense;
+ * "estimate" here refers to its use as a guide to accuracy.
+ *
+ * @tparam SparseMat Square input matrix type.
+ * @param  a         Matrix to examine.
+ * @return           @c Result wrapping the condition number; @c ok() is
+ *                   @c false if @p a is singular, where the true condition
+ *                   number is infinite.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto condition_number(const SparseMat& a) {
+  static_assert(SparseMat::rows == SparseMat::cols, "condition_number requires a square matrix.");
+  using DataType = typename SparseMat::DataType;
+  const auto inv = inverse(a);
+  const DataType estimate = norm_1(a) * norm_1(inv.value());
+  return Result<DataType>(estimate, inv.status());
 }
 
 }  // namespace SparseLinearAlgebra

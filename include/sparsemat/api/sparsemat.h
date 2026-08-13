@@ -7,6 +7,7 @@
 
 #include "sparsemat/operations/add.h"
 #include "sparsemat/operations/axpy.h"
+#include "sparsemat/operations/block.h"
 #include "sparsemat/operations/block_diagonal.h"
 #include "sparsemat/operations/cholesky.h"
 #include "sparsemat/operations/compare.h"
@@ -14,12 +15,15 @@
 #include "sparsemat/operations/dense.h"
 #include "sparsemat/operations/diagonal.h"
 #include "sparsemat/operations/fuse.h"
+#include "sparsemat/operations/gram.h"
 #include "sparsemat/operations/hadamard.h"
 #include "sparsemat/operations/invert.h"
 #include "sparsemat/operations/kronecker.h"
 #include "sparsemat/operations/least_squares.h"
 #include "sparsemat/operations/lu.h"
 #include "sparsemat/operations/multiply.h"
+#include "sparsemat/operations/permute.h"
+#include "sparsemat/operations/rank_update.h"
 #include "sparsemat/operations/scale.h"
 #include "sparsemat/operations/shift.h"
 #include "sparsemat/operations/symmetric.h"
@@ -634,6 +638,224 @@ class SparseMat {
   }
 
   /**
+   * @brief Returns the Gram matrix AᵀA (@c Cols × @c Cols).
+   *
+   * Equivalent to @c transpose().multiply(*this), but the transpose is never
+   * materialized: element (i, j) is read directly as the inner product of
+   * columns @c i and @c j.
+   *
+   * @return AᵀA, symmetric by construction.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto ata() const { return SparseLinearAlgebra::ata(*this); }
+
+  /**
+   * @brief Returns the Gram matrix AAᵀ (@c Rows × @c Rows).
+   *
+   * The row-wise counterpart of @c ata(); likewise skips the transpose.
+   *
+   * @return AAᵀ, symmetric by construction.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto aat() const { return SparseLinearAlgebra::aat(*this); }
+
+  /**
+   * @brief Returns the congruence transform AᵀBA (@c Cols × @c Cols).
+   *
+   * @p b must be square with @c B::rows == @c B::cols == @c Rows. Neither Aᵀ
+   * nor the intermediate BA is materialized. The result is symmetric only when
+   * @p b is.
+   *
+   * @tparam B Inner matrix type.
+   * @param  b Inner (weight) matrix.
+   * @return   AᵀBA.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto atba(const B& b) const {
+    return SparseLinearAlgebra::atba(*this, b);
+  }
+
+  /**
+   * @brief Returns the congruence transform ABAᵀ (@c Rows × @c Rows).
+   *
+   * The other orientation of @c atba(), and the covariance propagation
+   * @c F P Fᵀ of a Kalman filter. @p b must be @c Cols × @c Cols.
+   *
+   * @tparam B Inner matrix type.
+   * @param  b Inner matrix.
+   * @return   ABAᵀ.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto abat(const B& b) const {
+    return SparseLinearAlgebra::abat(*this, b);
+  }
+
+  /**
+   * @brief Returns @c ABAᵀ + C in a single pass — the fused covariance
+   *        propagation @c F P Fᵀ + Q.
+   *
+   * @tparam B Inner matrix type (@c Cols × @c Cols).
+   * @tparam C Addend type (@c Rows × @c Rows).
+   * @param  b Inner matrix.
+   * @param  c Matrix added to the product.
+   * @return   ABAᵀ + C.
+   */
+  template<typename B, typename C>
+  [[nodiscard]] SPARSEMAT_HD auto abat_add(const B& b, const C& c) const {
+    return SparseLinearAlgebra::abat_add(*this, b, c);
+  }
+
+  /**
+   * @brief Returns @c AᵀBA + C in a single pass.
+   *
+   * @tparam B Inner matrix type (@c Rows × @c Rows).
+   * @tparam C Addend type (@c Cols × @c Cols).
+   * @param  b Inner matrix.
+   * @param  c Matrix added to the product.
+   * @return   AᵀBA + C.
+   */
+  template<typename B, typename C>
+  [[nodiscard]] SPARSEMAT_HD auto atba_add(const B& b, const C& c) const {
+    return SparseLinearAlgebra::atba_add(*this, b, c);
+  }
+
+  /**
+   * @brief Returns AᵀB without materializing Aᵀ. @p b must have @c Rows rows.
+   *
+   * @tparam B Right matrix type.
+   * @param  b Right matrix.
+   * @return   AᵀB.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto atb(const B& b) const {
+    return SparseLinearAlgebra::atb(*this, b);
+  }
+
+  /**
+   * @brief Returns ABᵀ without materializing Bᵀ. @p b must have @c Cols columns.
+   *
+   * @tparam B Right matrix type.
+   * @param  b Right matrix.
+   * @return   ABᵀ.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto abt(const B& b) const {
+    return SparseLinearAlgebra::abt(*this, b);
+  }
+
+  /**
+   * @brief Extracts the @p NRows × @p NCols block whose top-left corner is
+   *        (@p Row0, @p Col0).
+   *
+   * @tparam Row0  First row of the window.
+   * @tparam Col0  First column of the window.
+   * @tparam NRows Window height.
+   * @tparam NCols Window width.
+   * @return       The extracted block.
+   */
+  template<auto Row0, auto Col0, auto NRows, auto NCols>
+  [[nodiscard]] SPARSEMAT_HD auto submatrix() const {
+    return SparseLinearAlgebra::submatrix<Row0, Col0, NRows, NCols>(*this);
+  }
+
+  /**
+   * @brief Extracts row @p I as a 1 × @c Cols matrix.
+   * @tparam I Row index.
+   */
+  template<auto I>
+  [[nodiscard]] SPARSEMAT_HD auto row() const {
+    return SparseLinearAlgebra::row<I>(*this);
+  }
+
+  /**
+   * @brief Extracts column @p J as a @c Rows × 1 matrix.
+   * @tparam J Column index.
+   */
+  template<auto J>
+  [[nodiscard]] SPARSEMAT_HD auto col() const {
+    return SparseLinearAlgebra::col<J>(*this);
+  }
+
+  /**
+   * @brief Joins @p b to the right: @c [A B]. Row counts must match.
+   *
+   * @tparam B Right operand type.
+   * @param  b Right operand.
+   * @return   @c Rows × (@c Cols + @c B::cols) matrix.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto hcat(const B& b) const {
+    return SparseLinearAlgebra::hcat(*this, b);
+  }
+
+  /**
+   * @brief Stacks @p b underneath: @c [A; B]. Column counts must match.
+   *
+   * @tparam B Bottom operand type.
+   * @param  b Bottom operand.
+   * @return   (@c Rows + @c B::rows) × @c Cols matrix.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto vcat(const B& b) const {
+    return SparseLinearAlgebra::vcat(*this, b);
+  }
+
+  /**
+   * @brief Permutes rows and columns: @c result[i,j] == @c a[RowPerm[i], ColPerm[j]].
+   *
+   * @tparam RowPerm Array of source row indices.
+   * @tparam ColPerm Array of source column indices.
+   * @return         Permuted matrix.
+   */
+  template<auto RowPerm, auto ColPerm>
+  [[nodiscard]] SPARSEMAT_HD auto permute() const {
+    return SparseLinearAlgebra::permute<RowPerm, ColPerm>(*this);
+  }
+
+  /**
+   * @brief Applies the same permutation to rows and columns: @c P A Pᵀ.
+   *
+   * The form a fill-reducing ordering takes for a square system; pair it with
+   * @c rcm_ordering<T>() to shrink the bandwidth before factorizing.
+   *
+   * @tparam Perm Permutation array.
+   * @return      @c P A Pᵀ.
+   */
+  template<auto Perm>
+  [[nodiscard]] SPARSEMAT_HD auto symmetric_permute() const {
+    return SparseLinearAlgebra::symmetric_permute<Perm>(*this);
+  }
+
+  /**
+   * @brief Returns @c A + alpha·x yᵀ without materializing the outer product.
+   *
+   * @tparam X     Left vector type (@c Rows × 1).
+   * @tparam Y     Right vector type (@c Cols × 1).
+   * @param  x     Left vector.
+   * @param  y     Right vector.
+   * @param  alpha Scalar multiplier (default 1; pass -1 to downdate).
+   * @return       @c A + alpha·x yᵀ, whose pattern may be wider than @c A's.
+   */
+  template<typename X, typename Y>
+  [[nodiscard]] SPARSEMAT_HD auto rank1_update(const X& x,
+                                               const Y& y,
+                                               DataType alpha = DataType(1)) const {
+    return SparseLinearAlgebra::rank1_update(*this, x, y, alpha);
+  }
+
+  /**
+   * @brief Returns @c A + alpha·x xᵀ — the symmetry-preserving special case.
+   *
+   * @tparam X     Vector type (@c Rows × 1).
+   * @param  x     Update vector.
+   * @param  alpha Scalar multiplier (default 1).
+   * @return       @c A + alpha·x xᵀ.
+   */
+  template<typename X>
+  [[nodiscard]] SPARSEMAT_HD auto symmetric_rank1_update(const X& x,
+                                                         DataType alpha = DataType(1)) const {
+    return SparseLinearAlgebra::symmetric_rank1_update(*this, x, alpha);
+  }
+
+  /**
    * @brief Returns a scaled copy: every non-zero element multiplied by @p factor.
    *
    * Sparsity pattern is unchanged.
@@ -776,6 +998,24 @@ class SparseMat {
   [[nodiscard]] SPARSEMAT_HD auto frobenius() const {
     return SparseLinearAlgebra::frobenius(*this);
   }
+
+  /**
+   * @brief Largest absolute stored value (the max-norm).
+   * @return @c max|aᵢⱼ|.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto max_abs() const { return SparseLinearAlgebra::max_abs(*this); }
+
+  /**
+   * @brief 1-norm: the largest absolute column sum.
+   * @return @c max_j Σᵢ|aᵢⱼ|.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto norm_1() const { return SparseLinearAlgebra::norm_1(*this); }
+
+  /**
+   * @brief ∞-norm: the largest absolute row sum.
+   * @return @c max_i Σⱼ|aᵢⱼ|.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto norm_inf() const { return SparseLinearAlgebra::norm_inf(*this); }
 
   /**
    * @brief Expands the sparse matrix into a fully dense @c SparseMat.

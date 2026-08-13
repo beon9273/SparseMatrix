@@ -838,6 +838,300 @@ SPARSEMAT_HD auto axpy(const A& a,
 }
 
 }  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/block.h ----
+
+#include <cstdint>
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for extracting a rectangular sub-block.
+ *
+ * The complement of @c block_diagonal: that one assembles a large matrix from
+ * independent pieces, this one takes the pieces back out — the partitioned
+ * state vectors and measurement models that motivate block assembly need both
+ * directions.
+ *
+ * Purely structural. Every stored entry of the window keeps its value and is
+ * re-indexed into the smaller grid, so the result's non-zero count is however
+ * many of A's entries fall inside it. Nothing is computed, which is why the
+ * fill is an ordinary runtime loop over a precomputed table rather than a fold
+ * — see @c MatrixUtilities::storage_index_grid() for why that is the right
+ * shape for value-moving operations.
+ *
+ * @tparam SparseMat Source matrix type.
+ * @tparam Row0      First row of the window.
+ * @tparam Col0      First column of the window.
+ * @tparam NRows     Window height.
+ * @tparam NCols     Window width.
+ */
+template<SparseMatrixType SparseMat,
+         typename SparseMat::Int Row0,
+         typename SparseMat::Int Col0,
+         typename SparseMat::Int NRows,
+         typename SparseMat::Int NCols>
+class Submatrix {
+ public:
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  static constexpr Int rows = NRows;
+  static constexpr Int cols = NCols;
+
+  static_assert(NRows > 0 && NCols > 0, "A submatrix must have a positive extent.");
+  static_assert(Row0 >= 0 && Col0 >= 0, "A submatrix origin must be non-negative.");
+  static_assert(Row0 + NRows <= SparseMat::rows && Col0 + NCols <= SparseMat::cols,
+                "Submatrix window extends past the edge of the source matrix.");
+
+  static constexpr auto source_grid =
+      SparseLinearAlgebra::MatrixUtilities<SparseMat>::storage_index_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    const auto flat = ((row + Row0) * SparseMat::cols) + (col + Col0);
+    return source_grid[static_cast<std::size_t>(flat)] >= 0;
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Submatrix>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Submatrix>::calculate_sparsity();
+  }
+
+  /// Source storage offset for each result slot, resolved once at compile time
+  /// so the fill itself is a flat copy loop.
+  SPARSEMAT_HD constexpr static auto source_slots() {
+    constexpr auto sparsity = calculate_sparsity();
+    std::array<Int, sparsity.size()> slots{};
+    for (std::size_t k = 0; k < sparsity.size(); ++k) {
+      const Int i = sparsity[k] / cols;
+      const Int j = sparsity[k] % cols;
+      slots[k] = source_grid[static_cast<std::size_t>(((i + Row0) * SparseMat::cols) + (j + Col0))];
+    }
+    return slots;
+  }
+
+  SPARSEMAT_HD static auto submatrix(const SparseMat& a) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    constexpr auto slots = source_slots();
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      result.values[k] = a.values[static_cast<std::size_t>(slots[k])];
+    }
+    return result;
+  }
+};
+
+/// Which way a concatenation joins its operands.
+enum class ConcatAxis : std::uint8_t {
+  /// Side by side: same row count, column counts add.
+  Horizontal,
+  /// Stacked: same column count, row counts add.
+  Vertical,
+};
+
+/**
+ * @brief Implementation policy for concatenating two matrices.
+ *
+ * Like @c Submatrix, this only moves values: each operand's entries keep their
+ * value and are re-indexed into the combined grid, so the result stores
+ * exactly @c nnz(a) + @c nnz(b) values. @c block_diagonal is the special case
+ * where the two operands are offset along both axes at once.
+ *
+ * @tparam SparseMatA Left/top operand.
+ * @tparam SparseMatB Right/bottom operand.
+ * @tparam Axis       Which way to join them.
+ */
+template<SparseMatrixType SparseMatA, SparseMatrixType SparseMatB, ConcatAxis Axis>
+class Concat {
+ public:
+  using DataType = typename SparseMatA::DataType;
+  using Int = typename SparseMatA::Int;
+  static constexpr bool horizontal = (Axis == ConcatAxis::Horizontal);
+  static constexpr Int rows = horizontal ? SparseMatA::rows : SparseMatA::rows + SparseMatB::rows;
+  static constexpr Int cols = horizontal ? SparseMatA::cols + SparseMatB::cols : SparseMatA::cols;
+
+  static_assert(horizontal ? SparseMatB::rows == SparseMatA::rows
+                           : SparseMatB::cols == SparseMatA::cols,
+                "Incompatible matrix dimensions for concatenation: hcat requires equal row "
+                "counts, vcat requires equal column counts.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMatA, SparseMatB>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  /// Where B's block starts in the combined grid.
+  static constexpr Int row_offset = horizontal ? Int(0) : SparseMatA::rows;
+  static constexpr Int col_offset = horizontal ? SparseMatA::cols : Int(0);
+
+  static constexpr auto a_slots =
+      SparseLinearAlgebra::MatrixUtilities<SparseMatA>::storage_index_grid();
+  static constexpr auto b_slots =
+      SparseLinearAlgebra::MatrixUtilities<SparseMatB>::storage_index_grid();
+
+  /// True inside A's block when A stores the position, inside B's when B does.
+  /// The blocks are disjoint by construction, so no position is claimed twice.
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    if (row < SparseMatA::rows && col < SparseMatA::cols) {
+      return a_slots[static_cast<std::size_t>((row * SparseMatA::cols) + col)] >= 0;
+    }
+    if (row >= row_offset && col >= col_offset) {
+      const Int i = row - row_offset;
+      const Int j = col - col_offset;
+      if (i < SparseMatB::rows && j < SparseMatB::cols) {
+        return b_slots[static_cast<std::size_t>((i * SparseMatB::cols) + j)] >= 0;
+      }
+    }
+    return false;
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Concat>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Concat>::calculate_sparsity();
+  }
+
+  /// For each result slot, which operand supplies it and at which offset.
+  /// Encoded as a signed offset per operand, -1 meaning "not this one", so the
+  /// fill is two flat copy loops with no branching on structure.
+  SPARSEMAT_HD constexpr static auto source_slots() {
+    constexpr auto sparsity = calculate_sparsity();
+    std::array<std::array<Int, 2>, sparsity.size()> slots{};
+    for (std::size_t k = 0; k < sparsity.size(); ++k) {
+      const Int i = sparsity[k] / cols;
+      const Int j = sparsity[k] % cols;
+      slots[k][0] = Int(-1);
+      slots[k][1] = Int(-1);
+      if (i < SparseMatA::rows && j < SparseMatA::cols) {
+        slots[k][0] = a_slots[static_cast<std::size_t>((i * SparseMatA::cols) + j)];
+      }
+      if (slots[k][0] < 0) {
+        const Int bi = i - row_offset;
+        const Int bj = j - col_offset;
+        slots[k][1] = b_slots[static_cast<std::size_t>((bi * SparseMatB::cols) + bj)];
+      }
+    }
+    return slots;
+  }
+
+  SPARSEMAT_HD static auto concat(const SparseMatA& a, const SparseMatB& b) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMatA>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    constexpr auto slots = source_slots();
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      result.values[k] = slots[k][0] >= 0 ? a.values[static_cast<std::size_t>(slots[k][0])]
+                                          : b.values[static_cast<std::size_t>(slots[k][1])];
+    }
+    return result;
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Extracts the @p NRows × @p NCols block of @p a whose top-left corner
+ *        is (@p Row0, @p Col0).
+ *
+ * The window is a compile-time constant, so the result's sparsity — the subset
+ * of @p a's entries that fall inside it — is too. Values are copied unchanged.
+ *
+ * @code
+ * auto top_left = SparseLinearAlgebra::submatrix<0, 0, 2, 2>(a);
+ * @endcode
+ *
+ * @tparam Row0  First row of the window.
+ * @tparam Col0  First column of the window.
+ * @tparam NRows Window height.
+ * @tparam NCols Window width.
+ * @tparam A     Source matrix type.
+ * @param  a     Source matrix.
+ * @return       The extracted block.
+ */
+template<auto Row0, auto Col0, auto NRows, auto NCols, SparseMatrixType A>
+SPARSEMAT_HD auto submatrix(const A& a) {
+  using Int = typename A::Int;
+  return detail::Submatrix<A,
+                           static_cast<Int>(Row0),
+                           static_cast<Int>(Col0),
+                           static_cast<Int>(NRows),
+                           static_cast<Int>(NCols)>::submatrix(a);
+}
+
+/**
+ * @brief Extracts row @p I of @p a as a 1 × @c A::cols matrix.
+ *
+ * @tparam I Row index.
+ * @tparam A Source matrix type.
+ * @param  a Source matrix.
+ * @return   The row, as a matrix.
+ */
+template<auto I, SparseMatrixType A>
+SPARSEMAT_HD auto row(const A& a) {
+  return submatrix<I, 0, 1, A::cols>(a);
+}
+
+/**
+ * @brief Extracts column @p J of @p a as an @c A::rows × 1 matrix.
+ *
+ * @tparam J Column index.
+ * @tparam A Source matrix type.
+ * @param  a Source matrix.
+ * @return   The column, as a matrix.
+ */
+template<auto J, SparseMatrixType A>
+SPARSEMAT_HD auto col(const A& a) {
+  return submatrix<0, J, A::rows, 1>(a);
+}
+
+/**
+ * @brief Joins @p a and @p b side by side: @c [A B].
+ *
+ * Both must have the same row count. The result stores exactly
+ * @c nnz(a) + @c nnz(b) values — concatenation never creates or destroys a
+ * non-zero.
+ *
+ * @tparam A Left operand type.
+ * @tparam B Right operand type.
+ * @param  a Left operand.
+ * @param  b Right operand.
+ * @return   @c A::rows × (@c A::cols + @c B::cols) matrix.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto hcat(const A& a, const B& b) {
+  return detail::Concat<A, B, detail::ConcatAxis::Horizontal>::concat(a, b);
+}
+
+/**
+ * @brief Stacks @p a above @p b: @c [A; B].
+ *
+ * Both must have the same column count. As with @c hcat, the result stores
+ * exactly @c nnz(a) + @c nnz(b) values.
+ *
+ * @tparam A Top operand type.
+ * @tparam B Bottom operand type.
+ * @param  a Top operand.
+ * @param  b Bottom operand.
+ * @return   (@c A::rows + @c B::rows) × @c A::cols matrix.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto vcat(const A& a, const B& b) {
+  return detail::Concat<A, B, detail::ConcatAxis::Vertical>::concat(a, b);
+}
+
+}  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/block_diagonal.h ----
 
 
@@ -1093,7 +1387,6 @@ SPARSEMAT_HD void set_diagonal(
 }  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/result.h ----
 
-#include <cstdint>
 #include <limits>
 
 
@@ -2710,6 +3003,795 @@ SPARSEMAT_HD auto fuse(const Fn& fn, const Mats&... mats) {
 }
 
 }  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/gram.h ----
+
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Which one-sided product a @c Gram instantiation computes.
+ */
+enum class GramSide : std::uint8_t {
+  /// AᵀA — an @c A::cols × @c A::cols matrix of column inner products.
+  Transposed,
+  /// AAᵀ — an @c A::rows × @c A::rows matrix of row inner products.
+  Straight,
+};
+
+/**
+ * @brief Implementation policy for the Gram products AᵀA and AAᵀ.
+ *
+ * Neither form materializes the transpose. AᵀA[i,j] is the inner product of
+ * columns @c i and @c j of A, and AAᵀ[i,j] the inner product of rows @c i and
+ * @c j — both read straight out of A's storage, so the intermediate matrix
+ * @c transpose(a).multiply(a) would build (and the sparsity computation it
+ * would need) never exists.
+ *
+ * Result sparsity: for AᵀA, position (i, j) is non-zero when some row @c k has
+ * both A[k,i] and A[k,j] stored; for AAᵀ, when some column @c k has both
+ * A[i,k] and A[j,k] stored. Either pattern is symmetric by construction.
+ *
+ * @tparam SparseMat Input matrix type.
+ * @tparam Side      Which product to form.
+ */
+template<SparseMatrixType SparseMat, GramSide Side>
+class Gram {
+ public:
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+
+  /// Length of the summed dimension: A's rows for AᵀA, A's cols for AAᵀ.
+  static constexpr Int inner = (Side == GramSide::Transposed) ? SparseMat::rows : SparseMat::cols;
+  static constexpr Int rows = (Side == GramSide::Transposed) ? SparseMat::cols : SparseMat::rows;
+  static constexpr Int cols = rows;
+
+  // Precomputed once per instantiation — see Multiply::a_grid for why the
+  // O(nonZeroCount) scans this replaces are not affordable per lookup.
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+
+  /// Reads A at the (row, col) orientation this side sums over: element @c k
+  /// of "vector" @c v is A[k,v] for AᵀA and A[v,k] for AAᵀ.
+  SPARSEMAT_HD constexpr static bool a_at(Int k, Int v) {
+    if constexpr (Side == GramSide::Transposed) {
+      return a_grid[k][v];
+    } else {
+      return a_grid[v][k];
+    }
+  }
+
+  /**
+   * @brief The result's structural non-zero pattern, computed once.
+   *
+   * Walks the summed dimension once, and for each slice pairs up the vectors
+   * that store an entry in it — O(inner * rows²) worst case, but proportional
+   * to the *stored* entries in practice, and paid a single time rather than
+   * once per @c is_result_index_nonzero call.
+   */
+  SPARSEMAT_HD constexpr static auto compute_result_grid() {
+    std::array<std::array<bool, static_cast<std::size_t>(cols)>, static_cast<std::size_t>(rows)>
+        grid{};
+    for (Int k = 0; k < inner; ++k) {
+      for (Int i = 0; i < rows; ++i) {
+        if (!a_at(k, i)) {
+          continue;
+        }
+        for (Int j = 0; j < cols; ++j) {
+          if (a_at(k, j)) {
+            grid[i][j] = true;
+          }
+        }
+      }
+    }
+    return grid;
+  }
+  static constexpr auto result_grid = compute_result_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return result_grid[row][col];
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Gram>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Gram>::calculate_sparsity();
+  }
+
+  /// Storage offset of the element of "vector" @p V at summed index @p K, or
+  /// -1 when that element is structurally zero.
+  template<Int V, Int K>
+  SPARSEMAT_HD constexpr static Int offset() {
+    if constexpr (Side == GramSide::Transposed) {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(K, V);
+    } else {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(V, K);
+    }
+  }
+
+  /// Single term of the inner product at summed index @p K, elided entirely at
+  /// compile time when either factor is structurally zero.
+  template<Int I, Int J, std::size_t K>
+  SPARSEMAT_HD static DataType inner_product_term(const SparseMat& a) {
+    constexpr Int lhs = offset<I, static_cast<Int>(K)>();
+    constexpr Int rhs = offset<J, static_cast<Int>(K)>();
+    if constexpr (lhs >= 0 && rhs >= 0) {
+      return a.values[lhs] * a.values[rhs];
+    } else {
+      return DataType(0);
+    }
+  }
+
+  template<Int I, Int J, std::size_t... Ks>
+  SPARSEMAT_HD static DataType inner_product_fold(const SparseMat& a,
+                                                  std::index_sequence<Ks...> /*seq*/) {
+    return (inner_product_term<I, J, Ks>(a) + ...);
+  }
+
+  /**
+   * @brief Fills result slot @p Idx, mirroring the strict lower triangle from
+   *        the upper rather than recomputing it.
+   *
+   * Both Gram products are symmetric — result[i,j] and result[j,i] are the same
+   * inner product — so computing both halves would emit the entire fold twice
+   * per off-diagonal pair, doubling the instantiation count of the operations
+   * most likely to strain the density budget in the first place.
+   *
+   * Reading the mirror slot is safe because it is always already written:
+   * the pattern is symmetric so (J,I) is stored whenever (I,J) is, its flat
+   * row-major index is smaller when @c I > @c J, and fill order follows the
+   * result's ascending index array (fill_range expands the low half before the
+   * high half, and the comma in a fold expression is the sequencing comma —
+   * see the note on chunked unrolling in utils.h).
+   */
+  template<typename Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const SparseMat& a) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    if constexpr (I > J) {
+      constexpr Int mirror = SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(J, I);
+      static_assert(mirror >= 0,
+                    "Gram result pattern is not symmetric; this should be impossible.");
+      r.values[Idx] = r.values[static_cast<std::size_t>(mirror)];
+    } else {
+      r.values[Idx] =
+          inner_product_fold<I, J>(a, std::make_index_sequence<static_cast<std::size_t>(inner)>{});
+    }
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const SparseMat& a) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a);
+      fill_range<Result, Begin + half, Count - half>(r, a);
+    }
+  }
+
+  SPARSEMAT_HD static auto gram(const SparseMat& a) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a);
+    return result;
+  }
+};
+
+/**
+ * @brief Placeholder addend for the congruence forms that have none.
+ *
+ * @c Congruence covers both the plain triple product and the Joseph form
+ * (which adds a matrix to it). Rather than duplicate every fill helper for the
+ * two arities, the no-addend case passes this empty type and the addend
+ * contributions compile away.
+ */
+struct NoAddend {};
+
+/// Shape check for the addend, written as a function so the @c NoAddend case
+/// never names @c rows/@c cols — a plain @c !has_addend || ... static_assert
+/// would still instantiate the right-hand side and fail on the sentinel.
+template<typename Addend, auto Rows, auto Cols>
+SPARSEMAT_HD constexpr bool addend_shape_matches() {
+  if constexpr (std::is_same_v<Addend, NoAddend>) {
+    return true;
+  } else {
+    return Addend::rows == Rows && Addend::cols == Cols;
+  }
+}
+
+/**
+ * @brief Implementation policy for the congruence transforms AᵀBA and ABAᵀ,
+ *        optionally with an added matrix (the Joseph form).
+ *
+ * The product is evaluated in a single traversal — for AᵀBA, result[i,j] is
+ * Σ_p Σ_q A[p,i] * B[p,q] * A[q,j] — so neither the transpose nor the
+ * intermediate product is ever materialized. Written eagerly as
+ * @c a.transpose() * b * a, both intermediates cost a full sparsity
+ * computation and a result of their own, and the transpose in particular is
+ * pure data movement this form skips by reading A in the other orientation.
+ *
+ * The two sides are the two halves of a Kalman update: @c ABAᵀ propagates a
+ * covariance (@c F P Fᵀ), @c AᵀBA forms a weighted normal matrix
+ * (@c Hᵀ R⁻¹ H). With an addend both become the fused forms actually used —
+ * @c F P Fᵀ + Q, and the Joseph-form covariance update.
+ *
+ * Result sparsity is derived through the same intermediate pattern the eager
+ * form would produce, then unioned with the addend's.
+ *
+ * @tparam SparseMatA Outer matrix A.
+ * @tparam SparseMatB Inner matrix B; square, matching A's summed dimension.
+ * @tparam Side       @c Transposed for AᵀBA, @c Straight for ABAᵀ.
+ * @tparam Addend     Matrix added to the product, or @c NoAddend.
+ */
+template<SparseMatrixType SparseMatA,
+         SparseMatrixType SparseMatB,
+         GramSide Side,
+         typename Addend = NoAddend>
+class Congruence {
+  static constexpr bool has_addend = !std::is_same_v<Addend, NoAddend>;
+
+ public:
+  using DataType = typename SparseMatA::DataType;
+  using Int = typename SparseMatA::Int;
+
+  /// Length of the summed dimension, and therefore B's order: A's rows for
+  /// AᵀBA, A's cols for ABAᵀ.
+  static constexpr Int inner = (Side == GramSide::Transposed) ? SparseMatA::rows : SparseMatA::cols;
+  static constexpr Int rows = (Side == GramSide::Transposed) ? SparseMatA::cols : SparseMatA::rows;
+  static constexpr Int cols = rows;
+
+  static_assert(SparseMatB::rows == inner && SparseMatB::cols == inner,
+                "Incompatible matrix dimensions for a congruence transform: B must be square, "
+                "with order A::rows for AᵀBA and A::cols for ABAᵀ.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMatA, SparseMatB>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+  static_assert(addend_shape_matches<Addend, rows, cols>(),
+                "The added matrix must have the same shape as the triple product.");
+
+  // Precomputed once per instantiation — see Multiply::a_grid.
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMatA>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMatB>::to_dense_bool();
+
+  /// Reads A at the orientation this side sums over: element (k, v) is A[k,v]
+  /// for AᵀBA (A is read column-wise) and A[v,k] for ABAᵀ (row-wise).
+  SPARSEMAT_HD constexpr static bool a_at(Int k, Int v) {
+    if constexpr (Side == GramSide::Transposed) {
+      return a_grid[k][v];
+    } else {
+      return a_grid[v][k];
+    }
+  }
+
+  /// Storage offset of that same element, or -1 when structurally zero.
+  template<Int V, Int K>
+  SPARSEMAT_HD constexpr static Int a_offset() {
+    if constexpr (Side == GramSide::Transposed) {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMatA>::getSparseIndex(K, V);
+    } else {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMatA>::getSparseIndex(V, K);
+    }
+  }
+
+  /// Pattern of the inner product B·A (or B·Aᵀ), built by walking B's stored
+  /// entries — O(nonZeroCount(B) * cols), the traversal shape Multiply uses
+  /// and for the same constexpr-budget reasons.
+  SPARSEMAT_HD constexpr static auto compute_ba_grid() {
+    std::array<std::array<bool, static_cast<std::size_t>(cols)>, static_cast<std::size_t>(inner)>
+        grid{};
+    for (auto flat : SparseMatB::indices()) {
+      const Int p = flat / SparseMatB::cols;
+      const Int q = flat % SparseMatB::cols;
+      for (Int j = 0; j < cols; ++j) {
+        if (a_at(q, j)) {
+          grid[p][j] = true;
+        }
+      }
+    }
+    return grid;
+  }
+  static constexpr auto ba_grid = compute_ba_grid();
+
+  /// Pattern of the full triple product, unioned with the addend's: a stored
+  /// A element at summed index p pairs with every non-zero (BA)[p,j].
+  SPARSEMAT_HD constexpr static auto compute_result_grid() {
+    std::array<std::array<bool, static_cast<std::size_t>(cols)>, static_cast<std::size_t>(rows)>
+        grid{};
+    for (Int p = 0; p < inner; ++p) {
+      for (Int i = 0; i < rows; ++i) {
+        if (!a_at(p, i)) {
+          continue;
+        }
+        for (Int j = 0; j < cols; ++j) {
+          if (ba_grid[p][j]) {
+            grid[i][j] = true;
+          }
+        }
+      }
+    }
+    if constexpr (has_addend) {
+      for (auto flat : Addend::indices()) {
+        grid[flat / Addend::cols][flat % Addend::cols] = true;
+      }
+    }
+    return grid;
+  }
+  static constexpr auto result_grid = compute_result_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return result_grid[row][col];
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Congruence>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Congruence>::calculate_sparsity();
+  }
+
+  /// One B[P,Q]·A term of the inner sum, elided when either factor is
+  /// structurally zero.
+  template<Int P, Int J, std::size_t Q>
+  SPARSEMAT_HD static DataType ba_term(const SparseMatA& a, const SparseMatB& b) {
+    constexpr Int b_index =
+        SparseLinearAlgebra::MatrixUtilities<SparseMatB>::getSparseIndex(P, static_cast<Int>(Q));
+    constexpr Int a_index = a_offset<J, static_cast<Int>(Q)>();
+    if constexpr (b_index >= 0 && a_index >= 0) {
+      return b.values[b_index] * a.values[a_index];
+    } else {
+      return DataType(0);
+    }
+  }
+
+  template<Int P, Int J, std::size_t... Qs>
+  SPARSEMAT_HD static DataType ba_fold(const SparseMatA& a,
+                                       const SparseMatB& b,
+                                       std::index_sequence<Qs...> /*seq*/) {
+    return (ba_term<P, J, Qs>(a, b) + ...);
+  }
+
+  /// One A·(BA)[P,J] term of the outer sum. The whole inner fold is discarded
+  /// at compile time when A's factor is structurally zero — which is what
+  /// keeps this cheap for the sparse A these transforms are applied to.
+  template<Int I, Int J, std::size_t P>
+  SPARSEMAT_HD static DataType outer_term(const SparseMatA& a, const SparseMatB& b) {
+    constexpr Int a_index = a_offset<I, static_cast<Int>(P)>();
+    if constexpr (a_index >= 0) {
+      return a.values[a_index] *
+             ba_fold<static_cast<Int>(P), J>(
+                 a, b, std::make_index_sequence<static_cast<std::size_t>(inner)>{});
+    } else {
+      return DataType(0);
+    }
+  }
+
+  template<Int I, Int J, std::size_t... Ps>
+  SPARSEMAT_HD static DataType outer_fold(const SparseMatA& a,
+                                          const SparseMatB& b,
+                                          std::index_sequence<Ps...> /*seq*/) {
+    return (outer_term<I, J, Ps>(a, b) + ...);
+  }
+
+  /// The addend's contribution at result slot @p Idx: zero when there is no
+  /// addend, or when it is structurally zero there.
+  template<typename Result, std::size_t Idx>
+  SPARSEMAT_HD static DataType addend_at(const Addend& c) {
+    if constexpr (has_addend) {
+      constexpr auto flat = Result::indices()[Idx];
+      constexpr Int offset =
+          SparseLinearAlgebra::MatrixUtilities<Addend>::getSparseIndex(flat / Result::cols,
+                                                                       flat % Result::cols);
+      if constexpr (offset >= 0) {
+        return c.values[static_cast<std::size_t>(offset)];
+      } else {
+        return DataType(0);
+      }
+    } else {
+      (void)c;
+      return DataType(0);
+    }
+  }
+
+  template<typename Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r,
+                                     const SparseMatA& a,
+                                     const SparseMatB& b,
+                                     const Addend& c) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    r.values[Idx] =
+        outer_fold<I, J>(a, b, std::make_index_sequence<static_cast<std::size_t>(inner)>{}) +
+        addend_at<Result, Idx>(c);
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMatA& a,
+                                      const SparseMatB& b,
+                                      const Addend& c,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b, c), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h.
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r,
+                                      const SparseMatA& a,
+                                      const SparseMatB& b,
+                                      const Addend& c) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, c, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b, c);
+      fill_range<Result, Begin + half, Count - half>(r, a, b, c);
+    }
+  }
+
+  SPARSEMAT_HD static auto congruence(const SparseMatA& a, const SparseMatB& b, const Addend& c) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMatA>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a, b, c);
+    return result;
+  }
+};
+
+/**
+ * @brief Implementation policy for the mixed products AᵀB and ABᵀ.
+ *
+ * The general two-operand form of the Gram products: same one-pass evaluation,
+ * same skipped transpose, but with independent left and right matrices, so the
+ * result is not symmetric and nothing can be mirrored.
+ *
+ * @tparam SparseMatA Left matrix.
+ * @tparam SparseMatB Right matrix.
+ * @tparam Side       @c Transposed for AᵀB, @c Straight for ABᵀ.
+ */
+template<SparseMatrixType SparseMatA, SparseMatrixType SparseMatB, GramSide Side>
+class TransposedMultiply {
+ public:
+  using DataType = typename SparseMatA::DataType;
+  using Int = typename SparseMatA::Int;
+
+  /// The dimension summed over: the rows both operands share for AᵀB, the
+  /// columns they share for ABᵀ.
+  static constexpr Int inner = (Side == GramSide::Transposed) ? SparseMatA::rows : SparseMatA::cols;
+  static constexpr Int rows = (Side == GramSide::Transposed) ? SparseMatA::cols : SparseMatA::rows;
+  static constexpr Int cols = (Side == GramSide::Transposed) ? SparseMatB::cols : SparseMatB::rows;
+
+  static_assert(Side == GramSide::Transposed ? SparseMatB::rows == SparseMatA::rows
+                                             : SparseMatB::cols == SparseMatA::cols,
+                "Incompatible matrix dimensions: AᵀB requires equal row counts, ABᵀ requires "
+                "equal column counts.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMatA, SparseMatB>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMatA>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMatB>::to_dense_bool();
+
+  /// Element @p k of the left operand's "vector" @p v — A[k,v] for AᵀB,
+  /// A[v,k] for ABᵀ. The right operand mirrors it.
+  SPARSEMAT_HD constexpr static bool a_at(Int k, Int v) {
+    if constexpr (Side == GramSide::Transposed) {
+      return a_grid[k][v];
+    } else {
+      return a_grid[v][k];
+    }
+  }
+  SPARSEMAT_HD constexpr static bool b_at(Int k, Int v) {
+    if constexpr (Side == GramSide::Transposed) {
+      return b_grid[k][v];
+    } else {
+      return b_grid[v][k];
+    }
+  }
+
+  template<Int V, Int K>
+  SPARSEMAT_HD constexpr static Int a_offset() {
+    if constexpr (Side == GramSide::Transposed) {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMatA>::getSparseIndex(K, V);
+    } else {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMatA>::getSparseIndex(V, K);
+    }
+  }
+  template<Int V, Int K>
+  SPARSEMAT_HD constexpr static Int b_offset() {
+    if constexpr (Side == GramSide::Transposed) {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMatB>::getSparseIndex(K, V);
+    } else {
+      return SparseLinearAlgebra::MatrixUtilities<SparseMatB>::getSparseIndex(V, K);
+    }
+  }
+
+  SPARSEMAT_HD constexpr static auto compute_result_grid() {
+    std::array<std::array<bool, static_cast<std::size_t>(cols)>, static_cast<std::size_t>(rows)>
+        grid{};
+    for (Int k = 0; k < inner; ++k) {
+      for (Int i = 0; i < rows; ++i) {
+        if (!a_at(k, i)) {
+          continue;
+        }
+        for (Int j = 0; j < cols; ++j) {
+          if (b_at(k, j)) {
+            grid[i][j] = true;
+          }
+        }
+      }
+    }
+    return grid;
+  }
+  static constexpr auto result_grid = compute_result_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return result_grid[row][col];
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<TransposedMultiply>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<TransposedMultiply>::calculate_sparsity();
+  }
+
+  template<Int I, Int J, std::size_t K>
+  SPARSEMAT_HD static DataType inner_product_term(const SparseMatA& a, const SparseMatB& b) {
+    constexpr Int lhs = a_offset<I, static_cast<Int>(K)>();
+    constexpr Int rhs = b_offset<J, static_cast<Int>(K)>();
+    if constexpr (lhs >= 0 && rhs >= 0) {
+      return a.values[lhs] * b.values[rhs];
+    } else {
+      return DataType(0);
+    }
+  }
+
+  template<Int I, Int J, std::size_t... Ks>
+  SPARSEMAT_HD static DataType inner_product_fold(const SparseMatA& a,
+                                                  const SparseMatB& b,
+                                                  std::index_sequence<Ks...> /*seq*/) {
+    return (inner_product_term<I, J, Ks>(a, b) + ...);
+  }
+
+  template<typename Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r, const SparseMatA& a, const SparseMatB& b) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    r.values[Idx] =
+        inner_product_fold<I, J>(a, b, std::make_index_sequence<static_cast<std::size_t>(inner)>{});
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMatA& a,
+                                      const SparseMatB& b,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h.
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r, const SparseMatA& a, const SparseMatB& b) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b);
+      fill_range<Result, Begin + half, Count - half>(r, a, b);
+    }
+  }
+
+  SPARSEMAT_HD static auto product(const SparseMatA& a, const SparseMatB& b) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMatA>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(result, a, b);
+    return result;
+  }
+};
+
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Computes the Gram matrix AᵀA.
+ *
+ * Element (i, j) is the inner product of columns @c i and @c j of @p a, so the
+ * result is an @c A::cols × @c A::cols matrix, symmetric by construction.
+ *
+ * Equivalent to @c multiply(transpose(a), a) but computed in one pass: the
+ * transpose is never materialized, the result's sparsity is derived directly
+ * from @p a's pattern, and only the upper triangle's inner products are
+ * emitted — the lower triangle is mirrored from it.
+ *
+ * @tparam A Input matrix type.
+ * @param  a Input matrix.
+ * @return   AᵀA, with sparsity encoded in the type.
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD auto ata(const A& a) {
+  return detail::Gram<A, detail::GramSide::Transposed>::gram(a);
+}
+
+/**
+ * @brief Computes the Gram matrix AAᵀ.
+ *
+ * Element (i, j) is the inner product of rows @c i and @c j of @p a, so the
+ * result is an @c A::rows × @c A::rows matrix, symmetric by construction.
+ * As with @c ata, the transpose is never materialized and only the upper
+ * triangle is computed.
+ *
+ * @tparam A Input matrix type.
+ * @param  a Input matrix.
+ * @return   AAᵀ, with sparsity encoded in the type.
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD auto aat(const A& a) {
+  return detail::Gram<A, detail::GramSide::Straight>::gram(a);
+}
+
+/**
+ * @brief Computes AᵀB without materializing Aᵀ.
+ *
+ * The two-operand generalization of @c ata: element (i, j) is the inner
+ * product of column @c i of @p a with column @c j of @p b. Both operands must
+ * have the same number of rows; the result is @c A::cols × @c B::cols.
+ *
+ * @tparam A Left matrix type.
+ * @tparam B Right matrix type.
+ * @param  a Left matrix.
+ * @param  b Right matrix.
+ * @return   AᵀB.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto atb(const A& a, const B& b) {
+  return detail::TransposedMultiply<A, B, detail::GramSide::Transposed>::product(a, b);
+}
+
+/**
+ * @brief Computes ABᵀ without materializing Bᵀ.
+ *
+ * The two-operand generalization of @c aat: element (i, j) is the inner
+ * product of row @c i of @p a with row @c j of @p b. Both operands must have
+ * the same number of columns; the result is @c A::rows × @c B::rows.
+ *
+ * @tparam A Left matrix type.
+ * @tparam B Right matrix type.
+ * @param  a Left matrix.
+ * @param  b Right matrix.
+ * @return   ABᵀ.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto abt(const A& a, const B& b) {
+  return detail::TransposedMultiply<A, B, detail::GramSide::Straight>::product(a, b);
+}
+
+/**
+ * @brief Computes the congruence transform AᵀBA.
+ *
+ * @p a is m × n and @p b is m × m, giving an n × n result — the standard form
+ * for changing the basis of a quadratic form or assembling a weighted normal
+ * equation (with @p b the weight matrix, @c ata is the @c B = I case).
+ *
+ * Both Aᵀ and the intermediate BA are skipped: the triple product is
+ * accumulated in a single traversal, with structurally zero factors dropped at
+ * compile time. Note that the result is symmetric only when @p b is.
+ *
+ * @tparam A Outer matrix type (m × n).
+ * @tparam B Inner matrix type (m × m).
+ * @param  a Outer matrix.
+ * @param  b Inner matrix.
+ * @return   AᵀBA, with sparsity encoded in the type.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto atba(const A& a, const B& b) {
+  return detail::Congruence<A, B, detail::GramSide::Transposed>::congruence(a,
+                                                                            b,
+                                                                            detail::NoAddend{});
+}
+
+/**
+ * @brief Computes the congruence transform ABAᵀ.
+ *
+ * The other orientation of @c atba: @p a is m × n, @p b is n × n, and the
+ * result is m × m. This is the covariance propagation @c F P Fᵀ of a Kalman
+ * filter, and likewise skips both Aᵀ and the intermediate BAᵀ.
+ *
+ * @tparam A Outer matrix type (m × n).
+ * @tparam B Inner matrix type (n × n).
+ * @param  a Outer matrix.
+ * @param  b Inner matrix.
+ * @return   ABAᵀ, with sparsity encoded in the type.
+ */
+template<SparseMatrixType A, SparseMatrixType B>
+SPARSEMAT_HD auto abat(const A& a, const B& b) {
+  return detail::Congruence<A, B, detail::GramSide::Straight>::congruence(a, b, detail::NoAddend{});
+}
+
+/**
+ * @brief Computes @c ABAᵀ + C in a single pass.
+ *
+ * The fused form of a covariance propagation (@c F P Fᵀ + Q) and of the
+ * Joseph-form covariance update (@c (I-KH) P (I-KH)ᵀ + K R Kᵀ, one term at a
+ * time). The addition costs nothing beyond the wider result pattern: @p c is
+ * read at the position already being written, so the intermediate @c ABAᵀ that
+ * @c abat(a, b).add(c) would materialize never exists.
+ *
+ * @tparam A Outer matrix type (m × n).
+ * @tparam B Inner matrix type (n × n).
+ * @tparam C Addend type (m × m).
+ * @param  a Outer matrix.
+ * @param  b Inner matrix.
+ * @param  c Matrix added to the product.
+ * @return   ABAᵀ + C, whose pattern is the union of the product's and @p c's.
+ */
+template<SparseMatrixType A, SparseMatrixType B, SparseMatrixType C>
+SPARSEMAT_HD auto abat_add(const A& a, const B& b, const C& c) {
+  return detail::Congruence<A, B, detail::GramSide::Straight, C>::congruence(a, b, c);
+}
+
+/**
+ * @brief Computes @c AᵀBA + C in a single pass.
+ *
+ * The @c atba counterpart of @c abat_add — an information-filter update
+ * (@c Hᵀ R⁻¹ H + P⁻¹) in one traversal.
+ *
+ * @tparam A Outer matrix type (m × n).
+ * @tparam B Inner matrix type (m × m).
+ * @tparam C Addend type (n × n).
+ * @param  a Outer matrix.
+ * @param  b Inner matrix.
+ * @param  c Matrix added to the product.
+ * @return   AᵀBA + C, whose pattern is the union of the product's and @p c's.
+ */
+template<SparseMatrixType A, SparseMatrixType B, SparseMatrixType C>
+SPARSEMAT_HD auto atba_add(const A& a, const B& b, const C& c) {
+  return detail::Congruence<A, B, detail::GramSide::Transposed, C>::congruence(a, b, c);
+}
+
+}  // namespace SparseLinearAlgebra
 // ---- sparsemat/operations/hadamard.h ----
 
 
@@ -3264,6 +4346,227 @@ SPARSEMAT_HD auto lu_solve(const SparseMat& A, const RHS& b) {
 }
 
 }  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/scale.h ----
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for scalar multiplication of a sparse matrix.
+ *
+ * The sparsity pattern is unchanged: multiplying by a scalar cannot introduce
+ * new non-zeros or eliminate existing ones (structural zeros remain zero).
+ *
+ * @tparam SparseMat The matrix type to scale.
+ */
+template<typename SparseMat>
+class Scale {
+ public:
+  using DataType = typename SparseMat::DataType;
+  static constexpr auto rows = SparseMat::rows;
+  static constexpr auto cols = SparseMat::cols;
+  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
+  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
+  static constexpr auto total_elements = rows * cols;
+
+  /// Returns the unchanged input sparsity as the result sparsity.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() { return SparseMat::indices(); }
+
+  /// Returns a copy of @p a with every stored value multiplied by @p factor.
+  SPARSEMAT_HD static auto scale(const SparseMat& a, DataType factor) {
+    SparseMat result;
+    result.values = a.values;
+
+    for (auto& it : result.values) {
+      it *= factor;
+    }
+    return result;
+  }
+
+  /// Multiplies every stored value of @p a by @p factor in place.
+  SPARSEMAT_HD static void scale_inplace(SparseMat& a, DataType factor) {
+    for (auto& it : a.values) {
+      it *= factor;
+    }
+  }
+};
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief Returns a scaled copy of @p a: every non-zero element multiplied by @p factor.
+ *
+ * The sparsity pattern is preserved unchanged; structural zeros are not stored
+ * and are unaffected.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @param  factor    Scalar multiplier.
+ * @return           Scaled matrix with the same sparsity pattern as @p a.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
+  return detail::Scale<SparseMat>::scale(a, factor);
+}
+
+/**
+ * @brief Multiplies every non-zero element of @p a by @p factor in place.
+ *
+ * Modifies @p a directly without allocating a new matrix.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Matrix to modify.
+ * @param  factor    Scalar multiplier.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD void scale_inplace(SparseMat& a, typename SparseMat::DataType factor) {
+  detail::Scale<SparseMat>::scale_inplace(a, factor);
+}
+
+/**
+ * @brief Computes the Frobenius norm of @p a: √(Σ aᵢⱼ²).
+ *
+ * Only iterates over the stored non-zero values; structural zeros contribute
+ * nothing to the sum.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           Frobenius norm as the matrix's @c DataType.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto frobenius(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  DataType sq_sum = 0;
+  for (auto& it : a.values) {
+    sq_sum += it * it;
+  }
+  return std::sqrt(sq_sum);
+}
+
+/**
+ * @brief Largest absolute value stored in @p a (the max-norm).
+ *
+ * Only the stored values are scanned; structural zeros cannot be the maximum
+ * unless the matrix has no stored values at all, in which case this is 0.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           @c max|aᵢⱼ|.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto max_abs(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  DataType worst = 0;
+  for (const auto& value : a.values) {
+    const DataType magnitude = value < DataType(0) ? -value : value;
+    if (magnitude > worst) {
+      worst = magnitude;
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief Computes the 1-norm of @p a: the largest absolute column sum.
+ *
+ * The norm the standard condition-number estimate is built on, and cheap here
+ * — accumulating per column costs one pass over the stored values, since a
+ * structural zero adds nothing.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           @c max_j Σᵢ|aᵢⱼ|.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto norm_1(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  std::array<DataType, static_cast<std::size_t>(SparseMat::cols)> sums{};
+  constexpr auto inds = SparseMat::indices();
+  for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+    const auto value = a.values[k];
+    sums[static_cast<std::size_t>(inds[k] % SparseMat::cols)] +=
+        value < DataType(0) ? -value : value;
+  }
+  DataType worst = 0;
+  for (const auto sum : sums) {
+    if (sum > worst) {
+      worst = sum;
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief Computes the ∞-norm of @p a: the largest absolute row sum.
+ *
+ * The row-wise counterpart of @c norm_1; equal to @c norm_1(transpose(a)), but
+ * computed without forming the transpose.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           @c max_i Σⱼ|aᵢⱼ|.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto norm_inf(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  std::array<DataType, static_cast<std::size_t>(SparseMat::rows)> sums{};
+  constexpr auto inds = SparseMat::indices();
+  for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+    const auto value = a.values[k];
+    sums[static_cast<std::size_t>(inds[k] / SparseMat::cols)] +=
+        value < DataType(0) ? -value : value;
+  }
+  DataType worst = 0;
+  for (const auto sum : sums) {
+    if (sum > worst) {
+      worst = sum;
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief Returns a unit-norm copy of @p a, scaled by @c 1/frobenius(a).
+ *
+ * The resulting matrix has a Frobenius norm of 1 for non-zero inputs.
+ * If @p a is the zero matrix, returns @p a unchanged.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           Normalized matrix with the same sparsity pattern as @p a.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto normalize(const SparseMat& a) {
+  const auto frobenius_norm = frobenius(a);
+  if (frobenius_norm == decltype(frobenius_norm)(0)) {
+    return a;
+  }
+  return detail::Scale<SparseMat>::scale(a,
+                                         static_cast<typename SparseMat::DataType>(1.0 /
+                                                                                   frobenius_norm));
+}
+
+/**
+ * @brief Normalizes @p a to unit Frobenius norm in place.
+ *
+ * Divides every stored element by @c frobenius(a). If @p a is the zero
+ * matrix, this operation is a no-op.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Matrix to normalize in place.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto normalize_inplace(SparseMat& a) {
+  const auto frobenius_norm = frobenius(a);
+  if (frobenius_norm == decltype(frobenius_norm)(0)) {
+    return;
+  }
+  detail::Scale<SparseMat>::scale_inplace(a,
+                                          static_cast<typename SparseMat::DataType>(
+                                              1.0 / frobenius_norm));
+}
+
+}  // namespace SparseLinearAlgebra
 
 namespace SparseLinearAlgebra::detail {
 
@@ -3403,6 +4706,38 @@ SPARSEMAT_HD auto cholesky_inverse(const SparseMat& a) {
   static_assert(SparseMat::rows == SparseMat::cols, "cholesky_inverse requires a square matrix.");
   const auto rhs = detail::identity_rhs<SparseMat>();
   return cholesky_solve(a, rhs);
+}
+
+/**
+ * @brief Estimates the 1-norm condition number @c ‖A‖₁·‖A⁻¹‖₁.
+ *
+ * Roughly how many digits a solve can lose: a condition number near @c 10ᵏ
+ * costs about @c k digits of the @c ~16 a double carries. Worth checking
+ * alongside @c ok(), which only catches the outright singular case — a matrix
+ * can factorize "successfully" and still return a solution with no correct
+ * digits, and without pivoting (see @c lu_solve) that happens sooner here than
+ * in a pivoting solver.
+ *
+ * @note This forms the inverse explicitly, so it is expensive and — since the
+ * inverse of a sparse matrix is generally dense — costs real compile time and
+ * binary size. It is a diagnostic to reach for while validating a pattern, not
+ * something to call on a hot path. It is also an exact computation of the
+ * 1-norm condition number rather than a cheap estimate in the LAPACK sense;
+ * "estimate" here refers to its use as a guide to accuracy.
+ *
+ * @tparam SparseMat Square input matrix type.
+ * @param  a         Matrix to examine.
+ * @return           @c Result wrapping the condition number; @c ok() is
+ *                   @c false if @p a is singular, where the true condition
+ *                   number is infinite.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto condition_number(const SparseMat& a) {
+  static_assert(SparseMat::rows == SparseMat::cols, "condition_number requires a square matrix.");
+  using DataType = typename SparseMat::DataType;
+  const auto inv = inverse(a);
+  const DataType estimate = norm_1(a) * norm_1(inv.value());
+  return Result<DataType>(estimate, inv.status());
 }
 
 }  // namespace SparseLinearAlgebra
@@ -3930,16 +5265,18 @@ SPARSEMAT_HD auto least_squares_solve(const A& a, const RHS& b) {
                 "scalar types — convert one operand explicitly first, e.g. "
                 "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
 
-  const auto at = transpose(a);
-
+  // The normal-equations matrix comes from ata()/aat() rather than
+  // transpose()+multiply(): those form it in one pass, so the transpose is
+  // never materialized. Aᵀb still needs the transpose, but only on the
+  // overdetermined path, and only against the (narrow) right-hand side.
   if constexpr (A::rows >= A::cols) {
     // Overdetermined (or square): AᵀA x = Aᵀb.
-    return cholesky_solve(multiply(at, a), multiply(at, b));
+    return cholesky_solve(ata(a), multiply(transpose(a), b));
   } else {
     // Underdetermined: solve (A Aᵀ) y = b, then x = Aᵀ y, which is the
     // minimum-norm solution.
-    auto y = cholesky_solve(multiply(a, at), b);
-    auto x = multiply(at, y.value());
+    auto y = cholesky_solve(aat(a), b);
+    auto x = multiply(transpose(a), y.value());
     return Result<decltype(x)>(std::move(x), y.status());
   }
 }
@@ -3963,142 +5300,653 @@ SPARSEMAT_HD auto residual(const A& a, const X& x, const RHS& b) {
 }
 
 }  // namespace SparseLinearAlgebra
-// ---- sparsemat/operations/scale.h ----
+// ---- sparsemat/operations/permute.h ----
+
+
+
+namespace SparseLinearAlgebra {
+
+/**
+ * @brief @c true if @p Perm contains each index in @c [0, N) exactly once.
+ *
+ * Every entry point that consumes a permutation checks this first: a repeated
+ * or out-of-range index would silently duplicate or drop entries, and the
+ * resulting matrix would look entirely plausible. Because permutations here are
+ * compile-time arrays, the check is a @c static_assert rather than a runtime
+ * guard — malformed orderings are rejected at the instantiation that used them.
+ *
+ * @tparam Perm Permutation array to check.
+ * @tparam N    Index range the permutation must cover.
+ * @return      @c true if @p Perm is a genuine permutation of @c [0, N).
+ */
+template<auto Perm, auto N>
+SPARSEMAT_HD constexpr bool is_permutation() {
+  if (Perm.size() != static_cast<std::size_t>(N)) {
+    return false;
+  }
+  std::array<bool, static_cast<std::size_t>(N)> seen{};
+  for (auto p : Perm) {
+    if (p < 0 || static_cast<std::size_t>(p) >= static_cast<std::size_t>(N) ||
+        seen[static_cast<std::size_t>(p)]) {
+      return false;
+    }
+    seen[static_cast<std::size_t>(p)] = true;
+  }
+  return true;
+}
+
+}  // namespace SparseLinearAlgebra
 
 namespace SparseLinearAlgebra::detail {
 
 /**
- * @brief Implementation policy for scalar multiplication of a sparse matrix.
+ * @brief Implementation policy for a row/column permutation.
  *
- * The sparsity pattern is unchanged: multiplying by a scalar cannot introduce
- * new non-zeros or eliminate existing ones (structural zeros remain zero).
+ * @c result[i,j] == @c a[RowPerm[i], ColPerm[j]]. Values move, nothing is
+ * computed, and the non-zero count is unchanged — only the pattern's shape
+ * changes, which is the entire point (see @c rcm_ordering).
  *
- * @tparam SparseMat The matrix type to scale.
+ * @tparam SparseMat Source matrix type.
+ * @tparam RowPerm   Array of @c SparseMat::rows source row indices.
+ * @tparam ColPerm   Array of @c SparseMat::cols source column indices.
  */
-template<typename SparseMat>
-class Scale {
+template<SparseMatrixType SparseMat, auto RowPerm, auto ColPerm>
+class Permute {
  public:
   using DataType = typename SparseMat::DataType;
-  static constexpr auto rows = SparseMat::rows;
-  static constexpr auto cols = SparseMat::cols;
-  static constexpr auto num_non_zeros = SparseMat::nonZeroCount;
-  static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
-  static constexpr auto total_elements = rows * cols;
+  using Int = typename SparseMat::Int;
+  static constexpr Int rows = SparseMat::rows;
+  static constexpr Int cols = SparseMat::cols;
 
-  /// Returns the unchanged input sparsity as the result sparsity.
-  SPARSEMAT_HD constexpr static auto calculate_sparsity() { return SparseMat::indices(); }
+  static_assert(RowPerm.size() == static_cast<std::size_t>(SparseMat::rows),
+                "Row permutation length must equal the matrix's row count.");
+  static_assert(ColPerm.size() == static_cast<std::size_t>(SparseMat::cols),
+                "Column permutation length must equal the matrix's column count.");
 
-  /// Returns a copy of @p a with every stored value multiplied by @p factor.
-  SPARSEMAT_HD static auto scale(const SparseMat& a, DataType factor) {
-    SparseMat result;
-    result.values = a.values;
+  /// Rejects anything that is not a genuine permutation — a repeated or
+  /// out-of-range index would silently duplicate or drop entries, and the
+  /// resulting matrix would look plausible.
+  static_assert(SparseLinearAlgebra::is_permutation<RowPerm, SparseMat::rows>(),
+                "Row permutation must contain each index in [0, rows) exactly once.");
+  static_assert(SparseLinearAlgebra::is_permutation<ColPerm, SparseMat::cols>(),
+                "Column permutation must contain each index in [0, cols) exactly once.");
 
-    for (auto& it : result.values) {
-      it *= factor;
+  static constexpr auto source_grid =
+      SparseLinearAlgebra::MatrixUtilities<SparseMat>::storage_index_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    const auto flat = (RowPerm[static_cast<std::size_t>(row)] * SparseMat::cols) +
+                      ColPerm[static_cast<std::size_t>(col)];
+    return source_grid[static_cast<std::size_t>(flat)] >= 0;
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Permute>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Permute>::calculate_sparsity();
+  }
+
+  /// Source storage offset per result slot, resolved once so the fill is a
+  /// flat copy loop — see block.h for why permutation-like operations use a
+  /// loop rather than a fold.
+  SPARSEMAT_HD constexpr static auto source_slots() {
+    constexpr auto sparsity = calculate_sparsity();
+    std::array<Int, sparsity.size()> slots{};
+    for (std::size_t k = 0; k < sparsity.size(); ++k) {
+      const Int i = sparsity[k] / cols;
+      const Int j = sparsity[k] % cols;
+      slots[k] = source_grid[static_cast<std::size_t>(
+          (RowPerm[static_cast<std::size_t>(i)] * SparseMat::cols) +
+          ColPerm[static_cast<std::size_t>(j)])];
+    }
+    return slots;
+  }
+
+  SPARSEMAT_HD static auto permute(const SparseMat& a) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    constexpr auto slots = source_slots();
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      result.values[k] = a.values[static_cast<std::size_t>(slots[k])];
     }
     return result;
   }
+};
 
-  /// Multiplies every stored value of @p a by @p factor in place.
-  SPARSEMAT_HD static void scale_inplace(SparseMat& a, DataType factor) {
-    for (auto& it : a.values) {
-      it *= factor;
+}  // namespace SparseLinearAlgebra::detail
+
+namespace SparseLinearAlgebra {
+
+/// The identity permutation of length @p N, for the axis you do not want to
+/// touch.
+template<typename Int, Int N>
+SPARSEMAT_HD constexpr auto identity_permutation() {
+  std::array<Int, static_cast<std::size_t>(N)> perm{};
+  for (Int i = 0; i < N; ++i) {
+    perm[static_cast<std::size_t>(i)] = i;
+  }
+  return perm;
+}
+
+/**
+ * @brief Inverts a permutation.
+ *
+ * @c permute reads @c a[Perm[i]] into result row @c i, so a solution computed
+ * in permuted coordinates has to be mapped back through the inverse:
+ * @c x[Perm[i]] == @c y[i], i.e. @c y[inverse[k]] is the value belonging to
+ * original index @c k.
+ *
+ * @p Perm is a template parameter rather than a function argument so that it can
+ * be validated: inverting scatters through @c perm[i] as an index, so an entry
+ * outside @c [0, N) would write past the end of the result. Every other
+ * permutation entry point in this header rejects a malformed ordering at compile
+ * time, and so does this one.
+ *
+ * @tparam Perm Permutation to invert.
+ * @return      Its inverse.
+ */
+template<auto Perm>
+SPARSEMAT_HD constexpr auto inverse_permutation() {
+  static_assert(is_permutation<Perm, Perm.size()>(),
+                "inverse_permutation requires a genuine permutation: each index in [0, N) "
+                "exactly once.");
+  using Int = std::remove_cvref_t<decltype(Perm[0])>;
+  std::array<Int, Perm.size()> inverse{};
+  for (std::size_t i = 0; i < Perm.size(); ++i) {
+    inverse[static_cast<std::size_t>(Perm[i])] = static_cast<Int>(i);
+  }
+  return inverse;
+}
+
+namespace detail {
+
+/**
+ * @brief Symmetrized adjacency of a matrix type's pattern, excluding the
+ *        diagonal.
+ *
+ * An edge is taken when either (i, j) or (j, i) is stored, which is what makes
+ * @c rcm_ordering meaningful for structurally non-symmetric matrices. Self-edges
+ * are dropped: they tell the traversal nothing.
+ *
+ * @tparam A Square matrix type.
+ * @return   @c adj[i][j] — whether nodes @c i and @c j are adjacent.
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD constexpr auto symmetrized_adjacency() {
+  constexpr auto n = static_cast<std::size_t>(A::rows);
+  std::array<std::array<bool, n>, n> adj{};
+  for (auto flat : A::indices()) {
+    const auto i = static_cast<std::size_t>(flat / A::cols);
+    const auto j = static_cast<std::size_t>(flat % A::cols);
+    if (i != j) {
+      adj[i][j] = true;
+      adj[j][i] = true;
     }
   }
+  return adj;
+}
+
+/// Neighbour count per node.
+template<typename Int, std::size_t N>
+SPARSEMAT_HD constexpr auto adjacency_degrees(const std::array<std::array<bool, N>, N>& adj) {
+  std::array<Int, N> degree{};
+  for (std::size_t i = 0; i < N; ++i) {
+    for (std::size_t j = 0; j < N; ++j) {
+      if (adj[i][j]) {
+        ++degree[i];
+      }
+    }
+  }
+  return degree;
+}
+
+/// Lowest-degree unvisited node, or @c N if every node has been visited. The
+/// standard cheap substitute for a pseudo-peripheral start node.
+template<typename Int, std::size_t N>
+SPARSEMAT_HD constexpr std::size_t lowest_degree_unvisited(const std::array<Int, N>& degree,
+                                                           const std::array<bool, N>& visited) {
+  std::size_t best = N;
+  for (std::size_t i = 0; i < N; ++i) {
+    if (!visited[i] && (best == N || degree[i] < degree[best])) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+/// Lowest-degree unvisited neighbour of @p current, or @c N if it has none left.
+/// Visiting neighbours in ascending degree order is what makes the traversal
+/// Cuthill–McKee rather than a plain breadth-first walk.
+template<typename Int, std::size_t N>
+SPARSEMAT_HD constexpr std::size_t lowest_degree_neighbour(
+    const std::array<std::array<bool, N>, N>& adj,
+    const std::array<Int, N>& degree,
+    const std::array<bool, N>& visited,
+    std::size_t current) {
+  std::size_t best = N;
+  for (std::size_t j = 0; j < N; ++j) {
+    if (adj[current][j] && !visited[j] && (best == N || degree[j] < degree[best])) {
+      best = j;
+    }
+  }
+  return best;
+}
+
+}  // namespace detail
+
+/**
+ * @brief Bandwidth of a matrix type's pattern: the largest @c |i-j| over its
+ *        stored entries.
+ *
+ * A direct measure of what a fill-reducing ordering is trying to shrink — the
+ * factors of a banded matrix stay inside the band, so a smaller bandwidth
+ * bounds the fill-in that @c lu_factorize and @c cholesky_factorize produce.
+ *
+ * @tparam A Matrix type to measure.
+ * @return   Bandwidth, or 0 for an empty pattern.
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD constexpr auto bandwidth() {
+  using Int = typename A::Int;
+  Int worst = 0;
+  for (auto flat : A::indices()) {
+    const Int i = flat / A::cols;
+    const Int j = flat % A::cols;
+    const Int spread = i > j ? i - j : j - i;
+    if (spread > worst) {
+      worst = spread;
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief Computes a reverse Cuthill–McKee ordering for a matrix type's pattern.
+ *
+ * RCM renumbers a symmetric-ish pattern to pull its entries towards the
+ * diagonal, which shrinks the bandwidth and with it the fill-in a subsequent
+ * factorization produces. Ordinary sparse libraries have to do this at runtime
+ * on the matrix in hand; here the pattern is a compile-time constant, so the
+ * whole ordering is derived at compile time and baked into the permuted type.
+ * That makes it a direct attack on this library's real cost centre — the
+ * factor's stored-value count is what drives compile time and binary size, and
+ * a reordering that halves it halves both.
+ *
+ * Usage is two steps, because the reordering has to be undone on the solution:
+ *
+ * @code
+ * constexpr auto p = SparseLinearAlgebra::rcm_ordering<decltype(a)>();
+ * auto reordered = SparseLinearAlgebra::symmetric_permute<p>(a);   // P A Pᵀ
+ * auto y = SparseLinearAlgebra::cholesky_solve(reordered, permute_rows<p>(b));
+ * // y is in permuted coordinates: original index p[i] holds y[i].
+ * @endcode
+ *
+ * The pattern is symmetrized first (an edge is taken when either (i,j) or
+ * (j,i) is stored), so this is meaningful for structurally non-symmetric
+ * matrices too. Each component starts from its lowest-degree unvisited node —
+ * the standard cheap substitute for a pseudo-peripheral start, which costs
+ * extra passes for a usually-marginal improvement — and disconnected
+ * components are handled by restarting.
+ *
+ * @tparam A Matrix type whose pattern to reorder; must be square.
+ * @return   Permutation array: @c perm[i] is the original index that moves to
+ *           position @c i.
+ */
+template<SparseMatrixType A>
+SPARSEMAT_HD constexpr auto rcm_ordering() {
+  using Int = typename A::Int;
+  static_assert(A::rows == A::cols, "rcm_ordering requires a square matrix.");
+  constexpr auto n = static_cast<std::size_t>(A::rows);
+
+  constexpr auto adj = detail::symmetrized_adjacency<A>();
+  constexpr auto degree = detail::adjacency_degrees<Int>(adj);
+
+  std::array<Int, n> order{};
+  std::array<bool, n> visited{};
+  std::size_t head = 0;
+  std::size_t tail = 0;
+
+  while (tail < n) {
+    if (head == tail) {
+      // Start (or restart, for a disconnected component) at the unvisited node
+      // of lowest degree.
+      const auto start = detail::lowest_degree_unvisited(degree, visited);
+      visited[start] = true;
+      order[tail++] = static_cast<Int>(start);
+    }
+
+    const auto current = static_cast<std::size_t>(order[head++]);
+    // Enqueue unvisited neighbours in ascending degree order — the choice that
+    // makes this Cuthill–McKee rather than a plain breadth-first walk.
+    for (auto next = detail::lowest_degree_neighbour(adj, degree, visited, current); next != n;
+         next = detail::lowest_degree_neighbour(adj, degree, visited, current)) {
+      visited[next] = true;
+      order[tail++] = static_cast<Int>(next);
+    }
+  }
+
+  // Reversing is what makes it *reverse* Cuthill–McKee: same bandwidth, but
+  // reliably less fill-in during factorization.
+  std::array<Int, n> perm{};
+  for (std::size_t i = 0; i < n; ++i) {
+    perm[i] = order[n - 1 - i];
+  }
+  return perm;
+}
+
+/**
+ * @brief Permutes rows and columns: @c result[i,j] == @c a[RowPerm[i], ColPerm[j]].
+ *
+ * Both permutations are compile-time arrays, so the reordered pattern — and
+ * therefore the result type — is known at compile time. The non-zero count is
+ * unchanged; only the shape of the pattern moves.
+ *
+ * @tparam RowPerm Array of source row indices, one per result row.
+ * @tparam ColPerm Array of source column indices, one per result column.
+ * @tparam A       Source matrix type.
+ * @param  a       Source matrix.
+ * @return         Permuted matrix.
+ */
+template<auto RowPerm, auto ColPerm, SparseMatrixType A>
+SPARSEMAT_HD auto permute(const A& a) {
+  return detail::Permute<A, RowPerm, ColPerm>::permute(a);
+}
+
+/**
+ * @brief Applies the same permutation to rows and columns: @c P A Pᵀ.
+ *
+ * The form a fill-reducing ordering takes for a square system, and the one
+ * that preserves symmetry and definiteness — so a symmetric positive definite
+ * matrix stays Cholesky-solvable after reordering.
+ *
+ * @tparam Perm Permutation array.
+ * @tparam A    Source matrix type (square).
+ * @param  a    Source matrix.
+ * @return      @c P A Pᵀ.
+ */
+template<auto Perm, SparseMatrixType A>
+SPARSEMAT_HD auto symmetric_permute(const A& a) {
+  static_assert(A::rows == A::cols, "symmetric_permute requires a square matrix.");
+  return detail::Permute<A, Perm, Perm>::permute(a);
+}
+
+/**
+ * @brief Permutes rows only — for moving a right-hand side into the same
+ *        coordinates as a reordered system.
+ *
+ * @tparam Perm Permutation array.
+ * @tparam A    Source matrix type.
+ * @param  a    Source matrix.
+ * @return      @c P A.
+ */
+template<auto Perm, SparseMatrixType A>
+SPARSEMAT_HD auto permute_rows(const A& a) {
+  return detail::Permute<A, Perm, identity_permutation<typename A::Int, A::cols>()>::permute(a);
+}
+
+/**
+ * @brief Permutes columns only.
+ *
+ * @tparam Perm Permutation array.
+ * @tparam A    Source matrix type.
+ * @param  a    Source matrix.
+ * @return      @c A Pᵀ.
+ */
+template<auto Perm, SparseMatrixType A>
+SPARSEMAT_HD auto permute_cols(const A& a) {
+  return detail::Permute<A, identity_permutation<typename A::Int, A::rows>(), Perm>::permute(a);
+}
+
+}  // namespace SparseLinearAlgebra
+// ---- sparsemat/operations/rank_update.h ----
+
+
+
+namespace SparseLinearAlgebra::detail {
+
+/**
+ * @brief Implementation policy for the outer product @c x yᵀ.
+ *
+ * @p x is m × 1 and @p y is n × 1, giving an m × n result whose pattern is the
+ * product of the two vectors' patterns: (i, j) is stored exactly when both
+ * @c x[i] and @c y[j] are.
+ *
+ * Every result element is a single multiplication, so there is no
+ * zero-skipping left to exploit at fill time and the fill is a runtime loop
+ * over a precomputed table rather than a fold — see
+ * @c MatrixUtilities::storage_index_grid().
+ *
+ * @tparam VecX Column vector type (m × 1).
+ * @tparam VecY Column vector type (n × 1).
+ */
+template<SparseMatrixType VecX, SparseMatrixType VecY>
+class Outer {
+ public:
+  using DataType = typename VecX::DataType;
+  using Int = typename VecX::Int;
+  static constexpr Int rows = VecX::rows;
+  static constexpr Int cols = VecY::rows;
+
+  static_assert(VecX::cols == 1 && VecY::cols == 1,
+                "An outer product takes two column vectors; transpose or reshape first.");
+  static_assert(SparseLinearAlgebra::SameDataType<VecX, VecY>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  static constexpr auto x_slots = SparseLinearAlgebra::MatrixUtilities<VecX>::storage_index_grid();
+  static constexpr auto y_slots = SparseLinearAlgebra::MatrixUtilities<VecY>::storage_index_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    return x_slots[static_cast<std::size_t>(row)] >= 0 &&
+           y_slots[static_cast<std::size_t>(col)] >= 0;
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Outer>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Outer>::calculate_sparsity();
+  }
+
+  /// The (x, y) storage offsets feeding each result slot.
+  SPARSEMAT_HD constexpr static auto source_slots() {
+    constexpr auto sparsity = calculate_sparsity();
+    std::array<std::array<Int, 2>, sparsity.size()> slots{};
+    for (std::size_t k = 0; k < sparsity.size(); ++k) {
+      slots[k][0] = x_slots[static_cast<std::size_t>(sparsity[k] / cols)];
+      slots[k][1] = y_slots[static_cast<std::size_t>(sparsity[k] % cols)];
+    }
+    return slots;
+  }
+
+  SPARSEMAT_HD static auto outer(const VecX& x, const VecY& y, DataType alpha) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result = SparseLinearAlgebra::MatrixUtilities<VecX>::template make<rows, cols, sparsity>(
+        std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    constexpr auto slots = source_slots();
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      result.values[k] = alpha * x.values[static_cast<std::size_t>(slots[k][0])] *
+                         y.values[static_cast<std::size_t>(slots[k][1])];
+    }
+    return result;
+  }
 };
+
+/**
+ * @brief Implementation policy for the rank-1 update @c A + alpha·x yᵀ.
+ *
+ * The update every Kalman gain application, BFGS step, and Sherman–Morrison
+ * correction is built from. Fusing it matters for the same reason @c axpy
+ * exists: written out, @c a.add(outer(x, y).scale(alpha)) materializes the
+ * full outer product — which is dense wherever both vectors are — purely to
+ * add it and throw it away. Here it is accumulated straight into the result.
+ *
+ * Result pattern is the union of A's and the outer product's, which is the
+ * correct superset: the update can create non-zeros where A had none, and
+ * cannot be assumed to cancel any that A has.
+ *
+ * @tparam SparseMat Base matrix type (m × n).
+ * @tparam VecX      Column vector type (m × 1).
+ * @tparam VecY      Column vector type (n × 1).
+ */
+template<SparseMatrixType SparseMat, SparseMatrixType VecX, SparseMatrixType VecY>
+class Rank1Update {
+ public:
+  using DataType = typename SparseMat::DataType;
+  using Int = typename SparseMat::Int;
+  static constexpr Int rows = SparseMat::rows;
+  static constexpr Int cols = SparseMat::cols;
+
+  static_assert(VecX::cols == 1 && VecY::cols == 1,
+                "A rank-1 update takes two column vectors; transpose or reshape first.");
+  static_assert(VecX::rows == SparseMat::rows && VecY::rows == SparseMat::cols,
+                "Incompatible dimensions for a rank-1 update: x must be A::rows × 1 and y must "
+                "be A::cols × 1.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, VecX> &&
+                    SparseLinearAlgebra::SameDataType<SparseMat, VecY>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types — convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
+
+  static constexpr auto a_slots =
+      SparseLinearAlgebra::MatrixUtilities<SparseMat>::storage_index_grid();
+  static constexpr auto x_slots = SparseLinearAlgebra::MatrixUtilities<VecX>::storage_index_grid();
+  static constexpr auto y_slots = SparseLinearAlgebra::MatrixUtilities<VecY>::storage_index_grid();
+
+  SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
+    if (a_slots[static_cast<std::size_t>((row * cols) + col)] >= 0) {
+      return true;
+    }
+    return x_slots[static_cast<std::size_t>(row)] >= 0 &&
+           y_slots[static_cast<std::size_t>(col)] >= 0;
+  }
+
+  /// Delegates to OperationUtilities to count result non-zeros.
+  SPARSEMAT_HD constexpr static auto num_nonzeros() {
+    return SparseLinearAlgebra::OperationUtilities<Rank1Update>::num_nonzeros();
+  }
+
+  /// Delegates to OperationUtilities to compute result sparsity indices.
+  SPARSEMAT_HD constexpr static auto calculate_sparsity() {
+    return SparseLinearAlgebra::OperationUtilities<Rank1Update>::calculate_sparsity();
+  }
+
+  /// Per result slot: the offsets into A, x and y, each -1 when that operand
+  /// contributes nothing there.
+  SPARSEMAT_HD constexpr static auto source_slots() {
+    constexpr auto sparsity = calculate_sparsity();
+    std::array<std::array<Int, 3>, sparsity.size()> slots{};
+    for (std::size_t k = 0; k < sparsity.size(); ++k) {
+      const Int i = sparsity[k] / cols;
+      const Int j = sparsity[k] % cols;
+      slots[k][0] = a_slots[static_cast<std::size_t>(sparsity[k])];
+      slots[k][1] = x_slots[static_cast<std::size_t>(i)];
+      slots[k][2] = y_slots[static_cast<std::size_t>(j)];
+    }
+    return slots;
+  }
+
+  SPARSEMAT_HD static auto update(const SparseMat& a,
+                                  const VecX& x,
+                                  const VecY& y,
+                                  DataType alpha) {
+    constexpr auto sparsity = calculate_sparsity();
+    auto result =
+        SparseLinearAlgebra::MatrixUtilities<SparseMat>::template make<rows, cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    constexpr auto slots = source_slots();
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      DataType value =
+          slots[k][0] >= 0 ? a.values[static_cast<std::size_t>(slots[k][0])] : DataType(0);
+      if (slots[k][1] >= 0 && slots[k][2] >= 0) {
+        value += alpha * x.values[static_cast<std::size_t>(slots[k][1])] *
+                 y.values[static_cast<std::size_t>(slots[k][2])];
+      }
+      result.values[k] = value;
+    }
+    return result;
+  }
+};
+
 }  // namespace SparseLinearAlgebra::detail
 
 namespace SparseLinearAlgebra {
 
 /**
- * @brief Returns a scaled copy of @p a: every non-zero element multiplied by @p factor.
+ * @brief Outer product @c alpha·x yᵀ of two column vectors.
  *
- * The sparsity pattern is preserved unchanged; structural zeros are not stored
- * and are unaffected.
+ * @p x is m × 1, @p y is n × 1, and the result is m × n, stored wherever both
+ * vectors are.
  *
- * @tparam SparseMat Matrix type.
- * @param  a         Input matrix.
- * @param  factor    Scalar multiplier.
- * @return           Scaled matrix with the same sparsity pattern as @p a.
+ * @tparam X     Left vector type (m × 1).
+ * @tparam Y     Right vector type (n × 1).
+ * @param  x     Left vector.
+ * @param  y     Right vector.
+ * @param  alpha Scalar multiplier (default 1).
+ * @return       @c alpha·x yᵀ.
  */
-template<SparseMatrixType SparseMat>
-SPARSEMAT_HD auto scale(const SparseMat& a, typename SparseMat::DataType factor) {
-  return detail::Scale<SparseMat>::scale(a, factor);
+template<SparseMatrixType X, SparseMatrixType Y>
+SPARSEMAT_HD auto outer(const X& x,
+                        const Y& y,
+                        typename X::DataType alpha = typename X::DataType(1)) {
+  return detail::Outer<X, Y>::outer(x, y, alpha);
 }
 
 /**
- * @brief Multiplies every non-zero element of @p a by @p factor in place.
+ * @brief Rank-1 update @c A + alpha·x yᵀ, computed in one pass.
  *
- * Modifies @p a directly without allocating a new matrix.
+ * The outer product is never materialized: each result element is written once
+ * as @c A[i,j] + alpha·x[i]·y[j]. The result pattern is the union of @p a's and
+ * the outer product's, so the update may widen the pattern — which is inherent
+ * to the operation, not an artifact of fusing it.
  *
- * @tparam SparseMat Matrix type.
- * @param  a         Matrix to modify.
- * @param  factor    Scalar multiplier.
+ * @tparam A     Base matrix type (m × n).
+ * @tparam X     Left vector type (m × 1).
+ * @tparam Y     Right vector type (n × 1).
+ * @param  a     Base matrix.
+ * @param  x     Left vector.
+ * @param  y     Right vector.
+ * @param  alpha Scalar multiplier on the update (default 1; pass -1 to
+ *               downdate).
+ * @return       @c A + alpha·x yᵀ.
  */
-template<SparseMatrixType SparseMat>
-SPARSEMAT_HD void scale_inplace(SparseMat& a, typename SparseMat::DataType factor) {
-  detail::Scale<SparseMat>::scale_inplace(a, factor);
+template<SparseMatrixType A, SparseMatrixType X, SparseMatrixType Y>
+SPARSEMAT_HD auto rank1_update(const A& a,
+                               const X& x,
+                               const Y& y,
+                               typename A::DataType alpha = typename A::DataType(1)) {
+  return detail::Rank1Update<A, X, Y>::update(a, x, y, alpha);
 }
 
 /**
- * @brief Computes the Frobenius norm of @p a: √(Σ aᵢⱼ²).
+ * @brief Symmetric rank-1 update @c A + alpha·x xᵀ.
  *
- * Only iterates over the stored non-zero values; structural zeros contribute
- * nothing to the sum.
+ * The common special case, and the one that keeps a symmetric matrix
+ * symmetric — a covariance correction, or a quasi-Newton curvature update.
  *
- * @tparam SparseMat Matrix type.
- * @param  a         Input matrix.
- * @return           Frobenius norm as the matrix's @c DataType.
+ * @tparam A     Base matrix type (n × n).
+ * @tparam X     Vector type (n × 1).
+ * @param  a     Base matrix.
+ * @param  x     Update vector.
+ * @param  alpha Scalar multiplier (default 1).
+ * @return       @c A + alpha·x xᵀ.
  */
-template<SparseMatrixType SparseMat>
-SPARSEMAT_HD auto frobenius(const SparseMat& a) {
-  using DataType = typename SparseMat::DataType;
-  DataType sq_sum = 0;
-  for (auto& it : a.values) {
-    sq_sum += it * it;
-  }
-  return std::sqrt(sq_sum);
-}
-
-/**
- * @brief Returns a unit-norm copy of @p a, scaled by @c 1/frobenius(a).
- *
- * The resulting matrix has a Frobenius norm of 1 for non-zero inputs.
- * If @p a is the zero matrix, returns @p a unchanged.
- *
- * @tparam SparseMat Matrix type.
- * @param  a         Input matrix.
- * @return           Normalized matrix with the same sparsity pattern as @p a.
- */
-template<SparseMatrixType SparseMat>
-SPARSEMAT_HD auto normalize(const SparseMat& a) {
-  const auto frobenius_norm = frobenius(a);
-  if (frobenius_norm == decltype(frobenius_norm)(0)) {
-    return a;
-  }
-  return detail::Scale<SparseMat>::scale(a,
-                                         static_cast<typename SparseMat::DataType>(1.0 /
-                                                                                   frobenius_norm));
-}
-
-/**
- * @brief Normalizes @p a to unit Frobenius norm in place.
- *
- * Divides every stored element by @c frobenius(a). If @p a is the zero
- * matrix, this operation is a no-op.
- *
- * @tparam SparseMat Matrix type.
- * @param  a         Matrix to normalize in place.
- */
-template<SparseMatrixType SparseMat>
-SPARSEMAT_HD auto normalize_inplace(SparseMat& a) {
-  const auto frobenius_norm = frobenius(a);
-  if (frobenius_norm == decltype(frobenius_norm)(0)) {
-    return;
-  }
-  detail::Scale<SparseMat>::scale_inplace(a,
-                                          static_cast<typename SparseMat::DataType>(
-                                              1.0 / frobenius_norm));
+template<SparseMatrixType A, SparseMatrixType X>
+SPARSEMAT_HD auto symmetric_rank1_update(const A& a,
+                                         const X& x,
+                                         typename A::DataType alpha = typename A::DataType(1)) {
+  static_assert(A::rows == A::cols, "symmetric_rank1_update requires a square matrix.");
+  return detail::Rank1Update<A, X, X>::update(a, x, x, alpha);
 }
 
 }  // namespace SparseLinearAlgebra
@@ -5092,6 +6940,224 @@ class SparseMat {
   }
 
   /**
+   * @brief Returns the Gram matrix AᵀA (@c Cols × @c Cols).
+   *
+   * Equivalent to @c transpose().multiply(*this), but the transpose is never
+   * materialized: element (i, j) is read directly as the inner product of
+   * columns @c i and @c j.
+   *
+   * @return AᵀA, symmetric by construction.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto ata() const { return SparseLinearAlgebra::ata(*this); }
+
+  /**
+   * @brief Returns the Gram matrix AAᵀ (@c Rows × @c Rows).
+   *
+   * The row-wise counterpart of @c ata(); likewise skips the transpose.
+   *
+   * @return AAᵀ, symmetric by construction.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto aat() const { return SparseLinearAlgebra::aat(*this); }
+
+  /**
+   * @brief Returns the congruence transform AᵀBA (@c Cols × @c Cols).
+   *
+   * @p b must be square with @c B::rows == @c B::cols == @c Rows. Neither Aᵀ
+   * nor the intermediate BA is materialized. The result is symmetric only when
+   * @p b is.
+   *
+   * @tparam B Inner matrix type.
+   * @param  b Inner (weight) matrix.
+   * @return   AᵀBA.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto atba(const B& b) const {
+    return SparseLinearAlgebra::atba(*this, b);
+  }
+
+  /**
+   * @brief Returns the congruence transform ABAᵀ (@c Rows × @c Rows).
+   *
+   * The other orientation of @c atba(), and the covariance propagation
+   * @c F P Fᵀ of a Kalman filter. @p b must be @c Cols × @c Cols.
+   *
+   * @tparam B Inner matrix type.
+   * @param  b Inner matrix.
+   * @return   ABAᵀ.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto abat(const B& b) const {
+    return SparseLinearAlgebra::abat(*this, b);
+  }
+
+  /**
+   * @brief Returns @c ABAᵀ + C in a single pass — the fused covariance
+   *        propagation @c F P Fᵀ + Q.
+   *
+   * @tparam B Inner matrix type (@c Cols × @c Cols).
+   * @tparam C Addend type (@c Rows × @c Rows).
+   * @param  b Inner matrix.
+   * @param  c Matrix added to the product.
+   * @return   ABAᵀ + C.
+   */
+  template<typename B, typename C>
+  [[nodiscard]] SPARSEMAT_HD auto abat_add(const B& b, const C& c) const {
+    return SparseLinearAlgebra::abat_add(*this, b, c);
+  }
+
+  /**
+   * @brief Returns @c AᵀBA + C in a single pass.
+   *
+   * @tparam B Inner matrix type (@c Rows × @c Rows).
+   * @tparam C Addend type (@c Cols × @c Cols).
+   * @param  b Inner matrix.
+   * @param  c Matrix added to the product.
+   * @return   AᵀBA + C.
+   */
+  template<typename B, typename C>
+  [[nodiscard]] SPARSEMAT_HD auto atba_add(const B& b, const C& c) const {
+    return SparseLinearAlgebra::atba_add(*this, b, c);
+  }
+
+  /**
+   * @brief Returns AᵀB without materializing Aᵀ. @p b must have @c Rows rows.
+   *
+   * @tparam B Right matrix type.
+   * @param  b Right matrix.
+   * @return   AᵀB.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto atb(const B& b) const {
+    return SparseLinearAlgebra::atb(*this, b);
+  }
+
+  /**
+   * @brief Returns ABᵀ without materializing Bᵀ. @p b must have @c Cols columns.
+   *
+   * @tparam B Right matrix type.
+   * @param  b Right matrix.
+   * @return   ABᵀ.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto abt(const B& b) const {
+    return SparseLinearAlgebra::abt(*this, b);
+  }
+
+  /**
+   * @brief Extracts the @p NRows × @p NCols block whose top-left corner is
+   *        (@p Row0, @p Col0).
+   *
+   * @tparam Row0  First row of the window.
+   * @tparam Col0  First column of the window.
+   * @tparam NRows Window height.
+   * @tparam NCols Window width.
+   * @return       The extracted block.
+   */
+  template<auto Row0, auto Col0, auto NRows, auto NCols>
+  [[nodiscard]] SPARSEMAT_HD auto submatrix() const {
+    return SparseLinearAlgebra::submatrix<Row0, Col0, NRows, NCols>(*this);
+  }
+
+  /**
+   * @brief Extracts row @p I as a 1 × @c Cols matrix.
+   * @tparam I Row index.
+   */
+  template<auto I>
+  [[nodiscard]] SPARSEMAT_HD auto row() const {
+    return SparseLinearAlgebra::row<I>(*this);
+  }
+
+  /**
+   * @brief Extracts column @p J as a @c Rows × 1 matrix.
+   * @tparam J Column index.
+   */
+  template<auto J>
+  [[nodiscard]] SPARSEMAT_HD auto col() const {
+    return SparseLinearAlgebra::col<J>(*this);
+  }
+
+  /**
+   * @brief Joins @p b to the right: @c [A B]. Row counts must match.
+   *
+   * @tparam B Right operand type.
+   * @param  b Right operand.
+   * @return   @c Rows × (@c Cols + @c B::cols) matrix.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto hcat(const B& b) const {
+    return SparseLinearAlgebra::hcat(*this, b);
+  }
+
+  /**
+   * @brief Stacks @p b underneath: @c [A; B]. Column counts must match.
+   *
+   * @tparam B Bottom operand type.
+   * @param  b Bottom operand.
+   * @return   (@c Rows + @c B::rows) × @c Cols matrix.
+   */
+  template<typename B>
+  [[nodiscard]] SPARSEMAT_HD auto vcat(const B& b) const {
+    return SparseLinearAlgebra::vcat(*this, b);
+  }
+
+  /**
+   * @brief Permutes rows and columns: @c result[i,j] == @c a[RowPerm[i], ColPerm[j]].
+   *
+   * @tparam RowPerm Array of source row indices.
+   * @tparam ColPerm Array of source column indices.
+   * @return         Permuted matrix.
+   */
+  template<auto RowPerm, auto ColPerm>
+  [[nodiscard]] SPARSEMAT_HD auto permute() const {
+    return SparseLinearAlgebra::permute<RowPerm, ColPerm>(*this);
+  }
+
+  /**
+   * @brief Applies the same permutation to rows and columns: @c P A Pᵀ.
+   *
+   * The form a fill-reducing ordering takes for a square system; pair it with
+   * @c rcm_ordering<T>() to shrink the bandwidth before factorizing.
+   *
+   * @tparam Perm Permutation array.
+   * @return      @c P A Pᵀ.
+   */
+  template<auto Perm>
+  [[nodiscard]] SPARSEMAT_HD auto symmetric_permute() const {
+    return SparseLinearAlgebra::symmetric_permute<Perm>(*this);
+  }
+
+  /**
+   * @brief Returns @c A + alpha·x yᵀ without materializing the outer product.
+   *
+   * @tparam X     Left vector type (@c Rows × 1).
+   * @tparam Y     Right vector type (@c Cols × 1).
+   * @param  x     Left vector.
+   * @param  y     Right vector.
+   * @param  alpha Scalar multiplier (default 1; pass -1 to downdate).
+   * @return       @c A + alpha·x yᵀ, whose pattern may be wider than @c A's.
+   */
+  template<typename X, typename Y>
+  [[nodiscard]] SPARSEMAT_HD auto rank1_update(const X& x,
+                                               const Y& y,
+                                               DataType alpha = DataType(1)) const {
+    return SparseLinearAlgebra::rank1_update(*this, x, y, alpha);
+  }
+
+  /**
+   * @brief Returns @c A + alpha·x xᵀ — the symmetry-preserving special case.
+   *
+   * @tparam X     Vector type (@c Rows × 1).
+   * @param  x     Update vector.
+   * @param  alpha Scalar multiplier (default 1).
+   * @return       @c A + alpha·x xᵀ.
+   */
+  template<typename X>
+  [[nodiscard]] SPARSEMAT_HD auto symmetric_rank1_update(const X& x,
+                                                         DataType alpha = DataType(1)) const {
+    return SparseLinearAlgebra::symmetric_rank1_update(*this, x, alpha);
+  }
+
+  /**
    * @brief Returns a scaled copy: every non-zero element multiplied by @p factor.
    *
    * Sparsity pattern is unchanged.
@@ -5234,6 +7300,24 @@ class SparseMat {
   [[nodiscard]] SPARSEMAT_HD auto frobenius() const {
     return SparseLinearAlgebra::frobenius(*this);
   }
+
+  /**
+   * @brief Largest absolute stored value (the max-norm).
+   * @return @c max|aᵢⱼ|.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto max_abs() const { return SparseLinearAlgebra::max_abs(*this); }
+
+  /**
+   * @brief 1-norm: the largest absolute column sum.
+   * @return @c max_j Σᵢ|aᵢⱼ|.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto norm_1() const { return SparseLinearAlgebra::norm_1(*this); }
+
+  /**
+   * @brief ∞-norm: the largest absolute row sum.
+   * @return @c max_i Σⱼ|aᵢⱼ|.
+   */
+  [[nodiscard]] SPARSEMAT_HD auto norm_inf() const { return SparseLinearAlgebra::norm_inf(*this); }
 
   /**
    * @brief Expands the sparse matrix into a fully dense @c SparseMat.

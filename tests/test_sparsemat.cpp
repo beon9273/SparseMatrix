@@ -229,6 +229,389 @@ SPARSEMAT_HD void test_transpose_nonsquare() {
   check_eq(ct.template get<2, 5>(), 6.0, "transpose 6x3: (2,5)");
 }
 
+// A is 3x2 with (0,0)=1, (0,1)=2, (1,1)=3, (2,0)=4 (flat 0, 1, 3, 4).
+using GramA = SparseMat<double, IntType, 3, 2, 0, 1, 3, 4>;
+
+SPARSEMAT_HD void test_ata() {
+  GramA a(1.0, 2.0, 3.0, 4.0);
+  auto g = a.ata();
+  check_eq(decltype(g)::rows, IntType(2), "ata: result rows");
+  check_eq(decltype(g)::cols, IntType(2), "ata: result cols");
+  // Columns are (1,0,4) and (2,3,0): [[17,2],[2,13]].
+  check_eq(g.template get<0, 0>(), 17.0, "ata: (0,0)");
+  check_eq(g.template get<0, 1>(), 2.0, "ata: (0,1)");
+  check_eq(g.template get<1, 0>(), 2.0, "ata: (1,0)");
+  check_eq(g.template get<1, 1>(), 13.0, "ata: (1,1)");
+
+  // Same result as the eager transpose-then-multiply, pattern included.
+  auto eager = (a.transpose() * a);
+  check_eq(decltype(g)::nonZeroCount,
+           decltype(eager)::nonZeroCount,
+           "ata: nonZeroCount matches transpose().multiply()");
+  check_eq(g.template get<0, 1>(), eager.template get<0, 1>(), "ata: matches eager (0,1)");
+  check_eq(g.template get<1, 1>(), eager.template get<1, 1>(), "ata: matches eager (1,1)");
+}
+
+SPARSEMAT_HD void test_aat() {
+  GramA a(1.0, 2.0, 3.0, 4.0);
+  auto g = a.aat();
+  check_eq(decltype(g)::rows, IntType(3), "aat: result rows");
+  check_eq(decltype(g)::cols, IntType(3), "aat: result cols");
+  // Rows are (1,2), (0,3), (4,0): rows 1 and 2 share no column, so (1,2) and
+  // (2,1) are structurally zero.
+  check_eq(g.template get<0, 0>(), 5.0, "aat: (0,0)");
+  check_eq(g.template get<0, 1>(), 6.0, "aat: (0,1)");
+  check_eq(g.template get<0, 2>(), 4.0, "aat: (0,2)");
+  check_eq(g.template get<1, 1>(), 9.0, "aat: (1,1)");
+  check_eq(g.template get<1, 2>(), 0.0, "aat: structural zero (1,2)");
+  check_eq(g.template get<2, 2>(), 16.0, "aat: (2,2)");
+  check_eq(decltype(g)::nonZeroCount, IntType(7), "aat: nonZeroCount excludes the disjoint pair");
+}
+
+SPARSEMAT_HD void test_atba() {
+  GramA a(1.0, 2.0, 3.0, 4.0);
+
+  // B = diag(2, 5, 3): a weighted normal equation. The result is the weighted
+  // sum of outer products of A's rows: 2*[[1,2],[2,4]] + 5*[[0,0],[0,9]] +
+  // 3*[[16,0],[0,0]] = [[50,4],[4,53]].
+  SparseMat<double, IntType, 3, 3, 0, 4, 8> w(2.0, 5.0, 3.0);
+  auto g = a.atba(w);
+  check_eq(decltype(g)::rows, IntType(2), "atba: result rows");
+  check_eq(decltype(g)::cols, IntType(2), "atba: result cols");
+  check_eq(g.template get<0, 0>(), 50.0, "atba: (0,0)");
+  check_eq(g.template get<0, 1>(), 4.0, "atba: (0,1)");
+  check_eq(g.template get<1, 0>(), 4.0, "atba: (1,0)");
+  check_eq(g.template get<1, 1>(), 53.0, "atba: (1,1)");
+
+  // B = I reduces to A^T A.
+  SparseMat<double, IntType, 3, 3, 0, 4, 8> eye(1.0, 1.0, 1.0);
+  auto ident = a.atba(eye);
+  auto gram = a.ata();
+  check_eq(ident.template get<0, 0>(), gram.template get<0, 0>(), "atba: B=I matches ata (0,0)");
+  check_eq(ident.template get<0, 1>(), gram.template get<0, 1>(), "atba: B=I matches ata (0,1)");
+  check_eq(ident.template get<1, 1>(), gram.template get<1, 1>(), "atba: B=I matches ata (1,1)");
+
+  // Non-symmetric B: the result is not symmetric either. B has (0,1)=1 only,
+  // so A^T B A = a_0 (row 0) outer a_1 (row 1) = [1,2]^T [0,3] = [[0,3],[0,6]].
+  SparseMat<double, IntType, 3, 3, 1> skew(1.0);
+  auto ns = a.atba(skew);
+  check_eq(ns.template get<0, 0>(), 0.0, "atba: nonsymmetric (0,0)");
+  check_eq(ns.template get<0, 1>(), 3.0, "atba: nonsymmetric (0,1)");
+  check_eq(ns.template get<1, 0>(), 0.0, "atba: nonsymmetric (1,0)");
+  check_eq(ns.template get<1, 1>(), 6.0, "atba: nonsymmetric (1,1)");
+
+  // Same result as the eager triple product.
+  auto eager = (a.transpose() * w * a);
+  check_eq(g.template get<0, 1>(), eager.template get<0, 1>(), "atba: matches eager (0,1)");
+  check_eq(g.template get<1, 1>(), eager.template get<1, 1>(), "atba: matches eager (1,1)");
+}
+
+SPARSEMAT_HD void test_abat_and_joseph() {
+  // A is 3x2 as above; P is a dense 2x2 [[1,2],[3,4]].
+  GramA a(1.0, 2.0, 3.0, 4.0);
+  SparseMat<double, IntType, 2, 2, 0, 1, 2, 3> p(1.0, 2.0, 3.0, 4.0);
+
+  auto g = a.abat(p);
+  check_eq(decltype(g)::rows, IntType(3), "abat: result rows");
+  check_eq(decltype(g)::cols, IntType(3), "abat: result cols");
+  // Row 0 of A is (1,2), so (0,0) is [1,2]·P·[1;2] = [7,10]·[1;2] = 27.
+  check_eq(g.template get<0, 0>(), 27.0, "abat: (0,0)");
+  // Row 1 is (0,3): (1,1) = 9*P[1,1] = 36. Row 2 is (4,0): (2,2) = 16*P[0,0] = 16.
+  check_eq(g.template get<1, 1>(), 36.0, "abat: (1,1)");
+  check_eq(g.template get<2, 2>(), 16.0, "abat: (2,2)");
+
+  // Matches the eager triple product.
+  auto eager = a * p * a.transpose();
+  check_eq(g.template get<0, 1>(), eager.template get<0, 1>(), "abat: matches eager (0,1)");
+  check_eq(g.template get<2, 2>(), eager.template get<2, 2>(), "abat: matches eager (2,2)");
+
+  // Joseph form: ABAᵀ + Q with Q = I adds one to each diagonal entry.
+  SparseMat<double, IntType, 3, 3, 0, 4, 8> q(1.0, 1.0, 1.0);
+  auto joseph = a.abat_add(p, q);
+  check_eq(joseph.template get<0, 0>(), 28.0, "abat_add: (0,0)");
+  check_eq(joseph.template get<1, 1>(), 37.0, "abat_add: (1,1)");
+  check_eq(joseph.template get<0, 1>(), g.template get<0, 1>(), "abat_add: off-diagonal unchanged");
+
+  // The addend widens the pattern: AAᵀ leaves (1,2) structurally zero (rows 1
+  // and 2 of A are disjoint), and adding a diagonal Q must not resurrect it,
+  // but adding a full matrix must.
+  // (With the dense P above, (1,2) is already non-zero — P couples A's two
+  // columns — so use the identity, for which ABAᵀ is exactly AAᵀ.)
+  SparseMat<double, IntType, 2, 2, 0, 3> eye(1.0, 1.0);
+  SparseMat<double, IntType, 3, 3, 5> corner(2.0);  // (1,2) only
+  auto plain = a.abat(eye);
+  auto widened = a.abat_add(eye, corner);
+  check_eq(decltype(widened)::nonZeroCount > decltype(plain)::nonZeroCount,
+           true,
+           "abat_add: addend widens the pattern");
+  check_eq(widened.template get<1, 2>(), 2.0, "abat_add: addend-only position");
+
+  // AᵀBA + C, the other orientation.
+  SparseMat<double, IntType, 3, 3, 0, 4, 8> w(2.0, 5.0, 3.0);
+  SparseMat<double, IntType, 2, 2, 0, 3> eye2(1.0, 1.0);
+  auto info = a.atba_add(w, eye2);
+  check_eq(info.template get<0, 0>(), 51.0, "atba_add: (0,0)");
+  check_eq(info.template get<1, 1>(), 54.0, "atba_add: (1,1)");
+  check_eq(info.template get<0, 1>(), 4.0, "atba_add: (0,1) unchanged by diagonal addend");
+}
+
+SPARSEMAT_HD void test_atb_abt() {
+  GramA a(1.0, 2.0, 3.0, 4.0);
+  // With both operands the same, these must agree with the Gram products.
+  auto t = a.atb(a);
+  auto gram = a.ata();
+  check_eq(decltype(t)::rows, IntType(2), "atb: result rows");
+  check_eq(t.template get<0, 0>(), gram.template get<0, 0>(), "atb: matches ata (0,0)");
+  check_eq(t.template get<0, 1>(), gram.template get<0, 1>(), "atb: matches ata (0,1)");
+
+  auto u = a.abt(a);
+  auto gram2 = a.aat();
+  check_eq(decltype(u)::rows, IntType(3), "abt: result rows");
+  check_eq(u.template get<0, 1>(), gram2.template get<0, 1>(), "abt: matches aat (0,1)");
+  check_eq(u.template get<2, 2>(), gram2.template get<2, 2>(), "abt: matches aat (2,2)");
+
+  // Distinct operands: B is 3x1, so AᵀB is 2x1 — Aᵀ times a column.
+  SparseMat<double, IntType, 3, 1, 0, 2> b(1.0, 1.0);
+  auto v = a.atb(b);
+  check_eq(decltype(v)::rows, IntType(2), "atb: rectangular result rows");
+  check_eq(decltype(v)::cols, IntType(1), "atb: rectangular result cols");
+  // Column 0 of A is (1,0,4) · (1,0,1) = 5; column 1 is (2,3,0) · (1,0,1) = 2.
+  check_eq(v.template get<0, 0>(), 5.0, "atb: (0,0)");
+  check_eq(v.template get<1, 0>(), 2.0, "atb: (1,0)");
+}
+
+SPARSEMAT_HD void test_submatrix() {
+  // 3x3 with (0,0)=1, (0,2)=2, (1,1)=3, (2,0)=4.
+  SparseMat<double, IntType, 3, 3, 0, 2, 4, 6> a(1.0, 2.0, 3.0, 4.0);
+
+  auto top_left = a.template submatrix<0, 0, 2, 2>();
+  check_eq(decltype(top_left)::rows, IntType(2), "submatrix: result rows");
+  check_eq(decltype(top_left)::cols, IntType(2), "submatrix: result cols");
+  check_eq(decltype(top_left)::nonZeroCount,
+           IntType(2),
+           "submatrix: only entries inside the window");
+  check_eq(top_left.template get<0, 0>(), 1.0, "submatrix: (0,0)");
+  check_eq(top_left.template get<1, 1>(), 3.0, "submatrix: (1,1)");
+  check_eq(top_left.template get<0, 1>(), 0.0, "submatrix: structural zero (0,1)");
+
+  // An off-origin window re-indexes correctly.
+  auto bottom_right = a.template submatrix<1, 1, 2, 2>();
+  check_eq(bottom_right.template get<0, 0>(), 3.0, "submatrix: off-origin (0,0)");
+  check_eq(decltype(bottom_right)::nonZeroCount, IntType(1), "submatrix: off-origin nonZeroCount");
+
+  auto r = a.template row<2>();
+  check_eq(decltype(r)::rows, IntType(1), "row: result rows");
+  check_eq(decltype(r)::cols, IntType(3), "row: result cols");
+  check_eq(r.template get<0, 0>(), 4.0, "row: (0,0)");
+
+  auto c = a.template col<0>();
+  check_eq(decltype(c)::rows, IntType(3), "col: result rows");
+  check_eq(decltype(c)::cols, IntType(1), "col: result cols");
+  check_eq(c.template get<0, 0>(), 1.0, "col: (0,0)");
+  check_eq(c.template get<2, 0>(), 4.0, "col: (2,0)");
+  check_eq(decltype(c)::nonZeroCount, IntType(2), "col: nonZeroCount");
+}
+
+SPARSEMAT_HD void test_concat() {
+  SparseMat<double, IntType, 3, 3, 0, 2, 4, 6> a(1.0, 2.0, 3.0, 4.0);
+
+  SparseMat<double, IntType, 3, 1, 0> v(9.0);
+  auto h = a.hcat(v);
+  check_eq(decltype(h)::rows, IntType(3), "hcat: result rows");
+  check_eq(decltype(h)::cols, IntType(4), "hcat: result cols");
+  check_eq(decltype(h)::nonZeroCount, IntType(5), "hcat: nnz(a) + nnz(b)");
+  check_eq(h.template get<0, 3>(), 9.0, "hcat: right operand value");
+  check_eq(h.template get<2, 0>(), 4.0, "hcat: left operand value");
+  check_eq(h.template get<1, 3>(), 0.0, "hcat: structural zero in right block");
+
+  SparseMat<double, IntType, 1, 3, 1> w(7.0);
+  auto vv = a.vcat(w);
+  check_eq(decltype(vv)::rows, IntType(4), "vcat: result rows");
+  check_eq(decltype(vv)::cols, IntType(3), "vcat: result cols");
+  check_eq(decltype(vv)::nonZeroCount, IntType(5), "vcat: nnz(a) + nnz(b)");
+  check_eq(vv.template get<3, 1>(), 7.0, "vcat: bottom operand value");
+  check_eq(vv.template get<0, 2>(), 2.0, "vcat: top operand value");
+
+  // Round trip: splitting a concatenation puts both halves back.
+  auto left = h.template submatrix<0, 0, 3, 3>();
+  check_eq(left.template get<0, 2>(), 2.0, "concat: round trip through submatrix");
+  check_eq(decltype(left)::nonZeroCount, IntType(4), "concat: round trip nonZeroCount");
+}
+
+SPARSEMAT_HD void test_permute() {
+  // 3x3 with (0,0)=1, (0,2)=2, (1,1)=3, (2,0)=4.
+  SparseMat<double, IntType, 3, 3, 0, 2, 4, 6> a(1.0, 2.0, 3.0, 4.0);
+
+  // Reversal: result[i,j] = a[2-i, 2-j].
+  constexpr std::array<IntType, 3> rev{2, 1, 0};
+  auto r = a.template symmetric_permute<rev>();
+  check_eq(decltype(r)::nonZeroCount, IntType(4), "symmetric_permute: nonZeroCount preserved");
+  check_eq(r.template get<0, 2>(), 4.0, "symmetric_permute: (0,2) was (2,0)");
+  check_eq(r.template get<2, 0>(), 2.0, "symmetric_permute: (2,0) was (0,2)");
+  check_eq(r.template get<1, 1>(), 3.0, "symmetric_permute: diagonal fixed point");
+
+  // Applying the inverse restores the original.
+  constexpr auto back = SparseLinearAlgebra::inverse_permutation<rev>();
+  auto restored = r.template symmetric_permute<back>();
+  check_eq(restored.template get<0, 0>(), 1.0, "symmetric_permute: inverse restores (0,0)");
+  check_eq(restored.template get<2, 0>(), 4.0, "symmetric_permute: inverse restores (2,0)");
+
+  // Row-only permutation moves rows without touching columns.
+  auto rows_only = SparseLinearAlgebra::permute_rows<rev>(a);
+  check_eq(rows_only.template get<0, 0>(), 4.0, "permute_rows: (0,0) was (2,0)");
+  check_eq(rows_only.template get<2, 2>(), 2.0, "permute_rows: (2,2) was (0,2)");
+
+  // Column-only permutation is the other half; doing both is the symmetric
+  // permutation above.
+  auto cols_only = SparseLinearAlgebra::permute_cols<rev>(a);
+  check_eq(cols_only.template get<0, 0>(), 2.0, "permute_cols: (0,0) was (0,2)");
+  check_eq(cols_only.template get<2, 2>(), 4.0, "permute_cols: (2,2) was (2,0)");
+  check_eq(SparseLinearAlgebra::permute_rows<rev>(cols_only).template get<0, 2>(),
+           4.0,
+           "permute_cols: composes with permute_rows into the symmetric permutation");
+
+  // The general two-permutation form, on a non-square matrix where the row and
+  // column permutations necessarily differ in length.
+  constexpr std::array<IntType, 3> swap_rows{1, 0, 2};
+  constexpr std::array<IntType, 2> swap_cols{1, 0};
+  GramA rect(1.0, 2.0, 3.0, 4.0);  // [[1,2],[0,3],[4,0]]
+  auto both = rect.template permute<swap_rows, swap_cols>();
+  check_eq(decltype(both)::rows, IntType(3), "permute: non-square result rows");
+  check_eq(decltype(both)::cols, IntType(2), "permute: non-square result cols");
+  check_eq(both.template get<0, 0>(), 3.0, "permute: (0,0) was (1,1)");
+  check_eq(both.template get<1, 1>(), 1.0, "permute: (1,1) was (0,0)");
+  check_eq(both.template get<2, 1>(), 4.0, "permute: (2,1) was (2,0)");
+}
+
+SPARSEMAT_HD void test_rcm_ordering() {
+  // A 6x6 "arrow": node 0 is adjacent to every other node, which puts entries
+  // as far from the diagonal as the matrix allows.
+  using Arrow = SparseMat<double,
+                          IntType,
+                          6,
+                          6,
+                          0,
+                          1,
+                          2,
+                          3,
+                          4,
+                          5,  // row 0: full
+                          6,
+                          7,  // row 1: (1,0),(1,1)
+                          12,
+                          14,  // row 2: (2,0),(2,2)
+                          18,
+                          21,  // row 3: (3,0),(3,3)
+                          24,
+                          28,  // row 4: (4,0),(4,4)
+                          30,
+                          35>;  // row 5: (5,0),(5,5)
+  Arrow a(1, 1, 1, 1, 1, 1, 1, 2, 1, 3, 1, 4, 1, 5, 1, 6);
+
+  constexpr auto perm = SparseLinearAlgebra::rcm_ordering<Arrow>();
+  auto reordered = a.template symmetric_permute<perm>();
+
+  check_eq(decltype(reordered)::nonZeroCount,
+           Arrow::nonZeroCount,
+           "rcm_ordering: permutation preserves nonZeroCount");
+  check_eq(SparseLinearAlgebra::bandwidth<decltype(reordered)>() <
+               SparseLinearAlgebra::bandwidth<Arrow>(),
+           true,
+           "rcm_ordering: bandwidth is reduced");
+
+  // The hub keeps its value wherever RCM moved it, and the permutation is a
+  // genuine one — every original index appears exactly once.
+  std::array<bool, 6> seen{};
+  for (auto p : perm) {
+    seen[static_cast<std::size_t>(p)] = true;
+  }
+  bool all_present = true;
+  for (auto s : seen) {
+    all_present = all_present && s;
+  }
+  check_eq(all_present, true, "rcm_ordering: result is a permutation");
+
+  // A tridiagonal matrix is already optimally ordered, so RCM must not make it
+  // worse.
+  using Tri = SparseMat<double, IntType, 4, 4, 0, 1, 4, 5, 6, 9, 10, 11, 14, 15>;
+  constexpr auto tri_perm = SparseLinearAlgebra::rcm_ordering<Tri>();
+  Tri t(2, -1, -1, 2, -1, -1, 2, -1, -1, 2);
+  auto tri_reordered = t.template symmetric_permute<tri_perm>();
+  check_eq(SparseLinearAlgebra::bandwidth<decltype(tri_reordered)>(),
+           SparseLinearAlgebra::bandwidth<Tri>(),
+           "rcm_ordering: tridiagonal bandwidth is not degraded");
+}
+
+SPARSEMAT_HD void test_rank1_update() {
+  SparseMat<double, IntType, 3, 1, 0, 2> x(1.0, 2.0);  // (1, 0, 2)
+  SparseMat<double, IntType, 2, 1, 0> y(3.0);          // (3, 0)
+
+  auto o = SparseLinearAlgebra::outer(x, y);
+  check_eq(decltype(o)::rows, IntType(3), "outer: result rows");
+  check_eq(decltype(o)::cols, IntType(2), "outer: result cols");
+  check_eq(decltype(o)::nonZeroCount, IntType(2), "outer: pattern is the product of both");
+  check_eq(o.template get<0, 0>(), 3.0, "outer: (0,0)");
+  check_eq(o.template get<2, 0>(), 6.0, "outer: (2,0)");
+  check_eq(o.template get<0, 1>(), 0.0, "outer: structural zero (0,1)");
+
+  // A + 2·x yᵀ over the 3x2 A: (0,0) = 1 + 2*1*3 = 7, (2,0) = 4 + 2*2*3 = 16.
+  GramA a(1.0, 2.0, 3.0, 4.0);
+  auto updated = a.rank1_update(x, y, 2.0);
+  check_eq(updated.template get<0, 0>(), 7.0, "rank1_update: (0,0)");
+  check_eq(updated.template get<2, 0>(), 16.0, "rank1_update: (2,0)");
+  check_eq(updated.template get<0, 1>(), 2.0, "rank1_update: untouched (0,1)");
+  check_eq(decltype(updated)::nonZeroCount,
+           IntType(4),
+           "rank1_update: pattern unchanged when the update lands on stored positions");
+
+  // A downdate is the same operation with a negative alpha.
+  auto downdated = a.rank1_update(x, y, -2.0);
+  check_eq(downdated.template get<0, 0>(), -5.0, "rank1_update: negative alpha");
+
+  // An update outside A's pattern widens it: (1,0) is structurally zero in A.
+  SparseMat<double, IntType, 3, 1, 1> mid(5.0);  // only row 1 non-zero
+  auto widened = a.rank1_update(mid, y);
+  check_eq(decltype(widened)::nonZeroCount, IntType(5), "rank1_update: pattern widened");
+  check_eq(widened.template get<1, 0>(), 15.0, "rank1_update: new non-zero");
+
+  // Symmetric form keeps a symmetric matrix symmetric.
+  SparseMat<double, IntType, 3, 3, 0, 4, 8> d(1.0, 1.0, 1.0);
+  auto sym = d.symmetric_rank1_update(x);
+  check_eq(sym.template get<0, 2>(), sym.template get<2, 0>(), "symmetric_rank1_update: symmetric");
+  check_eq(sym.template get<0, 0>(), 2.0, "symmetric_rank1_update: (0,0)");
+  check_eq(sym.template get<2, 2>(), 5.0, "symmetric_rank1_update: (2,2)");
+}
+
+SPARSEMAT_HD void test_norms() {
+  // [[1,2],[0,3],[4,0]]: column sums 5 and 5, row sums 3, 3, 4.
+  GramA a(1.0, 2.0, 3.0, 4.0);
+  check_eq(a.norm_1(), 5.0, "norm_1: largest absolute column sum");
+  check_eq(a.norm_inf(), 4.0, "norm_inf: largest absolute row sum");
+  check_eq(a.max_abs(), 4.0, "max_abs");
+
+  // Signs must not cancel.
+  SparseMat<double, IntType, 2, 2, 0, 2> negative(-3.0, 2.0);
+  check_eq(negative.norm_1(), 5.0, "norm_1: absolute values");
+  check_eq(negative.max_abs(), 3.0, "max_abs: absolute values");
+
+  // The zero matrix has zero norms.
+  SparseMat<double, IntType, 2, 2, 0> zero;
+  check_eq(zero.norm_1(), 0.0, "norm_1: zero matrix");
+  check_eq(zero.norm_inf(), 0.0, "norm_inf: zero matrix");
+
+  // diag(2, 4): ‖A‖₁ = 4, ‖A⁻¹‖₁ = 1/2, so the condition number is 2.
+  SparseMat<double, IntType, 2, 2, 0, 3> d(2.0, 4.0);
+  auto cond = SparseLinearAlgebra::condition_number(d);
+  check_eq(cond.ok(), true, "condition_number: non-singular");
+  check_eq(cond.value(), 2.0, "condition_number: diag(2,4)");
+
+  // A singular matrix reports failure rather than a number.
+  SparseMat<double, IntType, 2, 2, 0, 3> singular(1.0, 0.0);
+  check_eq(SparseLinearAlgebra::condition_number(singular).ok(),
+           false,
+           "condition_number: singular matrix");
+}
+
 SPARSEMAT_HD void test_scale() {
   SparseMat<double, IntType, 3, 3, 0, 4, 8> a(1, 2, 3);
   auto b = a.scale(2.0);
@@ -1629,6 +2012,17 @@ SPARSEMAT_HD inline void run_all_tests() {
   test_subtract();
   test_transpose();
   test_transpose_nonsquare();
+  test_ata();
+  test_aat();
+  test_atba();
+  test_abat_and_joseph();
+  test_atb_abt();
+  test_submatrix();
+  test_concat();
+  test_permute();
+  test_rcm_ordering();
+  test_rank1_update();
+  test_norms();
   test_scale();
   test_scale_inplace();
   test_hadamard();

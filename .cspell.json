@@ -19,6 +19,27 @@
     "cout",
     "mult",
     "endl",
-    "Kalman"
+    "Kalman",
+    "atba",
+    "AᵀBA",
+    "AᵀA",
+    "AAᵀ",
+    "abat",
+    "ABAᵀ",
+    "Cuthill",
+    "McKee",
+    "rcm",
+    "hcat",
+    "vcat",
+    "nnz",
+    "axpy",
+    "Joseph",
+    "downdate",
+    "BFGS",
+    "Morrison",
+    "Sherman",
+    "permute",
+    "subdiagonal",
+    "superdiagonal"
   ]
 }

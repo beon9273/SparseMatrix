@@ -18,8 +18,8 @@ using compile-time constructs( e.g. constexpr if).
 
 
 Limitations: 
-  - entering sparsity patterns is awkward and bugprone. 
-  - every distinct sparsity pattern is a distinct type, which makes compile times long for large configurations and binary size could expload pretty easily. 
+  - entering sparsity patterns is awkward and bug-prone.
+  - every distinct sparsity pattern is a distinct type, which makes compile times long for large configurations and binary size could explode pretty easily. 
   - matrix operations are unrolled at compile time via `std::index_sequence`/fold expressions (not, as in earlier versions, linear template recursion — that had a hard ceiling around the compiler's default ~900-deep template-instantiation budget, capping matrices at roughly O(10x10)). Every operation is now O(1) in instantiation depth regardless of matrix size. What remains is the compile-time/binary-size cost above — that scales with how many non-zeros an operation actually touches (density), not with recursion depth, so a genuinely sparse 40x40+ matrix is practical, while a dense-ish one of the same size can still be slow to compile.
   - the practical size limit is now the compiler's *constexpr evaluation* budget rather than its instantiation depth, and nvcc's is markedly tighter than g++'s or clang's. Sparsity computation is memoized into dense boolean grids to stay within it (see `MatrixUtilities::to_dense_bool`).
   - a certain level of sparsity is required.  Whether the performance gain is worth that cost depends heavily on how sparse your matrices are and how many operations you're doing.
@@ -50,6 +50,26 @@ Compile time and binary size scale with how many non-zeros a result actually has
 
 The default is 4096 — generous enough not to interfere with ordinary use (a fully dense 64×64 fits), low enough to catch runaway density. Define it to `0` to disable the check.
 
+### Fill-reducing ordering, at compile time
+
+The other way to spend less of that budget is to make the result genuinely sparser. `rcm_ordering<T>()` runs reverse Cuthill–McKee over a matrix type's pattern and returns a permutation that pulls its entries towards the diagonal; `symmetric_permute<perm>()` applies it as `P A Pᵀ`. Since the factors of a banded matrix stay inside the band, a smaller bandwidth bounds the fill-in `lu_factorize` and `cholesky_factorize` produce — and here fill-in *is* compile time and binary size.
+
+Ordinary sparse libraries do this at runtime, on the matrix in hand. Here the pattern is a compile-time constant, so the whole ordering is derived at compile time and baked into the permuted type:
+
+```cpp
+constexpr auto perm = SparseLinearAlgebra::rcm_ordering<decltype(A)>();
+auto reordered = A.symmetric_permute<perm>();
+auto y = reordered.solve(SparseLinearAlgebra::permute_rows<perm>(b));
+// y is in permuted coordinates: original index perm[i] holds y[i].
+// SparseLinearAlgebra::inverse_permutation<perm>() maps back.
+```
+
+`bandwidth<T>()` reports what the reordering achieved. The reordering is only worth applying when it actually shrinks the bandwidth — an already-banded matrix (tridiagonal, say) is optimally ordered to begin with.
+
+### Fused products
+
+Several operations exist purely to skip an intermediate that would otherwise be materialized, sparsity computation and all. `ata`/`aat` form AᵀA and AAᵀ without the transpose (and compute only the upper triangle, mirroring the rest); `atb`/`abt` do the same for two distinct operands; `atba`/`abat` evaluate the triple products AᵀBA and ABAᵀ in one traversal; `abat_add`/`atba_add` fold an addition into that same pass; `rank1_update` adds `alpha·x yᵀ` without building the outer product. The Kalman-shaped chain `F P Fᵀ + Q` is one call, not three matrices.
+
 ## Requirements
 
 - C++20
@@ -59,6 +79,8 @@ The default is 4096 — generous enough not to interfere with ordinary use (a fu
 
 This project is currently tested only on Linux. Other platforms and toolchains may work, but they are not currently part of the tested matrix.
 
+CI covers GCC 13 and Clang 18 on x86-64, plus ASan/UBSan and a `nvcc` build. Note that the CI runners have no GPU: the CUDA job proves every `SPARSEMAT_HD` operation *compiles* for the device, and `sparsemat_tests_gpu` reports itself skipped rather than run. Device *execution* is verified manually on a real GPU (see [GPU (CUDA)](#gpu-cuda)), not on every commit.
+
 Template parameter constraints for `SparseMat<DataType, IntType, Rows, Cols, NonZeroIndices...>`:
 - `Rows > 0` and `Cols > 0`.
 - Every `NonZeroIndex` must be non-negative.
@@ -66,14 +88,14 @@ Template parameter constraints for `SparseMat<DataType, IntType, Rows, Cols, Non
 - `NonZeroIndices` must be unique (no duplicates).
 
 
-## Building 
+## Building
 
 ```bash
 cmake -B build
 cmake --build build
 ```
 
-## Linking.
+## Linking
 
 This is a header-only library. There are two ways to use it:
 
@@ -246,6 +268,23 @@ All operations return a new matrix with the result sparsity inferred at compile 
 | `fuse(fn, a, b, ...)` | Apply `fn` element-wise across several matrices in one pass, no intermediates |
 | `a.kronecker(b)` | Kronecker (tensor) product |
 | `a.transpose()` | Matrix transpose |
+| `a.ata()` | Gram matrix AᵀA, without materializing the transpose |
+| `a.aat()` | Gram matrix AAᵀ, without materializing the transpose |
+| `a.atba(b)` | Congruence transform AᵀBA, in one pass (no Aᵀ, no BA) |
+| `a.abat(b)` | Congruence transform ABAᵀ — the Kalman covariance propagation `F P Fᵀ` |
+| `a.abat_add(b, c)` | Fused `ABAᵀ + C` (e.g. `F P Fᵀ + Q`); `a.atba_add(b, c)` for the other side |
+| `a.atb(b)` / `a.abt(b)` | AᵀB and ABᵀ without materializing a transpose |
+| `a.submatrix<Row0, Col0, NRows, NCols>()` | Extract a rectangular block |
+| `a.row<I>()` / `a.col<J>()` | Extract a single row or column as a matrix |
+| `a.hcat(b)` / `a.vcat(b)` | Concatenate side by side or stacked |
+| `a.permute<RowPerm, ColPerm>()` | Reorder rows and columns |
+| `a.symmetric_permute<Perm>()` | Reorder symmetrically: `P A Pᵀ` |
+| `rcm_ordering<T>()` | Reverse Cuthill–McKee ordering for a pattern, computed at compile time |
+| `bandwidth<T>()` | Largest `\|i-j\|` over a pattern's stored entries |
+| `outer(x, y, alpha)` | Outer product `alpha·x yᵀ` of two column vectors |
+| `a.rank1_update(x, y, alpha)` | Fused `A + alpha·x yᵀ`; `a.symmetric_rank1_update(x, alpha)` for `x xᵀ` |
+| `a.norm_1()` / `a.norm_inf()` / `a.max_abs()` | Largest absolute column sum, row sum, and element |
+| `condition_number(a)` | 1-norm condition number `‖A‖₁·‖A⁻¹‖₁` (forms the inverse — a diagnostic, not a hot path) |
 | `a.scale(factor)` | Scalar multiply, returns new matrix |
 | `a.scale_inplace(factor)` | Scalar multiply in place |
 | `a.shift(factor)` | Scalar add factor, returns new matrix |
@@ -276,7 +315,7 @@ All operations return a new matrix with the result sparsity inferred at compile 
 | `a.printDense()` | Print the full matrix, including zeros |
 + more 
 
-Free functions are also available under `SparseLinearAlgebra::` (`multiply`, `add`, `subtract`, `hadamard`, `kronecker`, `transpose`, `scale`, `scale_inplace`, `shift`, `shift_inplace`, `normalize`, `normalize_inplace`, `frobenius`, `trace`, `dense`, `fuse`, `power<N>`, `forward_solve`, `backward_solve`, `lu_solve`, `cholesky_solve`).
+Free functions are also available under `SparseLinearAlgebra::` (`multiply`, `add`, `subtract`, `hadamard`, `kronecker`, `transpose`, `ata`, `aat`, `atba`, `abat`, `abat_add`, `atba_add`, `atb`, `abt`, `submatrix`, `row`, `col`, `hcat`, `vcat`, `permute`, `symmetric_permute`, `permute_rows`, `permute_cols`, `rcm_ordering`, `bandwidth`, `inverse_permutation`, `outer`, `rank1_update`, `symmetric_rank1_update`, `norm_1`, `norm_inf`, `max_abs`, `condition_number`, `scale`, `scale_inplace`, `shift`, `shift_inplace`, `normalize`, `normalize_inplace`, `frobenius`, `trace`, `dense`, `fuse`, `power<N>`, `forward_solve`, `backward_solve`, `lu_solve`, `cholesky_solve`).
 
 Solvers and factorizations (`solve`, `cholesky`, `lu_solve`, `forward_solve`, `backward_solve`, `cholesky_solve`, `lu_factorize`, `cholesky_factorize`) return a `Result<T>` rather than throwing, since these routines are also usable from CUDA device code where exceptions aren't available. Check `.ok()` (or `bool(result)`) before calling `.value()` — a failed result still holds a value, but it is not meaningful.
 

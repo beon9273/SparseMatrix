@@ -2,6 +2,7 @@
 
 #include "sparsemat/concepts/concepts.h"
 #include "sparsemat/operations/cholesky.h"
+#include "sparsemat/operations/gram.h"
 #include "sparsemat/operations/multiply.h"
 #include "sparsemat/operations/result.h"
 #include "sparsemat/operations/transpose.h"
@@ -56,16 +57,18 @@ SPARSEMAT_HD auto least_squares_solve(const A& a, const RHS& b) {
                 "scalar types — convert one operand explicitly first, e.g. "
                 "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
 
-  const auto at = transpose(a);
-
+  // The normal-equations matrix comes from ata()/aat() rather than
+  // transpose()+multiply(): those form it in one pass, so the transpose is
+  // never materialized. Aᵀb still needs the transpose, but only on the
+  // overdetermined path, and only against the (narrow) right-hand side.
   if constexpr (A::rows >= A::cols) {
     // Overdetermined (or square): AᵀA x = Aᵀb.
-    return cholesky_solve(multiply(at, a), multiply(at, b));
+    return cholesky_solve(ata(a), multiply(transpose(a), b));
   } else {
     // Underdetermined: solve (A Aᵀ) y = b, then x = Aᵀ y, which is the
     // minimum-norm solution.
-    auto y = cholesky_solve(multiply(a, at), b);
-    auto x = multiply(at, y.value());
+    auto y = cholesky_solve(aat(a), b);
+    auto x = multiply(transpose(a), y.value());
     return Result<decltype(x)>(std::move(x), y.status());
   }
 }

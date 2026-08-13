@@ -200,6 +200,9 @@ sparsemat_add_compile_test(dot_mismatched_length FALSE)
 sparsemat_add_compile_test(mixed_datatype FALSE)
 sparsemat_add_compile_test(compound_add_widens_pattern FALSE)
 sparsemat_add_compile_test(exceeds_nonzero_budget FALSE)
+sparsemat_add_compile_test(invalid_permutation FALSE)
+sparsemat_add_compile_test(invalid_inverse_permutation FALSE)
+sparsemat_add_compile_test(concat_shape_mismatch FALSE)
 
 include(GNUInstallDirs)
 
