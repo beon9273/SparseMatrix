@@ -4,7 +4,7 @@ A header-only C++20 sparse matrix library that encodes sparsity patterns as temp
 
 > **Preface** — This library was built for fun, to test the limits of C++ compile-time constructs like template parameter packs, index sequences and `constexpr`. The underlying question was whether compile-time coding could meaningfully speed up basic linear algebra operations versus leaving it to blas.
 >
-> It also doubled as an exercise in using AI assistance to turn a simple C++ project into a fully developed library. The design and sparsity algorithms (how the result sparsity of each operation is derived and unrolled at compile time) are my own; AI was used for the surrounding brunt work — setting up and writing documentation, creating test harnesses, benchmarks, enabling code-coverage, exploring edge cases, and similar scaffolding. 
+> AI Disclosure: AI has been used heavily in the development of this library. A protype for this library was written, by hand, many years ago library. AI assited development was used to turn that prototype into a release worthy library. 
 
 ## Leveraging known sparsity information at compile time
 
