@@ -1,5 +1,7 @@
 #pragma once
+#include <array>
 #include <cmath>
+#include <cstddef>
 
 #include "sparsemat/concepts/concepts.h"
 namespace SparseLinearAlgebra::detail {
@@ -95,6 +97,88 @@ SPARSEMAT_HD auto frobenius(const SparseMat& a) {
     sq_sum += it * it;
   }
   return std::sqrt(sq_sum);
+}
+
+/**
+ * @brief Largest absolute value stored in @p a (the max-norm).
+ *
+ * Only the stored values are scanned; structural zeros cannot be the maximum
+ * unless the matrix has no stored values at all, in which case this is 0.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           @c max|aᵢⱼ|.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto max_abs(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  DataType worst = 0;
+  for (const auto& value : a.values) {
+    const DataType magnitude = value < DataType(0) ? -value : value;
+    if (magnitude > worst) {
+      worst = magnitude;
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief Computes the 1-norm of @p a: the largest absolute column sum.
+ *
+ * The norm the standard condition-number estimate is built on, and cheap here
+ * — accumulating per column costs one pass over the stored values, since a
+ * structural zero adds nothing.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           @c max_j Σᵢ|aᵢⱼ|.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto norm_1(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  std::array<DataType, static_cast<std::size_t>(SparseMat::cols)> sums{};
+  constexpr auto inds = SparseMat::indices();
+  for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+    const auto value = a.values[k];
+    sums[static_cast<std::size_t>(inds[k] % SparseMat::cols)] +=
+        value < DataType(0) ? -value : value;
+  }
+  DataType worst = 0;
+  for (const auto sum : sums) {
+    if (sum > worst) {
+      worst = sum;
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief Computes the ∞-norm of @p a: the largest absolute row sum.
+ *
+ * The row-wise counterpart of @c norm_1; equal to @c norm_1(transpose(a)), but
+ * computed without forming the transpose.
+ *
+ * @tparam SparseMat Matrix type.
+ * @param  a         Input matrix.
+ * @return           @c max_i Σⱼ|aᵢⱼ|.
+ */
+template<SparseMatrixType SparseMat>
+SPARSEMAT_HD auto norm_inf(const SparseMat& a) {
+  using DataType = typename SparseMat::DataType;
+  std::array<DataType, static_cast<std::size_t>(SparseMat::rows)> sums{};
+  constexpr auto inds = SparseMat::indices();
+  for (std::size_t k = 0; k < static_cast<std::size_t>(SparseMat::nonZeroCount); ++k) {
+    const auto value = a.values[k];
+    sums[static_cast<std::size_t>(inds[k] / SparseMat::cols)] +=
+        value < DataType(0) ? -value : value;
+  }
+  DataType worst = 0;
+  for (const auto sum : sums) {
+    if (sum > worst) {
+      worst = sum;
+    }
+  }
+  return worst;
 }
 
 /**

@@ -24,18 +24,47 @@ class Trace {
   static constexpr auto num_zeros = (rows * cols) - num_non_zeros;
   static constexpr auto total_elements = rows * cols;
 
-  /// Compile-time recursive accumulation of diagonal elements starting at (N, N).
-  template<int N>
-  SPARSEMAT_HD static DataType trace(const SparseMat& a) {
-    if constexpr (N >= rows || N >= cols) {
-      return 0;
-    } else if constexpr (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(N, N)) {
-      constexpr auto index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(N, N);
-      return a.values[index] + trace<N + 1>(a);
-    } else {
-      return trace<N + 1>(a);
+  using Int = typename SparseMat::Int;
+
+  /// Length of the diagonal that is actually summed.
+  static constexpr auto diag_length = (rows < cols) ? rows : cols;
+
+  /**
+   * @brief Storage offsets of every *stored* diagonal entry, in row order.
+   *
+   * Computed once at compile time, so the runtime sum below touches only the
+   * diagonal positions that actually exist — structurally zero ones are
+   * skipped here rather than contributing a zero term at runtime, which is
+   * the compile-time elimination that matters for trace.
+   */
+  SPARSEMAT_HD static constexpr auto diagonal_offsets() {
+    std::array<Int,
+               static_cast<std::size_t>(
+                   SparseLinearAlgebra::MatrixUtilities<SparseMat>::diagonal_nonzeros())>
+        offsets{};
+    constexpr auto grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::storage_index_grid();
+    std::size_t k = 0;
+    for (Int i = 0; i < diag_length; ++i) {
+      const auto offset = grid[static_cast<std::size_t>((i * cols) + i)];
+      if (offset >= 0) {
+        offsets[k++] = offset;
+      }
     }
-  };
+    return offsets;
+  }
+
+  /// Sums the stored diagonal entries with a plain runtime loop. The
+  /// zero-skipping is already done (see diagonal_offsets), so there is nothing
+  /// left for a fold to eliminate — and a fold over the diagonal of a large
+  /// matrix would run into clang's 256-argument nesting limit for no benefit.
+  SPARSEMAT_HD static DataType trace(const SparseMat& a) {
+    constexpr auto offsets = diagonal_offsets();
+    DataType sum = 0;
+    for (auto offset : offsets) {
+      sum += a.values[static_cast<std::size_t>(offset)];
+    }
+    return sum;
+  }
 };
 
 }  // namespace SparseLinearAlgebra::detail
@@ -55,7 +84,7 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType SparseMat>
 SPARSEMAT_HD auto trace(const SparseMat& a) {
-  return detail::Trace<SparseMat>::template trace<0>(a);
+  return detail::Trace<SparseMat>::trace(a);
 }
 
 }  // namespace SparseLinearAlgebra

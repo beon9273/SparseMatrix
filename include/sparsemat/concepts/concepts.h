@@ -11,6 +11,38 @@
 #define SPARSEMAT_HD
 #endif
 
+/**
+ * @def SPARSEMAT_MAX_NONZEROS
+ * @brief Ceiling on the stored-value count of any single @c SparseMat, enforced
+ *        by @c static_assert.
+ *
+ * Compile time and binary size are the real costs of encoding sparsity in the
+ * type system, and both scale with how many non-zeros an operation's result
+ * actually has. When a chain of operations quietly produces a much denser
+ * result than intended — and multiply and Kronecker both can — the symptom is a
+ * build that takes minutes, or a compiler that runs out of some internal
+ * budget and reports something inscrutable about a non-type template argument
+ * not being a constant expression. Neither points at the cause.
+ *
+ * This turns that into a named error naming the actual count, at the
+ * instantiation that caused it. The default is deliberately generous: it should
+ * catch runaway density, not ordinary use (a fully dense 64x64 fits). Lower it
+ * to put a tighter budget on a particular translation unit, raise it if you
+ * genuinely need larger results, or define it to 0 to disable the check:
+ *
+ * @code
+ * // Fail the build if any single matrix exceeds 512 stored values.
+ * #define SPARSEMAT_MAX_NONZEROS 512
+ * #include "sparsemat/api/sparsemat.h"
+ * @endcode
+ */
+// This has to be a macro rather than a constexpr constant: the whole point is
+// that a consumer can override it by defining it before including this header.
+#if !defined(SPARSEMAT_MAX_NONZEROS)
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define SPARSEMAT_MAX_NONZEROS 4096
+#endif
+
 namespace SparseLinearAlgebra {
 
 template<typename SparseMatrix>
@@ -85,6 +117,20 @@ concept RebindType =
  */
 template<typename T>
 concept SparseMatrixType = SparseMatrixBase<T> && RebindType<T>;
+
+/**
+ * @brief Concept satisfied when two sparse matrix types share a scalar type.
+ *
+ * Binary operations in this library do not promote mixed scalar types: the
+ * result would have to pick one, and silently truncating a @c double operand
+ * to a @c float result is exactly the kind of precision loss that is very hard
+ * to notice after the fact. Mismatches are therefore rejected at compile time
+ * (the only place they *can* be rejected — exceptions are not usable in the
+ * @c SPARSEMAT_HD device code these operations must support). Convert
+ * explicitly with @c convert<T>() to opt into the change.
+ */
+template<typename A, typename B>
+concept SameDataType = std::is_same_v<typename A::DataType, typename B::DataType>;
 
 /**
  * @brief Concept satisfied by the internal operation policy classes

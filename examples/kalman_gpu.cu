@@ -29,19 +29,21 @@ constexpr double GPS_STD = 5.0;
 constexpr double GPS_VAR = GPS_STD * GPS_STD;
 constexpr int STEPS = 50;
 
-#define CUDA_CHECK(call)                                                             \
-  do {                                                                               \
-    cudaError_t err = (call);                                                        \
-    if (err != cudaSuccess) {                                                        \
-      std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err),      \
-                   __FILE__, __LINE__);                                              \
-      std::exit(1);                                                                  \
-    }                                                                                \
+#define CUDA_CHECK(call)                                                                    \
+  do {                                                                                      \
+    cudaError_t err = (call);                                                               \
+    if (err != cudaSuccess) {                                                               \
+      std::fprintf(                                                                         \
+          stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+      std::exit(1);                                                                         \
+    }                                                                                       \
   } while (0)
 
 // One thread per filter: advances it one predict+update step using this
 // step's noisy measurement.
-__global__ void kalman_step_kernel(KF* filters, const double* meas_px, const double* meas_py,
+__global__ void kalman_step_kernel(KF* filters,
+                                   const double* meas_px,
+                                   const double* meas_py,
                                    int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -51,8 +53,12 @@ __global__ void kalman_step_kernel(KF* filters, const double* meas_px, const dou
   static_cast<void>(filters[i].step(z, GPS_VAR));
 }
 
-double true_px(double t) { return 50.0 * t; }
-double true_py(double t) { return (100.0 * t) - (0.5 * G * t * t); }
+double true_px(double t) {
+  return 50.0 * t;
+}
+double true_py(double t) {
+  return (100.0 * t) - (0.5 * G * t * t);
+}
 
 int main(int argc, char** argv) {
   const int n = (argc > 1) ? std::atoi(argv[1]) : 1'000'000;
@@ -70,7 +76,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMalloc(&device_filters, n * sizeof(KF)));
   CUDA_CHECK(cudaMalloc(&device_px, n * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&device_py, n * sizeof(double)));
-  CUDA_CHECK(cudaMemcpy(device_filters, host_filters.data(), n * sizeof(KF), cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(device_filters, host_filters.data(), n * sizeof(KF), cudaMemcpyHostToDevice));
 
   std::mt19937 rng(42);
   std::normal_distribution<double> noise(0.0, GPS_STD);
@@ -91,10 +98,10 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaMemcpy(device_px, px.data(), n * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_py, py.data(), n * sizeof(double), cudaMemcpyHostToDevice));
-    
+
     // Launch the kernel to perform one step of the Kalman filter for all threads.
     // Thread divergence occurs if some threads have filters that fail while others succeed,
-    // causing different execution paths within the kernel. A finite state machine manager 
+    // causing different execution paths within the kernel. A finite state machine manager
     // with state buffers for each thread could be used to track the state of each thread
     // and ensure consistent execution paths.
     kalman_step_kernel<<<grid, block>>>(device_filters, device_px, device_py, n);
@@ -112,20 +119,26 @@ int main(int argc, char** argv) {
       break;
     }
   }
-  std::printf("All filters ok: %d\n", all_ok);  
+  std::printf("All filters ok: %d\n", all_ok);
 
   double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
-  std::printf("Done in %.2f ms (%.1f filter-steps/sec)\n", elapsed_ms,
-             (double(n) * STEPS) / (elapsed_ms / 1000.0));
+  std::printf("Done in %.2f ms (%.1f filter-steps/sec)\n",
+              elapsed_ms,
+              (double(n) * STEPS) / (elapsed_ms / 1000.0));
 
   double final_t = STEPS * DT;
   std::printf("True final position:      (%.2f, %.2f)\n", true_px(final_t), true_py(final_t));
   std::printf("Filter 0 estimated state:  px=%.2f py=%.2f vx=%.2f vy=%.2f\n",
-             host_filters[0].x.values[0], host_filters[0].x.values[1],
-             host_filters[0].x.values[2], host_filters[0].x.values[3]);
-  std::printf("Filter %d estimated state:  px=%.2f py=%.2f vx=%.2f vy=%.2f\n", n - 1,
-             host_filters[n - 1].x.values[0], host_filters[n - 1].x.values[1],
-             host_filters[n - 1].x.values[2], host_filters[n - 1].x.values[3]);
+              host_filters[0].x.values[0],
+              host_filters[0].x.values[1],
+              host_filters[0].x.values[2],
+              host_filters[0].x.values[3]);
+  std::printf("Filter %d estimated state:  px=%.2f py=%.2f vx=%.2f vy=%.2f\n",
+              n - 1,
+              host_filters[n - 1].x.values[0],
+              host_filters[n - 1].x.values[1],
+              host_filters[n - 1].x.values[2],
+              host_filters[n - 1].x.values[3]);
 
   CUDA_CHECK(cudaFree(device_filters));
   CUDA_CHECK(cudaFree(device_px));

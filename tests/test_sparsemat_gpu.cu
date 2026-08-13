@@ -12,9 +12,9 @@
  */
 
 #define SPARSEMAT_TEST_NO_MAIN
-#include "test_sparsemat.cpp"
-
 #include <cstdio>
+
+#include "test_sparsemat.cpp"
 
 // Matches the SKIP_RETURN_CODE set on this test in CMakeLists.txt.
 constexpr int SPARSEMAT_SKIP_EXIT_CODE = 99;
@@ -29,8 +29,9 @@ int main() {
   int device_count = 0;
   cudaError_t err = cudaGetDeviceCount(&device_count);
   if (err != cudaSuccess || device_count == 0) {
-    std::printf("No CUDA device available (this binary already having built proves the tests "
-                "compile for the device); skipping kernel execution.\n");
+    std::printf(
+        "No CUDA device available (this binary already having built proves the tests "
+        "compile for the device); skipping kernel execution.\n");
     return SPARSEMAT_SKIP_EXIT_CODE;
   }
 

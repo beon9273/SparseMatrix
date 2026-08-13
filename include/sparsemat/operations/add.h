@@ -6,11 +6,14 @@
 namespace SparseLinearAlgebra::detail {
 
 /**
- * @brief Implementation policy for sparse matrix addition and subtraction.
+ * @brief Implementation policy for sparse matrix addition, subtraction, and
+ *        scaled addition.
  *
- * Computes @c a + multiplier*b.  Using @c multiplier = 1 gives addition;
- * @c multiplier = -1 gives subtraction.  Result sparsity is the union of both
- * input sparsity patterns.
+ * Computes @c alpha*a + beta*b.  Using @c alpha = beta = 1 gives addition;
+ * @c alpha = 1, @c beta = -1 gives subtraction; any other combination gives
+ * a general scaled addition without a separate scale pass over either
+ * operand.  Result sparsity is the union of both input sparsity patterns
+ * (independent of the runtime values of @c alpha/@c beta).
  *
  * @tparam SparseMat  Left-hand matrix type.
  * @tparam SparseMat1 Right-hand matrix type; must have the same shape as
@@ -21,16 +24,26 @@ class Add {
  public:
   static_assert(SparseMat::rows == SparseMat1::rows && SparseMat::cols == SparseMat1::cols,
                 "Incompatible matrix dimensions for addition.");
+  static_assert(SparseLinearAlgebra::SameDataType<SparseMat, SparseMat1>,
+                "Operands must have the same DataType. sparsemat does not promote mixed "
+                "scalar types \u2014 convert one operand explicitly first, e.g. "
+                "a.template convert<double>() or SparseLinearAlgebra::convert<double>(a).");
 
   using DataType = typename SparseMat::DataType;
   using Int = typename SparseMat::Int;
   static constexpr auto rows = SparseMat::rows;
-  static constexpr auto cols = SparseMat1::cols;
+  static constexpr auto cols = SparseMat::cols;
+
+  // Precomputed once per (SparseMat, SparseMat1) instantiation — not per
+  // is_result_index_nonzero call — so each of the O(rows*cols) calls
+  // OperationUtilities makes below is an O(1) grid lookup instead of two
+  // O(nonZeroCount) linear scans. See MatrixUtilities::to_dense_bool().
+  static constexpr auto a_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat>::to_dense_bool();
+  static constexpr auto b_grid = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::to_dense_bool();
 
   /// Returns true if (row, col) is non-zero in either input matrix.
   SPARSEMAT_HD constexpr static auto is_result_index_nonzero(Int row, Int col) {
-    return (SparseLinearAlgebra::MatrixUtilities<SparseMat>().isNonZero(row, col) ||
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>().isNonZero(row, col));
+    return a_grid[row][col] || b_grid[row][col];
   }
 
   /// Delegates to OperationUtilities to count result non-zeros.
@@ -43,44 +56,77 @@ class Add {
     return SparseLinearAlgebra::OperationUtilities<Add>::calculate_sparsity();
   }
 
-  /// Recursively fills result positions (I,J) with a[I,J] + multiplier*b[I,J].
-  template<SparseMatrixType Result, Int I, Int J>
-  SPARSEMAT_HD static void recursive_add(Result& r,
-                                         const SparseMat& a,
-                                         const SparseMat1& b,
-                                         const DataType multiplier) {
-    if constexpr (I >= SparseMat::rows) {
-      return;
-    } else if constexpr (J >= SparseMat1::cols) {
-      return recursive_add<Result, I + 1, 0>(r, a, b, multiplier);
-    } else {
-      constexpr auto sparse_index =
-          SparseLinearAlgebra::MatrixUtilities<Result>::getSparseIndex(I, J);
-      if constexpr (sparse_index >= 0) {
-        constexpr auto a_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
-        constexpr auto b_index =
-            SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
+  /// Fills result storage slot @p Idx (whose flat row-major index is
+  /// @c Result::indices()[Idx]) with alpha*a[I,J] + beta*b[I,J]. Iterating
+  /// only over the result's own sparsity array — rather than recursing over
+  /// every (I,J) in the full rows*cols grid — keeps both the number of
+  /// template instantiations and the compile-time work proportional to the
+  /// result's non-zero count instead of its dimensions.
+  template<SparseMatrixType Result, std::size_t Idx>
+  SPARSEMAT_HD static void fill_cell(Result& r,
+                                     const SparseMat& a,
+                                     const SparseMat1& b,
+                                     const DataType alpha,
+                                     const DataType beta) {
+    constexpr auto flat = Result::indices()[Idx];
+    constexpr Int I = flat / Result::cols;
+    constexpr Int J = flat % Result::cols;
+    constexpr auto a_index = SparseLinearAlgebra::MatrixUtilities<SparseMat>::getSparseIndex(I, J);
+    constexpr auto b_index = SparseLinearAlgebra::MatrixUtilities<SparseMat1>::getSparseIndex(I, J);
 
-        r.values[sparse_index] = 0;
-        if constexpr (a_index >= 0) {
-          r.values[sparse_index] = a.values[a_index];
-        }
-        if constexpr (b_index >= 0) {
-          r.values[sparse_index] += multiplier * b.values[b_index];
-        }
-      }
-      recursive_add<Result, I, J + 1>(r, a, b, multiplier);
+    DataType value = 0;
+    if constexpr (a_index >= 0) {
+      value = alpha * a.values[a_index];
+    }
+    if constexpr (b_index >= 0) {
+      value += beta * b.values[b_index];
+    }
+    r.values[Idx] = value;
+  }
+
+  /// Expands one chunk of at most kUnrollChunkSize result slots.
+  template<typename Result, std::size_t Begin, std::size_t... Is>
+  SPARSEMAT_HD static void fill_chunk(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      const DataType alpha,
+                                      const DataType beta,
+                                      std::index_sequence<Is...> /*seq*/) {
+    (fill_cell<Result, Begin + Is>(r, a, b, alpha, beta), ...);
+  }
+
+  /// Fills result slots [Begin, Begin+Count) by halving Count until it fits a
+  /// single fold. See the note on chunked unrolling in utils.h for why this is
+  /// neither one flat fold (clang caps those at 256 terms) nor a per-element
+  /// linear recursion (that exhausts the instantiation-depth budget).
+  template<typename Result, std::size_t Begin, std::size_t Count>
+  SPARSEMAT_HD static void fill_range(Result& r,
+                                      const SparseMat& a,
+                                      const SparseMat1& b,
+                                      const DataType alpha,
+                                      const DataType beta) {
+    if constexpr (Count == 0) {
+      return;
+    } else if constexpr (Count <= SparseLinearAlgebra::kUnrollChunkSize) {
+      fill_chunk<Result, Begin>(r, a, b, alpha, beta, std::make_index_sequence<Count>{});
+    } else {
+      constexpr std::size_t half = Count / 2;
+      fill_range<Result, Begin, half>(r, a, b, alpha, beta);
+      fill_range<Result, Begin + half, Count - half>(r, a, b, alpha, beta);
     }
   }
 
-  /// Constructs the result SparseMat and fills it via recursive_add.
-  SPARSEMAT_HD static auto add(const SparseMat& a, const SparseMat1& b, const DataType multiplier) {
+  /// Constructs the result SparseMat and fills it via fill_all.
+  SPARSEMAT_HD static auto add(const SparseMat& a,
+                               const SparseMat1& b,
+                               const DataType alpha,
+                               const DataType beta) {
     constexpr auto sparsity = calculate_sparsity();
     auto result = SparseLinearAlgebra::MatrixUtilities<SparseMat>::
-        template make<SparseMat::rows, SparseMat1::cols, sparsity>(
-            std::make_index_sequence<num_nonzeros()>{});
-    recursive_add<decltype(result), 0, 0>(result, a, b, multiplier);
+        template make<SparseMat::rows, SparseMat::cols, sparsity>(
+            std::make_index_sequence<static_cast<std::size_t>(num_nonzeros())>{});
+    fill_range<decltype(result), 0, static_cast<std::size_t>(num_nonzeros())>(
+        result, a, b, alpha, beta);
     return result;
   }
 };
@@ -102,14 +148,14 @@ namespace SparseLinearAlgebra {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 SPARSEMAT_HD auto add(const A& a, const B& b) {
-  return detail::Add<A, B>::add(a, b, 1);
+  return detail::Add<A, B>::add(a, b, 1, 1);
 }
 
 /**
  * @brief Element-wise subtraction of two sparse matrices: @p a - @p b.
  *
- * Equivalent to @c scaled_add(a, b, -1).  Result sparsity is the union of
- * both input patterns.
+ * Equivalent to @c add(a, b, 1, -1).  Result sparsity is the union of both
+ * input patterns.
  *
  * @tparam A Left-hand matrix type.
  * @tparam B Right-hand matrix type.
@@ -119,27 +165,49 @@ SPARSEMAT_HD auto add(const A& a, const B& b) {
  */
 template<SparseMatrixType A, SparseMatrixType B>
 SPARSEMAT_HD auto subtract(const A& a, const B& b) {
-  return detail::Add<A, B>::add(a, b, -1);
+  return detail::Add<A, B>::add(a, b, 1.0, -1.0);
 }
 
 /**
- * @brief Computes @p a + @p multiplier × @p b in a single fused operation.
+ * @brief Computes @p alpha*a + @p beta*b in a single fused operation.
  *
- * Avoids a separate scale pass; @p multiplier is applied element-wise to
- * @p b during the addition traversal.  Result sparsity is the union of both
- * input patterns.
+ * Avoids separate scale passes; @p alpha and @p beta are applied
+ * element-wise to @p a and @p b respectively during the same traversal that
+ * computes the sum.  Result sparsity is the union of both input patterns.
  *
  * @tparam A        Left-hand matrix type.
  * @tparam B        Right-hand matrix type.
- * @tparam DataType Scalar type of the multiplier.
- * @param  a          Base matrix.
- * @param  b          Matrix to scale and add.
- * @param  multiplier Scalar factor applied to @p b before adding.
- * @return            Result matrix @c a + multiplier*b.
+ * @tparam DataType Scalar type of @p alpha and @p beta.
+ * @param  a     Left-hand operand.
+ * @param  b     Right-hand operand.
+ * @param  alpha Scalar factor applied to @p a.
+ * @param  beta  Scalar factor applied to @p b.
+ * @return       Result matrix @c alpha*a + beta*b.
  */
 template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
-SPARSEMAT_HD auto scaled_add(const A& a, const B& b, const DataType multiplier) {
-  return detail::Add<A, B>::add(a, b, multiplier);
+SPARSEMAT_HD auto add(const A& a, const B& b, const DataType alpha, const DataType beta) {
+  return detail::Add<A, B>::add(a, b, alpha, beta);
+}
+
+/**
+ * @brief Computes @p a + @p beta*b in a single fused operation.
+ *
+ * Convenience overload equivalent to @c add(a, b, 1, beta): @p alpha is
+ * implicitly @c 1, so only @p b is scaled.  Avoids a separate scale pass;
+ * @p beta is applied element-wise to @p b during the addition traversal.
+ * Result sparsity is the union of both input patterns.
+ *
+ * @tparam A        Left-hand matrix type.
+ * @tparam B        Right-hand matrix type.
+ * @tparam DataType Scalar type of @p beta.
+ * @param  a    Base matrix, added unscaled.
+ * @param  b    Matrix to scale and add.
+ * @param  beta Scalar factor applied to @p b before adding.
+ * @return      Result matrix @c a + beta*b.
+ */
+template<SparseMatrixType A, SparseMatrixType B, MatrixDataType DataType>
+SPARSEMAT_HD auto add(const A& a, const B& b, const DataType beta) {
+  return detail::Add<A, B>::add(a, b, 1.0, beta);
 }
 
 }  // namespace SparseLinearAlgebra
